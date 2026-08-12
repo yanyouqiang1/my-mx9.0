@@ -1,0 +1,52 @@
+#include <Adafruit_NeoPixel.h>
+
+#define PIN        9 
+#define NUMPIXELS  2 
+#define MAX_BRIGHT 150  // 依然限制亮度以保护 3.3V 引脚
+
+Adafruit_NeoPixel strip(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  strip.begin();
+  strip.show();
+}
+
+void loop() {
+  // 预设几种漂亮的颜色：红、绿、蓝、黄、紫、青
+  // HSV 的 Hue 范围是 0 到 65535
+  uint32_t colors[] = {
+    0,      // 红色
+    10922,  // 黄色
+    21845,  // 绿色
+    32768,  // 青色
+    43690,  // 蓝色
+    54613   // 紫色
+  };
+
+  // 循环播放这 6 种颜色
+  for (int j = 0; j < 6; j++) {
+    long currentHue = colors[j];
+
+    // --- 呼吸变亮 ---
+    for (int b = 0; b <= MAX_BRIGHT; b++) {
+      // 使用 ColorHSV 转换颜色：(颜色, 饱和度255, 亮度b)
+      // gamma32 转换能让呼吸的亮度变化在视觉上更平滑
+      uint32_t rgbcolor = strip.gamma32(strip.ColorHSV(currentHue, 255, b));
+      
+      strip.fill(rgbcolor); // 同时设置所有灯珠
+      strip.show();
+      delay(8);
+    }
+
+    // --- 呼吸变暗 ---
+    for (int b = MAX_BRIGHT; b >= 0; b--) {
+      uint32_t rgbcolor = strip.gamma32(strip.ColorHSV(currentHue, 255, b));
+      
+      strip.fill(rgbcolor);
+      strip.show();
+      delay(12);
+    }
+    
+    delay(300); // 每种颜色呼吸完停顿一下
+  }
+}

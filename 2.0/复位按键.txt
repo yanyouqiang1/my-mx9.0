@@ -1,0 +1,4 @@
+按住开发板上的 BOOT 按钮不放。
+按一下 RESET 按钮。
+松开 BOOT 按钮。
+此时芯片已经进入下载模式，再次点击 Arduino IDE 的“上传 (Upload)”按钮。

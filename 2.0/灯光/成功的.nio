@@ -1,0 +1,223 @@
+#include <Adafruit_NeoPixel.h>
+#include "USB.h"
+#include "USBHIDConsumerControl.h"
+
+// ================= 引脚与参数定义 =================
+#define LED_PIN         5    // WS2812B 灯带引脚
+#define NUM_LEDS        16   // 灯珠总数 16 个
+#define MAX_BRIGHT      150  // 灯带最大亮度限值
+
+// MX9.0 旋转编码器引脚
+#define PIN_ROTARY_SW   12   // 旋转按键
+#define PIN_ROTARY_A    18   // 左旋 (CLK/DT)
+#define PIN_ROTARY_B    3   // 右旋 (DT/CLK)
+
+// 板载按键引脚
+#define PIN_KEY_LIGHT   15   // 灯光按键
+#define PIN_KEY_MUTE    16   // 静音按键
+#define PIN_KEY_CPG     17   // CPG按键 (注：原描述与18冲突，此处暂定19，可自行修改)
+
+// ================= 全局对象定义 =================
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+USBHIDConsumerControl ConsumerControl; // 用于通过USB控制电脑/手机音量
+
+// 系统状态变量
+bool lightOn = true;         // 灯光总开关 (true: 开, false: 关)
+uint8_t lightMode = 0;       // 当前灯光效果：0-呼吸灯, 1-跑马灯, 2-彩虹流光
+const uint8_t TOTAL_MODES = 3;
+
+// 旋转编码器状态
+int lastRotaryA = HIGH;
+
+// ================= 按键防抖检测函数 =================
+bool checkKeyPressed(uint8_t pin, bool &lastState, unsigned long &lastTime) {
+  bool currentState = digitalRead(pin);
+  bool isPressed = false;
+  
+  if (currentState != lastState) {
+    lastTime = millis();
+  }
+  
+  if ((millis() - lastTime) > 30) { // 30ms 防抖
+    static bool debouncedStates[40] = {HIGH};
+    if (currentState != debouncedStates[pin]) {
+      debouncedStates[pin] = currentState;
+      if (debouncedStates[pin] == LOW) { // 下降沿（按下）
+        isPressed = true;
+      }
+    }
+  }
+  lastState = currentState;
+  return isPressed;
+}
+
+// 防抖状态记录
+bool stLight = HIGH, stMute = HIGH, stCPG = HIGH, stRotSW = HIGH;
+unsigned long tLight = 0, tMute = 0, tCPG = 0, tRotSW = 0;
+
+// ================= 灯效动画相关变量 (非阻塞) =================
+// 模式0：呼吸灯相关
+uint32_t breathColors[] = {0, 10922, 21845, 32768, 43690, 54613}; // 红、黄、绿、青、蓝、紫
+int breathColorIdx = 0;
+int breathBright = 0;
+int breathDir = 1; // 1: 变亮, -1: 变暗, 0: 停顿
+unsigned long lastBreathTime = 0;
+
+// 模式1/2：跑马灯 & 彩虹流光相关
+int animStep = 0;
+unsigned long lastAnimTime = 0;
+
+// ================= 初始化设置 =================
+void setup() {
+  Serial.begin(115200);
+
+  // 初始化 ESP32-S3 原生 USB HID (用于媒体按键/音量控制)
+  ConsumerControl.begin();
+  USB.begin();
+
+  // 初始化 WS2812B 灯带
+  strip.begin();
+  strip.show();
+
+  // 初始化按键引脚（内部上拉，低电平有效）
+  pinMode(PIN_ROTARY_SW, INPUT_PULLUP);
+  pinMode(PIN_ROTARY_A, INPUT_PULLUP);
+  pinMode(PIN_ROTARY_B, INPUT_PULLUP);
+  pinMode(PIN_KEY_LIGHT, INPUT_PULLUP);
+  pinMode(PIN_KEY_MUTE, INPUT_PULLUP);
+  pinMode(PIN_KEY_CPG, INPUT_PULLUP);
+
+  lastRotaryA = digitalRead(PIN_ROTARY_A);
+}
+
+// ================= 灯效逻辑更新函数 =================
+void updateLEDs() {
+  // 如果灯光处于关闭状态
+  if (!lightOn) {
+    strip.clear();
+    strip.show();
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // 【模式 0】：呼吸灯效果（保持你原程序的颜色和视觉效果）
+  if (lightMode == 0) {
+    if (breathDir == 1) { // --- 呼吸变亮 ---
+      if (now - lastBreathTime >= 8) {
+        lastBreathTime = now;
+        uint32_t rgbcolor = strip.gamma32(strip.ColorHSV(breathColors[breathColorIdx], 255, breathBright));
+        strip.fill(rgbcolor);
+        strip.show();
+        breathBright++;
+        if (breathBright > MAX_BRIGHT) {
+          breathBright = MAX_BRIGHT;
+          breathDir = -1; // 转为变暗
+        }
+      }
+    } else if (breathDir == -1) { // --- 呼吸变暗 ---
+      if (now - lastBreathTime >= 12) {
+        lastBreathTime = now;
+        uint32_t rgbcolor = strip.gamma32(strip.ColorHSV(breathColors[breathColorIdx], 255, breathBright));
+        strip.fill(rgbcolor);
+        strip.show();
+        breathBright--;
+        if (breathBright < 0) {
+          breathBright = 0;
+          breathDir = 0; // 进入停顿
+        }
+      }
+    } else if (breathDir == 0) { // --- 切换停顿 ---
+      if (now - lastBreathTime >= 300) {
+        lastBreathTime = now;
+        breathColorIdx = (breathColorIdx + 1) % 6; // 切换下一种 HSV 预设颜
+        breathDir = 1; // 重新开始变亮
+      }
+    }
+  }
+  // 【模式 1】：跑马灯效果
+  else if (lightMode == 1) {
+    if (now - lastAnimTime >= 50) { // 50ms 移动一步
+      lastAnimTime = now;
+      strip.clear();
+      // 绘制 3 个灯珠长度的跑马轨迹
+      for (int i = 0; i < 3; i++) {
+        int pos = (animStep + i) % NUM_LEDS;
+        strip.setPixelColor(pos, strip.Color(0, 200, 255)); // 青蓝色灯光
+      }
+      strip.show();
+      animStep = (animStep + 1) % NUM_LEDS;
+    }
+  }
+  // 【模式 2】：彩虹流光效果
+  else if (lightMode == 2) {
+    if (now - lastAnimTime >= 20) { // 20ms 渐变一步
+      lastAnimTime = now;
+      for (int i = 0; i < NUM_LEDS; i++) {
+        int pixelHue = animStep + (i * 65536L / NUM_LEDS);
+        strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue, 255, MAX_BRIGHT)));
+      }
+      strip.show();
+      animStep = (animStep + 256) % 65536;
+    }
+  }
+}
+
+// ================= 旋转编码器处理函数 =================
+void handleRotaryEncoder() {
+  int currentRotaryA = digitalRead(PIN_ROTARY_A);
+  if (currentRotaryA != lastRotaryA && currentRotaryA == LOW) {
+    if (digitalRead(PIN_ROTARY_B) == HIGH) {
+      // 右旋：增加音量
+      ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+      ConsumerControl.release();
+      Serial.println("音量 +");
+    } else {
+      // 左旋：减少音量
+      ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+      ConsumerControl.release();
+      Serial.println("音量 -");
+    }
+  }
+  lastRotaryA = currentRotaryA;
+}
+
+// ================= 主循环 =================
+void loop() {
+  // 1. 旋转编码器：控制系统音量
+  handleRotaryEncoder();
+
+  // 2. 灯光开关按键 (IO 16)：按下开启/关闭灯光
+  if (checkKeyPressed(PIN_KEY_LIGHT, stLight, tLight)) {
+    lightOn = !lightOn;
+    Serial.println(lightOn ? "灯光开启" : "灯光关闭");
+  }
+
+  // 3. CPG 按键 (IO 19)：按下切换灯光效果模式
+  if (checkKeyPressed(PIN_KEY_CPG, stCPG, tCPG)) {
+    lightMode = (lightMode + 1) % TOTAL_MODES;
+    // 重置动画状态
+    breathBright = 0;
+    breathDir = 1;
+    animStep = 0;
+    Serial.print("切换灯效模式为: ");
+    Serial.println(lightMode);
+  }
+
+  // 4. 静音按键 (IO 17)：按下切换系统静音
+  if (checkKeyPressed(PIN_KEY_MUTE, stMute, tMute)) {
+    ConsumerControl.press(CONSUMER_CONTROL_MUTE);
+    ConsumerControl.release();
+    Serial.println("切换静音");
+  }
+
+  // 5. 旋转编码器中间按键 (IO 12)：按下可控制播放/暂停
+  if (checkKeyPressed(PIN_ROTARY_SW, stRotSW, tRotSW)) {
+    ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
+    ConsumerControl.release();
+    Serial.println("播放/暂停");
+  }
+
+  // 6. 刷新灯带动画
+  updateLEDs();
+}

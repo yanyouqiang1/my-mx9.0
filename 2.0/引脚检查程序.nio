@@ -1,0 +1,85 @@
+#include <Arduino.h>
+
+// 定义 ESP32-S3 安全可用的 GPIO 列表
+// 排除: 0(BOOT), 19/20(USB), 26-34(Flash/PSRAM), 43/44(默认串口0 TX/RX)
+int safe_gpios[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 
+                    11, 12, 13, 14, 15, 16, 17, 18, 
+                    21, 35, 36, 37, 38, 39, 40, 41, 42, 
+                    45, 46, 47, 48};
+                    
+int num_pins = sizeof(safe_gpios) / sizeof(safe_gpios[0]);
+int current_mode = 0; // 0 = 输出测试模式, 1 = 输入测试模式
+
+void setMode(int mode);
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // 等待串口初始化完毕
+  
+  Serial.println("\n=== ESP32-S3 GPIO 综合测试程序 ===");
+  Serial.println("请输入 '0' 切换到 -> 输出测试 (所有引脚 1Hz 闪烁)");
+  Serial.println("请输入 '1' 切换到 -> 输入测试 (将引脚接地测试读取)");
+  
+  // 默认进入输出测试模式
+  setMode(0); 
+}
+
+void setMode(int mode) {
+  current_mode = mode;
+  if (mode == 0) {
+    Serial.println("\n[模式: 输出测试] 正在将所有安全引脚设置为 OUTPUT...");
+    for (int i = 0; i < num_pins; i++) {
+      pinMode(safe_gpios[i], OUTPUT);
+      digitalWrite(safe_gpios[i], LOW);
+    }
+  } else if (mode == 1) {
+    Serial.println("\n[模式: 输入测试] 正在将所有安全引脚设置为 INPUT_PULLUP...");
+    Serial.println("👉 测试方法: 请用一根杜邦线，将任意被测引脚与 GND 短接，串口将打印该引脚编号。");
+    for (int i = 0; i < num_pins; i++) {
+      pinMode(safe_gpios[i], INPUT_PULLUP);
+    }
+  }
+}
+
+void loop() {
+  // 检查串口是否有输入，用于切换模式
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '0') setMode(0);
+    else if (c == '1') setMode(1);
+  }
+
+  // --- 模式 0：输出测试 ---
+  if (current_mode == 0) {
+    static unsigned long last_toggle = 0;
+    static bool pin_state = false;
+    
+    // 每 1000 毫秒（1秒）翻转一次所有引脚电平
+    if (millis() - last_toggle > 1000) {
+      last_toggle = millis();
+      pin_state = !pin_state;
+      for (int i = 0; i < num_pins; i++) {
+        digitalWrite(safe_gpios[i], pin_state ? HIGH : LOW);
+      }
+      Serial.print("当前所有测试引脚电平为: ");
+      Serial.println(pin_state ? "HIGH (3.3V)" : "LOW (0V)");
+    }
+  } 
+  
+  // --- 模式 1：输入测试 ---
+  else if (current_mode == 1) {
+    static unsigned long last_check = 0;
+    
+    // 每 300 毫秒扫描一次，防止打印过快刷屏
+    if (millis() - last_check > 300) { 
+      last_check = millis();
+      for (int i = 0; i < num_pins; i++) {
+        // 如果读取到低电平（被拉到GND）
+        if (digitalRead(safe_gpios[i]) == LOW) {
+          Serial.print("⚠️ 检测到低电平输入，触发引脚 GPIO: ");
+          Serial.println(safe_gpios[i]);
+        }
+      }
+    }
+  }
+}

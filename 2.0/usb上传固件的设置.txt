@@ -1,0 +1,4 @@
+一定要设置这个,tool里面
+tool-->
+USB CDC On Boot: 必须选 Enabled
+Upload  MODE: USB-OTG(tiny USB) 要设置关键-----------这个最关键

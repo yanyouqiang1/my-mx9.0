@@ -1,0 +1,387 @@
+#include <Adafruit_NeoPixel.h>
+
+// ================= C3 引脚定义 =================
+#define PIN_CPG         1   // CPG按键 (切换到CPG模式/切换灯效)
+#define PIN_MUTE        2   // 静音按键 (切换到音量控制模式)
+#define PIN_LIGHT       3   // 灯光按键 (切换到亮度控制模式)
+#define PIN_KNOB_BTN    0   // 旋转按钮按键 (按下一键关灯)
+#define PIN_ENCODER_A   5   // 左旋 (CLK)
+#define PIN_ENCODER_B   6   // 右旋 (DT)
+
+#define PIN_WS2812      21  // 主灯条数据引脚
+#define PIN_INDICATOR   9   // 底部指示灯引脚 
+
+#define RX_PIN          10  // 串口 RX 接 S3 的 9
+#define TX_PIN          20  // 串口 TX 接 S3 的 10
+
+#define NUM_LEDS        16  // 主灯珠数量
+#define NUM_INDICATORS  3   // 指示灯数量 (CPG、静音、灯光)
+
+Adafruit_NeoPixel strip(NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel indicatorStrip(NUM_INDICATORS, PIN_INDICATOR, NEO_GRB + NEO_KHZ800);
+
+// ================= 全局状态变量 =================
+enum ControlMode { MODE_CPG, MODE_MUTE, MODE_LIGHT };
+ControlMode currentMode = MODE_LIGHT; // 默认控制灯光
+
+uint8_t brightness = 140;    
+uint8_t currentEffect = 1;     // 当前灯效 
+const uint8_t MAX_EFFECTS = 14; // 扩展到14种模式(0-13)
+
+/* 灯效对应表：
+ * 0: 关灯
+ * 1: 常亮 - 红
+ * 2: 常亮 - 绿
+ * 3: 常亮 - 蓝
+ * 4: 常亮 - 冰蓝
+ * 5: 常亮 - 白色 
+ * 6: 呼吸 - 红
+ * 7: 呼吸 - 绿
+ * 8: 呼吸 - 蓝
+ * 9: 呼吸 - 冰蓝
+ * 10: 经典单色跑马灯
+ * 11: 电竞双色跑马灯 (游戏效果)
+ * 12: 彩虹
+ * 13: 自动循环模式 (1-12轮流播放)
+ */
+
+bool isNotifying = false;      // 是否处于"通知"爆闪状态
+bool g_forceRedraw = true;     // 全局重绘标志，防止静态灯效刷屏抢占信号
+
+// 编码器与按键状态
+int lastClkState;
+unsigned long lastEffectUpdate = 0;
+uint16_t effectFrame = 0;
+
+void setup() {
+  Serial.begin(115200);                                 // 调试用
+  Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);    // 与 S3 通信的串口
+
+  pinMode(PIN_CPG, INPUT_PULLUP);
+  pinMode(PIN_MUTE, INPUT_PULLUP);
+  pinMode(PIN_LIGHT, INPUT_PULLUP);
+  pinMode(PIN_KNOB_BTN, INPUT_PULLUP);
+  
+  pinMode(PIN_ENCODER_A, INPUT_PULLUP);
+  pinMode(PIN_ENCODER_B, INPUT_PULLUP);
+  lastClkState = digitalRead(PIN_ENCODER_A);
+
+  delay(100); // 稍微延时，等待板载电源电压稳定
+
+  // 初始化主灯带
+  strip.begin();
+  strip.setBrightness(brightness);
+  strip.show(); 
+
+  // 初始化底部指示灯带
+  pinMode(PIN_INDICATOR, OUTPUT);    // 明确设置指示灯引脚为输出模式
+  indicatorStrip.begin();
+  indicatorStrip.setBrightness(80);  // 保持指示灯适度亮度
+  updateIndicators();                // 更新初始指示灯状态
+}
+
+void loop() {
+  handleSerial();
+  handleButtons();
+  handleEncoder();
+  updateLightingEffect();
+}
+
+// ================= 1. 串口通信处理 =================
+void handleSerial() {
+  if (Serial1.available()) {
+    String msg = Serial1.readStringUntil('\n');
+    msg.trim();
+    if (msg == "N_ME") { // 收到ME更新通知
+      isNotifying = true;
+      effectFrame = 0;
+      Serial.println("收到ME记忆更新，触发提示灯效！");
+    }
+  }
+}
+
+void clearNotification() {
+  if (isNotifying) {
+    isNotifying = false;
+    strip.clear();
+    strip.show();
+    g_forceRedraw = true; // 退出通知后强制重新绘制常规灯效
+  }
+}
+
+// ================= 2. 底部指示灯更新 =================
+// 规则：CPG对应1号灯(索引0)，静音对应2号灯(索引1)，灯光对应3号灯(索引2)
+void updateIndicators() {
+  indicatorStrip.clear();
+  switch (currentMode) {
+    case MODE_CPG:
+      indicatorStrip.setPixelColor(0, indicatorStrip.Color(120, 0, 120)); // 1号灯 紫色代表CPG模式
+      break;
+    case MODE_MUTE:
+      indicatorStrip.setPixelColor(1, indicatorStrip.Color(120, 0, 0));   // 2号灯 红色代表静音模式
+      break;
+    case MODE_LIGHT:
+      indicatorStrip.setPixelColor(2, indicatorStrip.Color(0, 120, 0));   // 3号灯 绿色代表灯光模式
+      break;
+  }
+  indicatorStrip.show();
+}
+
+// ================= 3. 按键处理 =================
+void handleButtons() {
+  unsigned long now = millis();
+  static unsigned long lastBtnTime = 0;
+  
+  if (now - lastBtnTime < 50) return; // 统一防抖
+
+  // 1. 静音按键 -> 切换音量控制模式
+  if (digitalRead(PIN_MUTE) == LOW) {
+    currentMode = MODE_MUTE;
+    updateIndicators();
+    clearNotification();
+    Serial.println("模式切换: 控制音量");
+    lastBtnTime = now;
+    while(digitalRead(PIN_MUTE) == LOW) delay(10); 
+  }
+
+  // 2. 灯光按键 -> 切换灯光控制模式
+  if (digitalRead(PIN_LIGHT) == LOW) {
+    currentMode = MODE_LIGHT;
+    updateIndicators();
+    clearNotification();
+    Serial.println("模式切换: 控制亮度");
+    lastBtnTime = now;
+    while(digitalRead(PIN_LIGHT) == LOW) delay(10); 
+  }
+
+  // 3. CPG 按键 -> 切换至CPG模式 并切换下一个灯效
+  if (digitalRead(PIN_CPG) == LOW) {
+    currentMode = MODE_CPG;
+    updateIndicators();
+    currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+    if (currentEffect == 0) currentEffect = 1; // 物理按键切换跳过“关灯”状态
+    clearNotification();
+    effectFrame = 0;
+    g_forceRedraw = true; // 强制重绘新效果
+    Serial.printf("模式切换: CPG模式, 当前灯效: %d\n", currentEffect);
+    lastBtnTime = now;
+    while(digitalRead(PIN_CPG) == LOW) delay(10); 
+  }
+
+  // 4. 旋钮按键 -> 直接关灯 (切换到效果0)
+  if (digitalRead(PIN_KNOB_BTN) == LOW) {
+    currentEffect = 0; 
+    clearNotification();
+    g_forceRedraw = true; // 触发一次清屏
+    Serial.println("一键关灯");
+    lastBtnTime = now;
+    while(digitalRead(PIN_KNOB_BTN) == LOW) delay(10); 
+  }
+}
+
+// ================= 4. 旋转编码器处理 =================
+void handleEncoder() {
+  int currentClk = digitalRead(PIN_ENCODER_A);
+  if (currentClk != lastClkState && currentClk == LOW) {
+    clearNotification(); 
+
+    // 旋转方向逻辑 (== 代表左旋减小，右旋增加)
+    bool isRight = (digitalRead(PIN_ENCODER_B) == currentClk);
+
+    if (currentMode == MODE_LIGHT) {
+      // ------ 控光模式：调节亮度 ------
+      if (isRight) {
+        // 安全限制：最高亮度限制在 220，防止电流过载
+        brightness = (brightness <= 200) ? brightness + 20 : 220; 
+      } else {
+        brightness = (brightness >= 20) ? brightness - 20 : 0;
+      }
+      strip.setBrightness(brightness);
+      if (currentEffect == 0 && brightness > 0) currentEffect = 1; 
+      g_forceRedraw = true; // 亮度改变时强制重绘
+      strip.show();
+      Serial.printf("调整亮度: %d\n", brightness);
+      
+    } else if (currentMode == MODE_MUTE) {
+      // ------ 音量模式：发送指令给S3 ------
+      if (isRight) {
+        Serial1.println("V+");
+      } else {
+        Serial1.println("V-");
+      }
+    } else if (currentMode == MODE_CPG) {
+      // ------ CPG模式：旋钮切换灯效 ------
+      if (isRight) {
+        currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+      } else {
+        currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
+      }
+      effectFrame = 0; 
+      g_forceRedraw = true; // 灯效改变时强制重绘
+      Serial.printf("旋钮切换灯效: %d\n", currentEffect);
+    }
+  }
+  lastClkState = currentClk;
+}
+
+// ================= 5. 灯光特效实现 =================
+
+// 辅助函数：处理呼吸算法
+void drawBreathing(uint8_t maxR, uint8_t maxG, uint8_t maxB) {
+  float val = (exp(sin(effectFrame * 0.03)) - 0.36787944) * 108.0;
+  float ratio = val / 255.0;
+  if(ratio > 1.0) ratio = 1.0;
+  if(ratio < 0.0) ratio = 0.0;
+  strip.fill(strip.Color(maxR * ratio, maxG * ratio, maxB * ratio));
+  strip.show();
+  effectFrame++;
+}
+
+void updateLightingEffect() {
+  unsigned long now = millis();
+
+  // 1. 优先播放通知灯效 (强烈闪烁)
+  if (isNotifying) {
+    if (now - lastEffectUpdate > 80) { 
+      lastEffectUpdate = now;
+      if (effectFrame % 2 == 0) {
+        strip.fill(strip.Color(255, 200, 0)); // 金黄色
+      } else {
+        strip.fill(strip.Color(0, 255, 255)); // 青蓝色
+      }
+      strip.show();
+      effectFrame++;
+      if (effectFrame > 20) {
+        isNotifying = false;
+        strip.clear();
+        strip.show();
+        g_forceRedraw = true; // 退出通知后强制重绘当前效果
+      }
+    }
+    return;
+  }
+
+  // 0: 关灯状态
+  if (currentEffect == 0) {
+    if (g_forceRedraw) {
+      strip.clear();
+      strip.show();
+      g_forceRedraw = false;
+    }
+    return; 
+  }
+
+  // 2. 自动循环逻辑：处于模式 13 时，自动轮流播放 1-12 号模式
+  uint8_t displayEffect = currentEffect;
+  static unsigned long lastAutoSwitchTime = 0;
+  static uint8_t autoCycleIndex = 1;
+  
+  if (currentEffect == 13) {
+    if (now - lastAutoSwitchTime > 8000) { // 每 8 秒自动切换下一个
+      lastAutoSwitchTime = now;
+      autoCycleIndex++;
+      if (autoCycleIndex > 12) autoCycleIndex = 1;
+      effectFrame = 0; 
+      g_forceRedraw = true; // 自动切换时强制重绘静态效果
+    }
+    displayEffect = autoCycleIndex;
+  }
+
+  // 3. 执行对应的灯效渲染
+  switch (displayEffect) {
+    // ---- 常亮系列 (通过 g_forceRedraw 控制，仅在需要时更新一次，避免死循环高频刷新抢占总线) ----
+    case 1: 
+      if (g_forceRedraw) {
+        strip.fill(strip.Color(255, 0, 0)); 
+        strip.show(); 
+        g_forceRedraw = false;
+      } 
+      break;     // 常亮红
+    case 2: 
+      if (g_forceRedraw) {
+        strip.fill(strip.Color(0, 255, 0)); 
+        strip.show(); 
+        g_forceRedraw = false;
+      } 
+      break;     // 常亮绿
+    case 3: 
+      if (g_forceRedraw) {
+        strip.fill(strip.Color(0, 0, 255)); 
+        strip.show(); 
+        g_forceRedraw = false;
+      } 
+      break;     // 常亮蓝
+    case 4: 
+      if (g_forceRedraw) {
+        strip.fill(strip.Color(0, 127, 255)); 
+        strip.show(); 
+        g_forceRedraw = false;
+      } 
+      break;   // 常亮冰蓝
+    case 5: 
+      if (g_forceRedraw) {
+        strip.fill(strip.Color(255, 255, 255)); 
+        strip.show(); 
+        g_forceRedraw = false;
+      } 
+      break; // 常亮白色
+
+    // ---- 呼吸系列 (呼吸效果由时间控制器进行非阻塞渲染，渲染时自动清除重绘标志) ----
+    case 6: // 呼吸红
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(255, 0, 0); g_forceRedraw = false; } break;
+    case 7: // 呼吸绿
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 255, 0); g_forceRedraw = false; } break;
+    case 8: // 呼吸蓝
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 0, 255); g_forceRedraw = false; } break;
+    case 9: // 呼吸冰蓝
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 127, 255); g_forceRedraw = false; } break;
+
+    // ---- 动态与游戏系列 ----
+    case 10: // 经典单色跑马灯
+      if (now - lastEffectUpdate > 60) {
+        lastEffectUpdate = now;
+        strip.clear();
+        int head = effectFrame % NUM_LEDS;
+        strip.setPixelColor(head, strip.Color(255, 0, 150)); 
+        strip.setPixelColor((head + NUM_LEDS - 1) % NUM_LEDS, strip.Color(50, 0, 20));
+        strip.show();
+        effectFrame++;
+        g_forceRedraw = false;
+      }
+      break;
+
+    case 11: // 电竞双色跑马灯 (游戏效果)
+      if (now - lastEffectUpdate > 50) { 
+        lastEffectUpdate = now;
+        strip.clear();
+        
+        // 头部 1：电竞绿
+        int head1 = effectFrame % NUM_LEDS;
+        strip.setPixelColor(head1, strip.Color(0, 255, 100)); 
+        strip.setPixelColor((head1 + NUM_LEDS - 1) % NUM_LEDS, strip.Color(0, 80, 30)); 
+        
+        // 头部 2：霓虹紫
+        int head2 = (effectFrame + NUM_LEDS / 2) % NUM_LEDS;
+        strip.setPixelColor(head2, strip.Color(180, 0, 255)); 
+        strip.setPixelColor((head2 + NUM_LEDS - 1) % NUM_LEDS, strip.Color(50, 0, 80)); 
+        
+        strip.show();
+        effectFrame++;
+        g_forceRedraw = false;
+      }
+      break;
+      
+    case 12: // 彩虹
+      if (now - lastEffectUpdate > 20) {
+        lastEffectUpdate = now;
+        for (int i = 0; i < NUM_LEDS; i++) {
+          int pixelHue = effectFrame + (i * 65536L / NUM_LEDS);
+          strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue)));
+        }
+        strip.show();
+        effectFrame += 256;
+        g_forceRedraw = false;
+      }
+      break;
+  }
+}

@@ -1,0 +1,222 @@
+#include "USB.h"
+#include "USBHIDKeyboard.h"
+#include "USBHIDConsumerControl.h" 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <Wire.h>
+#include <Adafruit_MCP23X17.h>
+#include <Adafruit_NeoPixel.h>
+
+// ================= 1. 引脚定义 =================
+#define I2C_SDA 14
+#define I2C_SCL 13
+#define MCP23017_ADDR 0x20 
+
+#define LED_PIN        5    // 灯带引脚
+#define NUMPIXELS      16   // 灯珠总数
+#define ENC_SW         17   // 旋钮按下
+#define ENC_A          15   // 旋钮左旋
+#define ENC_B          16   // 旋钮右旋
+#define BTN_LIGHT      46   // 灯光按键
+#define BTN_MUTE       3    // 静音按键
+#define BTN_CPG        18   // CPG按键
+
+#define DEBOUNCE_DELAY 20
+#define PRESSED_VAL LOW  
+
+// ================= 2. 实例与变量 =================
+USBHIDKeyboard Keyboard;
+USBHIDConsumerControl Consumer; 
+Preferences preferences;
+Adafruit_MCP23X17 mcp;
+Adafruit_NeoPixel strip(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+bool lightOn = true;        
+int lightMode = 0;          // 0:呼吸灯, 1:彩虹跑马灯
+unsigned long lastLedUpdate = 0;
+int breathVal = 0;
+int breathStep = 1;
+uint16_t hueValue = 0;
+
+// 矩阵扫描相关
+const int rowPins[] = {1, 2, 42, 41, 40, 39, 38, 47, 21, 12}; 
+const int numRows = 10;
+const int numCols = 16; 
+uint16_t keyMatrix[numRows][numCols] = {0};
+bool lastState[numRows][numCols] = {false};
+unsigned long lastDebounceTime[numRows][numCols] = {0};
+
+#define MACRO_BASE 0x1000 
+
+// !!! 请在这里补充你原来的 initKeyMatrix() 函数，包含那一大堆 keyMatrix[0][0] = ...
+void initKeyMatrix() {
+    // [此处粘贴你原来的矩阵映射代码]
+}
+
+// ================= 3. 功能函数 =================
+
+// 非阻塞灯效处理
+void updateLEDs() {
+    if (!lightOn) {
+        strip.fill(0);
+        strip.show();
+        return;
+    }
+
+    unsigned long now = millis();
+    if (lightMode == 0) { // 模式0：平滑呼吸
+        if (now - lastLedUpdate > 20) {
+            lastLedUpdate = now;
+            breathVal += breathStep;
+            // 限制最大亮度为 100，防止拉垮电源
+            if (breathVal <= 0 || breathVal >= 100) breathStep = -breathStep;
+            
+            uint32_t color = strip.gamma32(strip.ColorHSV(hueValue, 255, breathVal));
+            strip.fill(color);
+            strip.show();
+            hueValue += 30; // 颜色缓慢变化
+        }
+    } 
+    else { // 模式1：跑马灯
+        if (now - lastLedUpdate > 40) {
+            lastLedUpdate = now;
+            static uint16_t j = 0;
+            for(int i=0; i<strip.numPixels(); i++) {
+                uint16_t pixelHue = j + (i * 65536L / strip.numPixels());
+                // 亮度控制在 80
+                strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue, 255, 80)));
+            }
+            strip.show();
+            j += 800;
+        }
+    }
+}
+
+// 旋钮逻辑
+void handleEncoder() {
+    static bool lastEncA = HIGH;
+    bool currentA = digitalRead(ENC_A);
+    
+    if (currentA != lastEncA) {
+        if (digitalRead(ENC_B) != currentA) {
+            Consumer.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+            Consumer.release();
+        } else {
+            Consumer.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+            Consumer.release();
+        }
+        delay(2); // 极短物理去抖
+    }
+    lastEncA = currentA;
+
+    static unsigned long lastSwPress = 0;
+    if (digitalRead(ENC_SW) == LOW && (millis() - lastSwPress > 400)) {
+        Keyboard.press(KEY_RETURN); // 旋钮按下模拟回车
+        Keyboard.releaseAll();
+        lastSwPress = millis();
+    }
+}
+
+// 独立按键
+void handleExtraButtons() {
+    static unsigned long lastBtnTime[3] = {0, 0, 0};
+
+    if (digitalRead(BTN_MUTE) == LOW && (millis() - lastBtnTime[0] > 400)) {
+        Consumer.press(CONSUMER_CONTROL_MUTE);
+        Consumer.release();
+        lastBtnTime[0] = millis();
+    }
+
+    if (digitalRead(BTN_LIGHT) == LOW && (millis() - lastBtnTime[1] > 400)) {
+        lightOn = !lightOn;
+        lastBtnTime[1] = millis();
+    }
+
+    if (digitalRead(BTN_CPG) == LOW && (millis() - lastBtnTime[2] > 400)) {
+        lightMode = (lightMode + 1) % 2;
+        lastBtnTime[2] = millis();
+    }
+}
+
+// ================= 4. 初始化 =================
+void setup() {
+    // 【核心还原保护】：上电先停5秒，此时你点烧录按钮必成功
+    delay(5000); 
+
+    Serial.begin(115200);
+    
+    // 初始化独立IO
+    pinMode(ENC_SW, INPUT_PULLUP);
+    pinMode(ENC_A, INPUT_PULLUP);
+    pinMode(ENC_B, INPUT_PULLUP);
+    pinMode(BTN_LIGHT, INPUT_PULLUP);
+    pinMode(BTN_MUTE, INPUT_PULLUP);
+    pinMode(BTN_CPG, INPUT_PULLUP);
+
+    // 初始化灯带并严格限制亮度
+    strip.begin();
+    strip.setBrightness(80); // 全局亮度限制在 80/255
+    strip.show(); 
+
+    // 初始化USB相关
+    Keyboard.begin();
+    Consumer.begin();
+    USB.begin();
+
+    Wire.begin(I2C_SDA, I2C_SCL);
+    if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
+        Serial.println("MCP23017 not found, check hardware!");
+        // 不再死循环，方便调试
+    }
+
+    preferences.begin("macros", false);
+    LittleFS.begin(true);
+    initKeyMatrix();
+
+    for (int c = 0; c < numCols; c++) { 
+        mcp.pinMode(c, OUTPUT); 
+        mcp.digitalWrite(c, HIGH); 
+    }
+    for (int r = 0; r < numRows; r++) { 
+        pinMode(rowPins[r], INPUT_PULLUP); 
+    }
+    
+    Serial.println("System Ready with Safety Delay");
+}
+
+void loop() {
+    // 1. 灯效更新
+    updateLEDs();
+
+    // 2. 旋钮与独立按键
+    handleEncoder();
+    handleExtraButtons();
+
+    // 3. 矩阵扫描
+    for (int c = 0; c < numCols; c++) {
+        mcp.digitalWrite(c, LOW); 
+        delayMicroseconds(20);
+        for (int r = 0; r < numRows; r++) {
+            bool currentState = (digitalRead(rowPins[r]) == PRESSED_VAL);
+            if (currentState != lastState[r][c]) {
+                if (millis() - lastDebounceTime[r][c] > DEBOUNCE_DELAY) {
+                    lastState[r][c] = currentState;
+                    lastDebounceTime[r][c] = millis();
+                    uint16_t keycode = keyMatrix[r][c];
+                    if (keycode == 0) continue;
+                    
+                    if (currentState) {
+                        if (keycode < MACRO_BASE) Keyboard.press((uint8_t)keycode);
+                        // else executeMacro(...) [此处调用你原来的宏逻辑]
+                    } else {
+                        if (keycode < MACRO_BASE) Keyboard.release((uint8_t)keycode);
+                    }
+                }
+            }
+        }
+        mcp.digitalWrite(c, HIGH);
+    }
+}
