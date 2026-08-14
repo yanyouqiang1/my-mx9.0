@@ -1,0 +1,120 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <NetworkUdp.h>
+#include <ArduinoOTA.h>
+
+// ==================== 自定义热点配置 ====================
+const char *ap_ssid = "ESP32_OTA_Hotspot";  
+const char *ap_password = "12345678";        
+
+// ==================== ESP32-S3 RGB 呼吸灯配置 ====================
+#ifndef RGB_BUILTIN
+#define RGB_BUILTIN 48              // 备用定义：绝大多数 ESP32-S3 开发板内置 RGB 灯接在 GPIO 48（或 38）上
+#endif
+
+uint32_t last_ota_time = 0;         
+uint32_t last_breath_time = 0;      
+
+int brightness = 0;                 // 亮度 (0 - 255)
+int fadeAmount = 3;                 // 每次亮度的变化步长（值越小，呼吸越平缓）
+const int breathInterval = 20;      // 20 毫秒微调一次亮度
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n--- ESP32-S3 专属 AP [RGB七彩呼吸灯] 启动 ---");
+
+  // 注意：彩色 WS2812 灯使用的是串行总线驱动，不需要写 pinMode(RGB_BUILTIN, OUTPUT)
+
+  // ==================== 1. 健壮的 AP（热点）初始化 ====================
+  WiFi.persistent(false);        
+  WiFi.disconnect(true);         
+  WiFi.softAPdisconnect(true);   
+  delay(150);                    
+
+  WiFi.mode(WIFI_AP);            
+  delay(150);                    
+
+  if (WiFi.softAP(ap_ssid, ap_password)) {
+    Serial.println("✓ WiFi 热点创建成功！");
+  } else {
+    Serial.println("❌ WiFi 热点创建失败！请检查密码是否 >= 8 位。");
+  }
+
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("ESP32 的 IP 地址是: ");
+  Serial.println(myIP);
+
+  // ==================== 2. 配置 ArduinoOTA ====================
+  ArduinoOTA.setHostname("esp32-ap-ota");
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  
+        type = "filesystem";
+      }
+      Serial.println("\n=================================");
+      Serial.println("OTA 升级开始: " + type);
+      Serial.println("=================================");
+    })
+    .onEnd([]() {
+      Serial.println("\n=================================");
+      Serial.println("✅ OTA 升级成功! 即将重启...");
+      Serial.println("=================================");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      if (millis() - last_ota_time > 500) {
+        Serial.printf("升级进度: %u%%\r", (progress / (total / 100)));
+        last_ota_time = millis();
+      }
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("\n错误代码[%u]: ", error);
+    });
+
+  ArduinoOTA.begin();
+
+  Serial.println("✓ OTA 服务器已就绪");
+  Serial.println("----------------------------------\n");
+}
+
+void loop() {
+  // ==================== 3. 核心：必须保持 OTA 实时响应 ====================
+  ArduinoOTA.handle();
+
+  // ==================== 4. 非阻塞 RGB 呼吸灯业务逻辑 ====================
+  if (millis() - last_breath_time > breathInterval) {
+    brightness += fadeAmount;
+
+    // 因为内置 RGB 灯满载亮度（255）时非常刺眼，这里建议将最大亮度限制在 120 左右，既好看又保护眼睛
+    if (brightness <= 0 || brightness >= 120) {
+      fadeAmount = -fadeAmount; // 达到边界值时，反转变化方向
+    }
+
+    brightness = constrain(brightness, 0, 120);
+
+    // =======================================================
+    // 调用内置 neopixelWrite(引脚, 红, 绿, 蓝) 控制彩色灯
+    // =======================================================
+    
+    // 示范 1：红色呼吸灯
+    neopixelWrite(RGB_BUILTIN, brightness, 0, 0); 
+    
+    // 如果你想换成其他颜色的呼吸灯，只需取消注释下面任意一行，并注释掉红色：
+    // 示范 2：绿色呼吸灯
+    // neopixelWrite(RGB_BUILTIN, 0, brightness, 0); 
+    
+    // 示范 3：蓝色呼吸灯
+    // neopixelWrite(RGB_BUILTIN, 0, 0, brightness); 
+    
+    // 示范 4：青色呼吸灯（绿色和蓝色混合）
+    // neopixelWrite(RGB_BUILTIN, 0, brightness, brightness); 
+
+    // 更新时间戳
+    last_breath_time = millis();
+  }
+}

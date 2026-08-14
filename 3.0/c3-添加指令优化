@@ -1,0 +1,636 @@
+#include <Adafruit_NeoPixel.h>
+
+// ================= C3 引脚定义 =================
+#define PIN_CPG         1   // CPG按键 (切换到CPG模式/切换灯效)
+#define PIN_MUTE        2   // 静音按键 (切换到音量控制模式)
+#define PIN_LIGHT       3   // 灯光按键 (切换到亮度控制模式)
+#define PIN_KNOB_BTN    0   // 旋转按钮按键 (长按一键关灯 / 短按重置回按键特效颜色配置)
+#define PIN_ENCODER_A   5   // 左旋 (CLK)
+#define PIN_ENCODER_B   6   // 右旋 (DT)
+
+#define PIN_WS2812      21  // 主灯条数据引脚
+#define PIN_INDICATOR   9   // 底部指示灯引脚 
+
+#define RX_PIN          10  // 串口 RX 接 S3 的 9
+#define TX_PIN          20  // 串口 TX 接 S3 的 10
+
+#define NUM_LEDS        16  // 主灯珠数量
+#define NUM_INDICATORS  3   // 指示灯数量 (CPG、静音、灯光)
+
+Adafruit_NeoPixel strip(NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel indicatorStrip(NUM_INDICATORS, PIN_INDICATOR, NEO_GRB + NEO_KHZ800);
+
+// ================= 全局状态与控制模式 =================
+enum ControlMode { 
+  MODE_CPG,         // CPG 灯效控制模式 (旋钮切背景效果)
+  MODE_MUTE,        // 音量控制模式 (旋钮发送 V+/V-)
+  MODE_LIGHT,       // 亮度控制模式 (旋钮控制全局亮度)
+  MODE_KEY_COLOR    // 按键扩散色彩配置模式 (旋钮控制 N_KEY_PRESS 扩散的颜色)
+};
+ControlMode currentMode = MODE_LIGHT; // 默认控制灯光亮度
+
+uint8_t brightness = 140;    
+uint8_t currentEffect = 1;     // 当前灯效 
+const uint8_t MAX_EFFECTS = 14; // 扩展到14种模式(0-13)
+
+/* CPG灯效对应表：
+ * 0: 关灯
+ * 1-5: 常亮 (红、绿、蓝、冰蓝、白)
+ * 6-9: 呼吸 (红、绿、蓝、冰蓝)
+ * 10: 经典单色左右来回扫描跑马灯 (Knight Rider)
+ * 11: 双色交叉左右来回扫射跑马灯 
+ * 12: 彩虹
+ * 13: 自动循环模式 (1-12轮流播放)
+ */
+
+// ================= 系统与特殊状态管理 =================
+enum SystemState { 
+  SYS_NORMAL,       // 正常运行模式
+  SYS_NOTIFY_ME,    // N_ME 收到记忆更新 (爆闪)
+  SYS_REBOOT,       // N_REBOT 键盘重启 (红绿蓝白过渡)
+  SYS_ROOT          // N_ROOT 刷机模式 (黄灯持续闪烁)
+};
+SystemState sysState = SYS_NORMAL;
+
+unsigned long lastSysUpdate = 0;
+int sysFrame = 0;
+bool g_forceRedraw = true;     // 全局重绘标志，防止静态灯效刷屏抢占信号
+
+// ================= 按键按下散开特效变量 =================
+bool isRippleActive = false;
+int rippleStep = 0;
+unsigned long lastRippleUpdate = 0;
+uint32_t currentRippleColor = 0;
+
+// 按键扩散特效的可选颜色模式 (0: 自动循环切换，1-7: 固定单色)
+uint8_t keypressColorMode = 0; 
+const char* keypressColorNames[] = { "自动彩环", "热血红", "极光绿", "深海蓝", "冰晶蓝", "幻境紫", "柠檬黄", "纯净白" };
+const uint32_t keypressColors[] = {
+  0x000000,   // 占位符 (0号为自动模式)
+  0xFF0000,   // 1: 红
+  0x00FF00,   // 2: 绿
+  0x0000FF,   // 3: 蓝
+  0x00FFFF,   // 4: 冰蓝
+  0xB400FF,   // 5: 紫
+  0xFFFF00,   // 6: 黄
+  0xFFFFFF    // 7: 白
+};
+
+// ================= 物理按键异步防抖变量 =================
+bool lastMuteState = HIGH;
+unsigned long lastMuteTime = 0;
+
+bool lastLightState = HIGH;
+unsigned long lastLightTime = 0;
+
+bool lastCpgState = HIGH;
+unsigned long lastCpgTime = 0;
+
+bool lastKnobState = HIGH;
+unsigned long lastKnobTime = 0;
+unsigned long knobPressStart = 0;
+bool knobWasPressed = false;
+
+// 编码器状态
+int lastClkState;
+unsigned long lastEffectUpdate = 0;
+uint16_t effectFrame = 0;
+
+// 串口缓存
+String inputBuffer = "";
+
+void setup() {
+  Serial.begin(115200);                                 // 调试用
+  Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);    // 与 S3 通信的串口
+
+  pinMode(PIN_CPG, INPUT_PULLUP);
+  pinMode(PIN_MUTE, INPUT_PULLUP);
+  pinMode(PIN_LIGHT, INPUT_PULLUP);
+  pinMode(PIN_KNOB_BTN, INPUT_PULLUP);
+  
+  pinMode(PIN_ENCODER_A, INPUT_PULLUP);
+  pinMode(PIN_ENCODER_B, INPUT_PULLUP);
+  lastClkState = digitalRead(PIN_ENCODER_A);
+
+  delay(100); // 稍微延时，等待板载电源电压稳定
+
+  // 初始化主灯带
+  strip.begin();
+  strip.setBrightness(brightness);
+  strip.show(); 
+
+  // 初始化底部指示灯带
+  pinMode(PIN_INDICATOR, OUTPUT);    // 明确设置指示灯引脚为输出模式
+  indicatorStrip.begin();
+  indicatorStrip.setBrightness(80);  // 保持指示灯适度亮度
+  updateIndicators();                // 更新初始指示灯状态
+}
+
+void loop() {
+  handleSerial();
+  handleButtons();
+  handleEncoder();
+  updateLightingEffect();
+}
+
+// ================= 1. 串口通信处理 (完全非阻塞) =================
+void handleSerial() {
+  while (Serial1.available() > 0) {
+    char c = Serial1.read();
+    if (c == '\n') {
+      inputBuffer.trim();
+      processSerialCommand(inputBuffer);
+      inputBuffer = ""; // 清空缓冲区准备下一次接收
+    } else if (c != '\r') {
+      inputBuffer += c;
+      if (inputBuffer.length() > 64) { // 防止溢出
+        inputBuffer = "";
+      }
+    }
+  }
+}
+
+// 解析和响应来自 S3 的指令
+void processSerialCommand(String cmd) {
+  if (cmd == "N_ME") {
+    sysState = SYS_NOTIFY_ME;
+    sysFrame = 0;
+    lastSysUpdate = millis();
+    Serial.println("收到ME记忆更新");
+  } 
+  else if (cmd == "N_REBOT") {
+    sysState = SYS_REBOOT;
+    sysFrame = 0;
+    lastSysUpdate = millis();
+    Serial.println("收到键盘重启信号");
+  } 
+  else if (cmd == "N_ROOT") {
+    sysState = SYS_ROOT;
+    sysFrame = 0;
+    lastSysUpdate = millis();
+    Serial.println("键盘进入刷机模式");
+  } 
+  else if (cmd == "N_KEY_PRESS") {
+    // 只有在非系统紧急状态下，才响应按键散开动效
+    if (sysState == SYS_NORMAL) {
+      triggerRipple();
+      // 【新增交互】：收到按键按下后，自动切换为“按键色彩配置模式”，以便旋钮可以直接控制它
+      currentMode = MODE_KEY_COLOR; 
+      updateIndicators();
+    }
+  }
+}
+
+// 安全退出系统特殊显示模式，恢复原常规灯效
+void exitSystemState() {
+  if (sysState != SYS_NORMAL) {
+    sysState = SYS_NORMAL;
+    strip.clear();
+    strip.show();
+    g_forceRedraw = true; // 强制重新绘制常规灯效
+  }
+}
+
+// ================= 2. 底部指示灯更新 =================
+void updateIndicators() {
+  indicatorStrip.clear();
+  switch (currentMode) {
+    case MODE_CPG:
+      indicatorStrip.setPixelColor(0, indicatorStrip.Color(120, 0, 120)); // 1号灯 紫色 (CPG模式)
+      break;
+    case MODE_MUTE:
+      indicatorStrip.setPixelColor(1, indicatorStrip.Color(120, 0, 0));   // 2号灯 红色 (静音模式)
+      break;
+    case MODE_LIGHT:
+      indicatorStrip.setPixelColor(2, indicatorStrip.Color(0, 120, 0));   // 3号灯 绿色 (灯光模式)
+      break;
+    case MODE_KEY_COLOR:
+      // 【视觉反馈】：3 颗指示灯一起亮起当前选择的扩散灯光颜色（调暗 30% 防止刺眼）
+      uint32_t activeColor = (keypressColorMode == 0) ? indicatorStrip.Color(80, 0, 80) : keypressColors[keypressColorMode];
+      uint8_t r = ((activeColor >> 16) & 0xFF) * 0.3;
+      uint8_t g = ((activeColor >> 8) & 0xFF) * 0.3;
+      uint8_t b = (activeColor & 0xFF) * 0.3;
+      indicatorStrip.fill(indicatorStrip.Color(r, g, b));
+      break;
+  }
+  indicatorStrip.show();
+}
+
+// ================= 3. 物理按键处理 (异步防抖) =================
+void handleButtons() {
+  unsigned long now = millis();
+
+  // 1. 静音按键 -> 切换音量控制模式
+  bool muteReading = digitalRead(PIN_MUTE);
+  if (muteReading != lastMuteState) {
+    lastMuteTime = now;
+    lastMuteState = muteReading;
+  }
+  if ((now - lastMuteTime) > 50) {
+    static bool muteTriggered = false;
+    if (muteReading == LOW && !muteTriggered) {
+      muteTriggered = true;
+      exitSystemState();
+      currentMode = MODE_MUTE;
+      updateIndicators();
+      Serial.println("模式切换: 控制音量");
+    } else if (muteReading == HIGH) {
+      muteTriggered = false;
+    }
+  }
+
+  // 2. 灯光按键 -> 切换灯光控制模式 (调节亮度)
+  bool lightReading = digitalRead(PIN_LIGHT);
+  if (lightReading != lastLightState) {
+    lastLightTime = now;
+    lastLightState = lightReading;
+  }
+  if ((now - lastLightTime) > 50) {
+    static bool lightTriggered = false;
+    if (lightReading == LOW && !lightTriggered) {
+      lightTriggered = true;
+      exitSystemState();
+      currentMode = MODE_LIGHT;
+      updateIndicators();
+      Serial.println("模式切换: 控制亮度");
+    } else if (lightReading == HIGH) {
+      lightTriggered = false;
+    }
+  }
+
+  // 3. CPG 按键 -> 强制切回 CPG 模式并控制背景灯效
+  bool cpgReading = digitalRead(PIN_CPG);
+  if (cpgReading != lastCpgState) {
+    lastCpgTime = now;
+    lastCpgState = cpgReading;
+  }
+  if ((now - lastCpgTime) > 50) {
+    static bool cpgTriggered = false;
+    if (cpgReading == LOW && !cpgTriggered) {
+      cpgTriggered = true;
+      exitSystemState();
+      
+      // 如果当前不是 CPG 模式，切入 CPG 模式；如果是 CPG 模式，则切换下一个灯效
+      if (currentMode != MODE_CPG) {
+        currentMode = MODE_CPG;
+        Serial.println("模式切换: CPG模式");
+      } else {
+        currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+        if (currentEffect == 0) currentEffect = 1; // 物理按键切换跳过“关灯”状态
+        Serial.printf("CPG模式内切换灯效: %d\n", currentEffect);
+      }
+      
+      updateIndicators();
+      effectFrame = 0;
+      g_forceRedraw = true; // 强制重绘新效果
+    } else if (cpgReading == HIGH) {
+      cpgTriggered = false;
+    }
+  }
+
+  // 4. 旋钮按键 -> 短按快速重置回按键特效色彩配置模式，长按一键关灯
+  bool knobReading = digitalRead(PIN_KNOB_BTN);
+  if (knobReading != lastKnobState) {
+    lastKnobTime = now;
+    lastKnobState = knobReading;
+  }
+  if ((now - lastKnobTime) > 50) {
+    if (knobReading == LOW) {
+      if (!knobWasPressed) {
+        knobWasPressed = true;
+        knobPressStart = now;
+      }
+    } else {
+      if (knobWasPressed) {
+        unsigned long pressDuration = now - knobPressStart;
+        knobWasPressed = false;
+        exitSystemState();
+        
+        if (pressDuration < 800) {
+          // ------ 短按：切换到按键色彩模式 ------
+          currentMode = MODE_KEY_COLOR;
+          updateIndicators();
+          Serial.println("模式切换: 按键扩散色彩配置模式");
+        } else {
+          // ------ 长按：一键关灯 ------
+          currentEffect = 0; 
+          g_forceRedraw = true; // 触发一次清屏
+          Serial.println("一键关灯 (长按触发)");
+        }
+      }
+    }
+  }
+}
+
+// ================= 4. 旋转编码器处理 =================
+void handleEncoder() {
+  int currentClk = digitalRead(PIN_ENCODER_A);
+  if (currentClk != lastClkState && currentClk == LOW) {
+    exitSystemState(); // 任何物理旋转操作立刻中断系统提醒模式
+
+    // 旋转方向逻辑 (== 代表左旋减小，右旋增加)
+    bool isRight = (digitalRead(PIN_ENCODER_B) == currentClk);
+
+    if (currentMode == MODE_LIGHT) {
+      // ------ 控光模式：调节亮度 ------
+      if (isRight) {
+        // 安全限制：最高亮度限制在 220，防止电流过载
+        brightness = (brightness <= 200) ? brightness + 20 : 220; 
+      } else {
+        brightness = (brightness >= 20) ? brightness - 20 : 0;
+      }
+      strip.setBrightness(brightness);
+      if (currentEffect == 0 && brightness > 0) currentEffect = 1; 
+      g_forceRedraw = true; // 亮度改变时强制重绘
+      strip.show();
+      Serial.printf("调整亮度: %d\n", brightness);
+      
+    } else if (currentMode == MODE_MUTE) {
+      // ------ 音量模式：发送指令给S3 ------
+      if (isRight) {
+        Serial1.println("V+");
+      } else {
+        Serial1.println("V-");
+      }
+      
+    } else if (currentMode == MODE_CPG) {
+      // ------ CPG模式：旋钮切换背景灯效 ------
+      if (isRight) {
+        currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+      } else {
+        currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
+      }
+      effectFrame = 0; 
+      g_forceRedraw = true; // 灯效改变时强制重绘
+      Serial.printf("旋钮切换背景灯效: %d\n", currentEffect);
+      
+    } else if (currentMode == MODE_KEY_COLOR) {
+      // ------ 按键色彩模式：旋钮调整按键扩散的灯光颜色 ------
+      if (isRight) {
+        keypressColorMode = (keypressColorMode + 1) % 8;
+      } else {
+        keypressColorMode = (keypressColorMode == 0) ? 7 : keypressColorMode - 1;
+      }
+      updateIndicators(); // 指示灯颜色同步更新显示
+      Serial.printf("旋钮修改按键扩散颜色: %s\n", keypressColorNames[keypressColorMode]);
+    }
+  }
+  lastClkState = currentClk;
+}
+
+// ================= 5. 灯光特效实现 =================
+
+// 开启按键扩散特效
+void triggerRipple() {
+  isRippleActive = true;
+  rippleStep = 0;
+  lastRippleUpdate = millis();
+  
+  // 确定本次散开的颜色
+  if (keypressColorMode == 0) {
+    // 自动切换模式：第一次红、第二次蓝、第三次绿、第四次紫等轮流散开
+    static uint8_t autoIndex = 0;
+    const uint32_t autoColors[] = { 0xFF0000, 0x0000FF, 0x00FF00, 0xB400FF, 0x00FFFF, 0xFFFFFF };
+    currentRippleColor = autoColors[autoIndex];
+    autoIndex = (autoIndex + 1) % 6;
+  } else {
+    // 固定单色模式
+    currentRippleColor = keypressColors[keypressColorMode];
+  }
+}
+
+// 按键散开特效的具体渲染 (从第7、8颗灯珠向两侧发散，伴随拖尾淡出)
+void updateRipple() {
+  unsigned long now = millis();
+  if (now - lastRippleUpdate > 40) { // 40ms/帧 散开速度
+    lastRippleUpdate = now;
+
+    // 对所有灯珠进行微弱调暗，形成好看的散开暗光拖尾
+    for (int i = 0; i < NUM_LEDS; i++) {
+      uint32_t c = strip.getPixelColor(i);
+      uint8_t r = (c >> 16) & 0xFF;
+      uint8_t g = (c >> 8) & 0xFF;
+      uint8_t b = c & 0xFF;
+      strip.setPixelColor(i, strip.Color(r * 0.4, g * 0.4, b * 0.4));
+    }
+
+    // 计算对称扩散边界并点亮
+    int left = (NUM_LEDS / 2 - 1) - rippleStep;
+    int right = (NUM_LEDS / 2) + rippleStep;
+
+    if (left >= 0) strip.setPixelColor(left, currentRippleColor);
+    if (right < NUM_LEDS) strip.setPixelColor(right, currentRippleColor);
+
+    strip.show();
+    rippleStep++;
+
+    // 当完全散开溢出边界后，结束动画
+    if (rippleStep > NUM_LEDS / 2) {
+      isRippleActive = false;
+      g_forceRedraw = true; // 结束后恢复常规背景灯效
+    }
+  }
+}
+
+// 系统紧急和串口通知状态渲染
+void handleSystemState(unsigned long now) {
+  switch (sysState) {
+    case SYS_NOTIFY_ME: // N_ME 记忆爆闪 (金黄与青蓝交替)
+      if (now - lastSysUpdate > 80) {
+        lastSysUpdate = now;
+        if (sysFrame % 2 == 0) {
+          strip.fill(strip.Color(255, 200, 0)); // 金黄色
+        } else {
+          strip.fill(strip.Color(0, 255, 255)); // 青蓝色
+        }
+        strip.show();
+        sysFrame++;
+        if (sysFrame > 20) { // 闪烁 10 次后结束
+          exitSystemState();
+        }
+      }
+      break;
+
+    case SYS_REBOOT: // N_REBOT 键盘重启倒计时 (红、绿、蓝、白依次切换)
+      if (now - lastSysUpdate > 400) { // 切换速度 400ms
+        lastSysUpdate = now;
+        if (sysFrame == 0) {
+          strip.fill(strip.Color(255, 0, 0)); // 红
+        } else if (sysFrame == 1) {
+          strip.fill(strip.Color(0, 255, 0)); // 绿
+        } else if (sysFrame == 2) {
+          strip.fill(strip.Color(0, 0, 255)); // 蓝
+        } else if (sysFrame == 3) {
+          strip.fill(strip.Color(255, 255, 255)); // 白
+        }
+        strip.show();
+        sysFrame++;
+        if (sysFrame > 4) { // 重启自检闭环
+          exitSystemState();
+        }
+      }
+      break;
+
+    case SYS_ROOT: // N_ROOT 刷机模式 (亮黄灯周期闪烁)
+      if (now - lastSysUpdate > 300) { // 300ms 快速闪烁
+        lastSysUpdate = now;
+        if (sysFrame % 2 == 0) {
+          strip.fill(strip.Color(255, 120, 0)); // 偏橙的亮黄色
+        } else {
+          strip.clear(); // 灭
+        }
+        strip.show();
+        sysFrame++;
+      }
+      break;
+      
+    default:
+      break;
+  }
+}
+
+// 辅助函数：处理呼吸算法
+void drawBreathing(uint8_t maxR, uint8_t maxG, uint8_t maxB) {
+  float val = (exp(sin(effectFrame * 0.03)) - 0.36787944) * 108.0;
+  float ratio = val / 255.0;
+  if(ratio > 1.0) ratio = 1.0;
+  if(ratio < 0.0) ratio = 0.0;
+  strip.fill(strip.Color(maxR * ratio, maxG * ratio, maxB * ratio));
+  strip.show();
+  effectFrame++;
+}
+
+void updateLightingEffect() {
+  unsigned long now = millis();
+
+  // 1. 系统提醒动画 (最高优先级)
+  if (sysState != SYS_NORMAL) {
+    handleSystemState(now);
+    return;
+  }
+
+  // 2. 按键散开反馈动画 (第二优先级)
+  if (isRippleActive) {
+    updateRipple();
+    return;
+  }
+
+  // 3. 常规灯效 (最低优先级)
+  if (currentEffect == 0) {
+    if (g_forceRedraw) {
+      strip.clear();
+      strip.show();
+      g_forceRedraw = false;
+    }
+    return; 
+  }
+
+  // 自动循环逻辑：处于模式 13 时，自动轮流播放 1-12 号模式
+  uint8_t displayEffect = currentEffect;
+  static unsigned long lastAutoSwitchTime = 0;
+  static uint8_t autoCycleIndex = 1;
+  
+  if (currentEffect == 13) {
+    if (now - lastAutoSwitchTime > 8000) { // 每 8 秒自动切换下一个
+      lastAutoSwitchTime = now;
+      autoCycleIndex++;
+      if (autoCycleIndex > 12) autoCycleIndex = 1;
+      effectFrame = 0; 
+      g_forceRedraw = true; // 自动切换时强制重绘静态效果
+    }
+    displayEffect = autoCycleIndex;
+  }
+
+  // 执行对应的常规灯效渲染
+  switch (displayEffect) {
+    // ---- 常亮系列 (通过 g_forceRedraw 控制，仅在需要时更新一次) ----
+    case 1: 
+      if (g_forceRedraw) { strip.fill(strip.Color(255, 0, 0)); strip.show(); g_forceRedraw = false; } break;     // 常亮红
+    case 2: 
+      if (g_forceRedraw) { strip.fill(strip.Color(0, 255, 0)); strip.show(); g_forceRedraw = false; } break;     // 常亮绿
+    case 3: 
+      if (g_forceRedraw) { strip.fill(strip.Color(0, 0, 255)); strip.show(); g_forceRedraw = false; } break;     // 常亮蓝
+    case 4: 
+      if (g_forceRedraw) { strip.fill(strip.Color(0, 127, 255)); strip.show(); g_forceRedraw = false; } break;   // 常亮冰蓝
+    case 5: 
+      if (g_forceRedraw) { strip.fill(strip.Color(255, 255, 255)); strip.show(); g_forceRedraw = false; } break; // 常亮白色
+
+    // ---- 呼吸系列 ----
+    case 6: // 呼吸红
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(255, 0, 0); g_forceRedraw = false; } break;
+    case 7: // 呼吸绿
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 255, 0); g_forceRedraw = false; } break;
+    case 8: // 呼吸蓝
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 0, 255); g_forceRedraw = false; } break;
+    case 9: // 呼吸冰蓝
+      if (now - lastEffectUpdate > 15) { lastEffectUpdate = now; drawBreathing(0, 127, 255); g_forceRedraw = false; } break;
+
+    // ---- 动态扫描与扫射系列 ----
+    case 10: // 左右来回跑马灯 (经典单色红色 Knight Rider 扫射扫回效果)
+      if (now - lastEffectUpdate > 50) {
+        lastEffectUpdate = now;
+        strip.clear();
+        
+        int totalSteps = (NUM_LEDS - 1) * 2; // 往返完整周期步骤
+        int step = effectFrame % totalSteps;
+        int pos = (step < NUM_LEDS) ? step : (totalSteps - step); // 计算当前LED索引
+        
+        // 渲染高亮头部
+        strip.setPixelColor(pos, strip.Color(255, 0, 50)); 
+        // 渲染对称半影拖尾，增加动感视觉
+        for (int i = 0; i < NUM_LEDS; i++) {
+          int diff = abs(i - pos);
+          if (diff == 1) {
+            strip.setPixelColor(i, strip.Color(80, 0, 15));
+          } else if (diff == 2) {
+            strip.setPixelColor(i, strip.Color(20, 0, 3));
+          }
+        }
+        strip.show();
+        effectFrame++;
+        g_forceRedraw = false;
+      }
+      break;
+
+    case 11: // 电竞双色交叉来回跑马灯 (霓虹紫与冰蓝双向交叉扫射)
+      if (now - lastEffectUpdate > 50) { 
+        lastEffectUpdate = now;
+        strip.clear();
+        
+        int totalSteps = (NUM_LEDS - 1) * 2;
+        int step = effectFrame % totalSteps;
+        
+        // 扫射 1 (左往右，右往左) - 霓虹紫
+        int pos1 = (step < NUM_LEDS) ? step : (totalSteps - step);
+        // 扫射 2 (右往左，左往右) - 冰蓝
+        int pos2 = (step < NUM_LEDS) ? (NUM_LEDS - 1 - step) : (step - NUM_LEDS + 1);
+        
+        strip.setPixelColor(pos1, strip.Color(180, 0, 255));
+        strip.setPixelColor(pos2, strip.Color(0, 180, 255));
+        
+        // 拖尾
+        for (int i = 0; i < NUM_LEDS; i++) {
+          if (abs(i - pos1) == 1) strip.setPixelColor(i, strip.Color(50, 0, 80));
+          if (abs(i - pos2) == 1) strip.setPixelColor(i, strip.Color(0, 50, 80));
+        }
+        
+        strip.show();
+        effectFrame++;
+        g_forceRedraw = false;
+      }
+      break;
+      
+    case 12: // 彩虹
+      if (now - lastEffectUpdate > 20) {
+        lastEffectUpdate = now;
+        for (int i = 0; i < NUM_LEDS; i++) {
+          int pixelHue = effectFrame + (i * 65536L / NUM_LEDS);
+          strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue)));
+        }
+        strip.show();
+        effectFrame += 256;
+        g_forceRedraw = false;
+      }
+      break;
+  }
+}
