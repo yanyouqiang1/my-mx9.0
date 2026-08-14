@@ -117,18 +117,25 @@
         }
     }
 
-    document.getElementById('connectBtn').addEventListener('click', async () => {
+document.getElementById('connectBtn').addEventListener('click', async () => {
         try {
+            // 针对 macOS 的 CoreBluetooth 进行了兼容优化
+            // 采用 acceptAllDevices 规避由于设备名称未被广播或被系统缓存导致的无法搜到问题
             const device = await navigator.bluetooth.requestDevice({
-                filters: [{ name: 'YYQ-MX9.0' }], 
+                acceptAllDevices: true,
                 optionalServices: ["4fafc201-1fb5-459e-8fcc-c5c9c331914b"]
             });
+            
             const server = await device.gatt.connect();
             const service = await server.getPrimaryService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
             myCharacteristic = await service.getCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8");
+            
             document.getElementById('status').innerText = "已连接 ✅";
             document.getElementById('status').style.color = "green";
-        } catch(e) { alert("蓝牙连接失败: " + e); }
+        } catch(e) { 
+            console.error("蓝牙连接详情:", e);
+            alert("蓝牙连接失败: " + (e.message || e)); 
+        }
     });
 
     async function sendBLE(str) {
