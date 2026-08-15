@@ -70,10 +70,11 @@
         </div>
     </div>
 
+    <!-- 已修改：更新为 Hex16 存储说明 -->
     <div class="card">
-        <h2>3. ME 键配置 (Base64 长文本/图片)</h2>
-        <div class="hint">输入原始文本，系统自动转 Base64 存入 ME 键</div>
-        <textarea id="meRawInput" rows="4" placeholder="在此输入需要转成Base64的原始文本..."></textarea>
+        <h2>3. ME 键配置 (Hex 十六进制长文本)</h2>
+        <div class="hint">输入原始文本（支持中文、标点或网页任意内容），系统自动转为高效 Hex 存入 ME 键</div>
+        <textarea id="meRawInput" rows="4" placeholder="在此输入需要转成Hex的原始文本..."></textarea>
         <button class="btn btn-send btn-me" id="sendMeBtn">转码并存入 ME 键</button>
         <div id="progress" style="margin-top:10px; color: blue;"></div>
     </div>
@@ -102,7 +103,7 @@
         textarea.selectionStart = textarea.selectionEnd = start + tag.length;
     }
 
-    // 动态切换组合按键输入类型（二选一展示）
+    // 动态切换组合按键输入类型
     function toggleCmbType(selectElem) {
         const parent = selectElem.parentElement;
         const valSelect = parent.querySelector('.val-select');
@@ -110,17 +111,15 @@
         if (selectElem.value === 'preset') {
             valSelect.style.display = 'inline-block';
             valInput.style.display = 'none';
-            valInput.value = ''; // 切换时清空字符输入
+            valInput.value = ''; 
         } else {
             valSelect.style.display = 'none';
             valInput.style.display = 'inline-block';
         }
     }
 
-document.getElementById('connectBtn').addEventListener('click', async () => {
+    document.getElementById('connectBtn').addEventListener('click', async () => {
         try {
-            // 针对 macOS 的 CoreBluetooth 进行了兼容优化
-            // 采用 acceptAllDevices 规避由于设备名称未被广播或被系统缓存导致的无法搜到问题
             const device = await navigator.bluetooth.requestDevice({
                 acceptAllDevices: true,
                 optionalServices: ["4fafc201-1fb5-459e-8fcc-c5c9c331914b"]
@@ -144,14 +143,14 @@ document.getElementById('connectBtn').addEventListener('click', async () => {
         const data = encoder.encode(str);
         try {
             await myCharacteristic.writeValue(data);
-            await new Promise(r => setTimeout(r, 40)); 
+            await new Promise(r => setTimeout(r, 150)); 
         } catch(e) {
             console.error(e);
             alert("发送失败，请尝试重新连接蓝牙！");
         }
     }
 
-    // 添加组合键（交互已优化，无默认值且二选一）
+    // 添加组合键
     document.getElementById('addCmbBtn').addEventListener('click', () => {
         const div = document.createElement('div');
         div.className = 'cmb-item';
@@ -161,11 +160,8 @@ document.getElementById('connectBtn').addEventListener('click', async () => {
                 <option value="preset">特殊功能键</option>
                 <option value="char">自定义字符</option>
             </select>
-            
             <select class="val-select" style="width: 170px;">${options}</select>
-            
             <input class="val-input" type="text" maxlength="1" style="width: 120px; display: none;" placeholder="输入单字符">
-            
             <span class="remove-btn" onclick="this.parentElement.remove()">✕</span>
         `;
         document.getElementById('cmbList').appendChild(div);
@@ -198,21 +194,30 @@ document.getElementById('connectBtn').addEventListener('click', async () => {
         alert("序列设置成功！");
     });
 
+    // 已修改：将 Base64 编码方式替换为更稳定的 UTF-8 十六进制（Hex）编码方式
     document.getElementById('sendMeBtn').addEventListener('click', async () => {
         const rawText = document.getElementById('meRawInput').value;
         if(!rawText) return;
         
-        const base64 = btoa(encodeURIComponent(rawText).replace(/%([0-9A-F]{2})/g, (match, p1) => String.fromCharCode('0x' + p1)));
+        // 1. 将原始字符串（含中文）转换为 UTF-8 Hex16 格式
+        const encoder = new TextEncoder();
+        const view = encoder.encode(rawText);
+        let hexStr = '';
+        for (let i = 0; i < view.length; i++) {
+            hexStr += view[i].toString(16).padStart(2, '0');
+        }
+        
         const prog = document.getElementById('progress');
         prog.innerText = "传输中...";
         
+        // 2. 依次向键盘分片发送数据
         await sendBLE("ME_START");
-        for(let i=0; i < base64.length; i += 128) {
-            await sendBLE("ME_DATA:" + base64.substring(i, i+128));
-            prog.innerText = `传输进度: ${Math.round((i/base64.length)*100)}%`;
+        for(let i=0; i < hexStr.length; i += 128) {
+            await sendBLE("ME_DATA:" + hexStr.substring(i, i+128));
+            prog.innerText = `传输进度: ${Math.round((i/hexStr.length)*100)}%`;
         }
         await sendBLE("ME_END");
-        prog.innerText = "ME 键 Base64 存入成功！";
+        prog.innerText = "ME 键 Hex 存入成功！";
     });
 
 </script>
