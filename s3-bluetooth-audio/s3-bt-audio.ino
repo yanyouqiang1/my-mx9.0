@@ -150,7 +150,7 @@ void initKeyMatrix() {
 bool lastState[numRows][numCols] = {false};
 unsigned long lastDebounceTime[numRows][numCols] = {0};
 
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914c"
 #define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 BLECharacteristic *pCharacteristic;
 
@@ -413,7 +413,7 @@ void setup() {
 
     // USB 设置
     USB.VID(0x303A);
-    USB.PID(0x001F);
+    USB.PID(0x0020);
     USB.productName("YYQ-MX9.0");
     USB.manufacturerName("YYQ");
 
