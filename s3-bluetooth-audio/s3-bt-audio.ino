@@ -434,6 +434,23 @@ void scanKeyboardMatrix() {
 
                                     executeMacro("LOGO");
                                 }
+                            } else if (keycode == K_ME) {
+                                // 长按 ME 键 (Row 8, Col 2) 切换蓝牙音频开关
+                                unsigned long pressedDuration = millis() - lastDebounceTime[r][c];
+                                if (pressedDuration >= 2000) {
+                                    static bool btAudioEnabled = false;
+                                    btAudioEnabled = !btAudioEnabled;
+                                    btAudio.setEnabled(btAudioEnabled);
+                                    if (btAudioEnabled) {
+                                        Serial1.println("N_BTAUDIO_ON");
+                                        Serial.println("蓝牙音频已开启");
+                                    } else {
+                                        Serial1.println("N_BTAUDIO_OFF");
+                                        Serial.println("蓝牙音频已关闭");
+                                    }
+                                } else {
+                                    executeMacro("ME");
+                                }
                             }
                         }
                     }
