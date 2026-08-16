@@ -7,24 +7,32 @@
 
 static const char* TAG = "BT_AUDIO";
 
+static BTAudioManager* btAudioMgrPtr = nullptr;
+
 BTAudioManager::BTAudioManager()
     : enabled_(false), state_(BTAudioState::OFF),
       playbackBuffer_(16384), captureBuffer_(16384) {
+    btAudioMgrPtr = this;
 }
 
 BTAudioManager::~BTAudioManager() {
+    btAudioMgrPtr = nullptr;
     end();
 }
 
 // A2DP 事件处理
 static void a2dp_event_handler(esp_a2d_cb_event_t event, esp_a2d_inc_cb_param_t* param) {
+    if (btAudioMgrPtr == nullptr) return;
+
     switch (event) {
         case ESP_A2D_CONNECTION_STATE_EVT: {
             auto& conn_stat = param->conn_stat;
             if (conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
                 ESP_LOGI(TAG, "A2DP 已连接");
+                btAudioMgrPtr->state_ = BTAudioState::CONNECTED;
             } else if (conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 ESP_LOGI(TAG, "A2DP 已断开");
+                btAudioMgrPtr->state_ = BTAudioState::OFF;
             }
             break;
         }
@@ -32,8 +40,10 @@ static void a2dp_event_handler(esp_a2d_cb_event_t event, esp_a2d_inc_cb_param_t*
             auto& audio_stat = param->audio_stat;
             if (audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
                 ESP_LOGI(TAG, "A2DP 音频开始");
+                btAudioMgrPtr->state_ = BTAudioState::PLAYING;
             } else if (audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
                 ESP_LOGI(TAG, "A2DP 音频停止");
+                btAudioMgrPtr->state_ = BTAudioState::CONNECTED;
             }
             break;
         }
@@ -132,7 +142,7 @@ void BTAudioManager::setEnabled(bool enabled) {
     if (enabled) {
         begin();
     } else {
-        state_ = BTAudioState::OFF;
+        end();
     }
 }
 

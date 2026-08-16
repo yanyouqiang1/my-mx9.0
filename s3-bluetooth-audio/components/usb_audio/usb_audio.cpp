@@ -10,6 +10,7 @@ USBAudioManager::USBAudioManager()
 }
 
 USBAudioManager::~USBAudioManager() {
+    dying_.store(true, std::memory_order_release);
     usbAudioPtr = nullptr;
 }
 
@@ -20,7 +21,7 @@ void USBAudioManager::begin() {
 // 播放完成回调（TX 完成，需要填充下一批数据）
 // playbackBuffer 存放的是从 A2DP 接收的 PCM 音频（耳机→电脑方向）
 void USBAudioManager::tud_audio_tx_complete_cb(uint8_t itf) {
-    if (usbAudioPtr == nullptr) return;
+    if (usbAudioPtr == nullptr || usbAudioPtr->isDying()) return;
 
     RingBuffer* buf = usbAudioPtr->getPlaybackBuffer();
     if (buf == nullptr) return;
@@ -49,7 +50,7 @@ void USBAudioManager::tud_audio_tx_complete_cb(uint8_t itf) {
 // 接收电脑音频回调（RX 收到 USB 音频数据）
 // captureBuffer 存放的是电脑发送的音频数据（电脑→耳机方向）
 void USBAudioManager::tud_audio_rx_cb(uint8_t itf, int16_t* buf, uint16_t len) {
-    if (usbAudioPtr == nullptr) return;
+    if (usbAudioPtr == nullptr || usbAudioPtr->isDying()) return;
 
     // 将 int16_t PCM 数据（len 个样本）写入 captureBuffer
     // captureBuffer 为 uint8_t，按字节存储
