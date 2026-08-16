@@ -232,6 +232,23 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                 }
             }
         }
+        else if (data.startsWith("BTAUDIO:")) {
+            String cmd = data.substring(8);
+            if (cmd == "0") {
+                btAudio.setEnabled(false);
+                Serial1.println("N_BTAUDIO_OFF");
+            } else if (cmd == "1") {
+                btAudio.setEnabled(true);
+                Serial1.println("N_BTAUDIO_ON");
+            } else if (cmd == "SCAN") {
+                btAudio.startScan();
+            } else if (cmd.startsWith("CONNECT:")) {
+                String addr = cmd.substring(8);
+                btAudio.connect(addr);
+            } else if (cmd == "DISCONNECT") {
+                btAudio.disconnect();
+            }
+        }
     }
 };
 
