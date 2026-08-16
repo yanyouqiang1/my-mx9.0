@@ -1,0 +1,1670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YYQ-MX9.0 键盘功能说明</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #12121a;
+      --bg-card: #1a1a24;
+      --bg-card-hover: #22222e;
+      --text-primary: #ffffff;
+      --text-secondary: #a0a0b0;
+      --text-muted: #606070;
+      --accent-cyan: #00d4ff;
+      --accent-purple: #b44aff;
+      --accent-pink: #ff4a8d;
+      --accent-green: #00ff88;
+      --accent-yellow: #ffcc00;
+      --accent-orange: #ff8844;
+      --accent-red: #ff4466;
+      --accent-blue: #4488ff;
+      --border-color: rgba(255,255,255,0.08);
+      --shadow: 0 4px 24px rgba(0,0,0,0.4);
+      --glow-cyan: 0 0 20px rgba(0,212,255,0.3);
+      --glow-purple: 0 0 20px rgba(180,74,255,0.3);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* 背景效果 */
+    .bg-gradient {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: -1;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 40%, rgba(0,212,255,0.08) 0%, transparent 50%),
+        radial-gradient(ellipse 60% 40% at 80% 60%, rgba(180,74,255,0.08) 0%, transparent 50%);
+    }
+
+    /* 导航栏 */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 64px;
+      background: rgba(10,10,15,0.9);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border-color);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 40px;
+    }
+
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 1.2rem;
+    }
+
+    .nav-brand .logo {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.9rem;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 8px;
+    }
+
+    .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: var(--text-primary);
+      background: var(--bg-card);
+    }
+
+    /* 主要内容 */
+    main {
+      padding-top: 96px;
+      padding-bottom: 80px;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding-left: 40px;
+      padding-right: 40px;
+    }
+
+    section {
+      margin-bottom: 80px;
+    }
+
+    .section-header {
+      margin-bottom: 32px;
+    }
+
+    .section-title {
+      font-size: 2rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .section-title .icon {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.2rem;
+    }
+
+    .section-subtitle {
+      color: var(--text-secondary);
+      font-size: 1.1rem;
+    }
+
+    /* 卡片网格 */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 24px;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 28px;
+      border: 1px solid var(--border-color);
+      transition: all 0.3s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(255,255,255,0.15);
+      box-shadow: var(--shadow);
+    }
+
+    .card-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.5rem;
+      margin-bottom: 16px;
+    }
+
+    .card h3 {
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .card p {
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+    }
+
+    /* 硬件架构图 */
+    .arch-diagram {
+      background: var(--bg-card);
+      border-radius: 20px;
+      padding: 40px;
+      border: 1px solid var(--border-color);
+    }
+
+    .arch-nodes {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 40px;
+      flex-wrap: wrap;
+    }
+
+    .arch-node {
+      text-align: center;
+      padding: 24px 32px;
+      background: var(--bg-secondary);
+      border-radius: 16px;
+      border: 1px solid var(--border-color);
+      min-width: 160px;
+    }
+
+    .arch-node .chip {
+      font-size: 2.5rem;
+      margin-bottom: 12px;
+    }
+
+    .arch-node .label {
+      font-weight: 600;
+      font-size: 1.1rem;
+      margin-bottom: 4px;
+    }
+
+    .arch-node .desc {
+      color: var(--text-secondary);
+      font-size: 0.85rem;
+    }
+
+    .arch-arrow {
+      font-size: 2rem;
+      color: var(--text-muted);
+    }
+
+    .arch-connector {
+      width: 2px;
+      height: 40px;
+      background: linear-gradient(to bottom, var(--accent-cyan), var(--accent-purple));
+      margin: 20px auto;
+    }
+
+    .arch-btns {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-top: 32px;
+      flex-wrap: wrap;
+    }
+
+    .arch-btn {
+      padding: 10px 20px;
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+    }
+
+    /* 键盘布局 */
+    .keyboard-container {
+      overflow-x: auto;
+      padding: 20px 0;
+    }
+
+    .keyboard {
+      display: grid;
+      gap: 4px;
+      min-width: 1100px;
+      background: var(--bg-card);
+      padding: 24px;
+      border-radius: 16px;
+      border: 1px solid var(--border-color);
+    }
+
+    .kb-row {
+      display: flex;
+      gap: 4px;
+      justify-content: center;
+    }
+
+    .kb-key {
+      min-width: 52px;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      font-size: 0.75rem;
+      font-family: 'JetBrains Mono', monospace;
+      border: 1px solid var(--border-color);
+      cursor: default;
+      transition: all 0.2s;
+      padding: 4px;
+      text-align: center;
+      word-break: break-all;
+      line-height: 1.2;
+    }
+
+    .kb-key:hover {
+      border-color: var(--accent-cyan);
+      box-shadow: var(--glow-cyan);
+    }
+
+    .kb-key.wide { min-width: 72px; }
+    .kb-key.wider { min-width: 92px; }
+    .kb-key.space { min-width: 280px; }
+    .kb-key.fn { background: linear-gradient(135deg, rgba(0,212,255,0.2), rgba(180,74,255,0.2)); border-color: var(--accent-cyan); }
+    .kb-key.media { background: linear-gradient(135deg, rgba(255,74,141,0.2), rgba(255,136,68,0.2)); border-color: var(--accent-pink); }
+    .kb-key.macro { background: linear-gradient(135deg, rgba(180,74,255,0.2), rgba(0,212,255,0.2)); border-color: var(--accent-purple); }
+    .kb-key.logo { background: linear-gradient(135deg, rgba(255,204,0,0.2), rgba(255,68,102,0.2)); border-color: var(--accent-yellow); }
+    .kb-key.nav { background: rgba(68,136,255,0.1); border-color: var(--accent-blue); }
+    .kb-key.fn:hover, .kb-key.media:hover, .kb-key.macro:hover, .kb-key.logo:hover, .kb-key.nav:hover {
+      transform: scale(1.05);
+    }
+
+    .key-legend {
+      display: flex;
+      justify-content: center;
+      gap: 24px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+
+    .legend-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 4px;
+    }
+
+    /* 旋钮控制 */
+    .knob-section {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 32px;
+    }
+
+    @media (max-width: 900px) {
+      .knob-section {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .knob-visual {
+      background: var(--bg-card);
+      border-radius: 20px;
+      padding: 40px;
+      border: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 32px;
+    }
+
+    .knob-display {
+      width: 200px;
+      height: 200px;
+      border-radius: 50%;
+      background: conic-gradient(from 0deg, var(--accent-cyan), var(--accent-purple), var(--accent-pink), var(--accent-cyan));
+      padding: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: rotate 8s linear infinite;
+    }
+
+    @keyframes rotate {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    .knob-inner {
+      width: 160px;
+      height: 160px;
+      border-radius: 50%;
+      background: var(--bg-primary);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+    }
+
+    .knob-mode {
+      font-size: 1.5rem;
+      margin-bottom: 4px;
+    }
+
+    .knob-value {
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+    }
+
+    .knob-btn-group {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+      width: 100%;
+    }
+
+    .knob-btn {
+      padding: 16px;
+      background: var(--bg-secondary);
+      border-radius: 12px;
+      border: 1px solid var(--border-color);
+      text-align: center;
+      transition: all 0.2s;
+    }
+
+    .knob-btn:hover {
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+    }
+
+    .knob-btn .label {
+      font-size: 1.2rem;
+      margin-bottom: 4px;
+    }
+
+    .knob-btn .desc {
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+
+    .knob-modes {
+      background: var(--bg-card);
+      border-radius: 20px;
+      padding: 32px;
+      border: 1px solid var(--border-color);
+    }
+
+    .mode-item {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .mode-item:last-child {
+      border-bottom: none;
+    }
+
+    .mode-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .mode-info {
+      flex: 1;
+    }
+
+    .mode-name {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .mode-desc {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+
+    .mode-keys {
+      display: flex;
+      gap: 8px;
+    }
+
+    .mini-key {
+      padding: 6px 12px;
+      background: var(--bg-secondary);
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* 灯光效果 */
+    .effects-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+
+    .effect-card {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 20px;
+      border: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      transition: all 0.2s;
+      cursor: pointer;
+    }
+
+    .effect-card:hover {
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+    }
+
+    .effect-preview {
+      width: 56px;
+      height: 56px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.5rem;
+      flex-shrink: 0;
+    }
+
+    .effect-info .name {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .effect-info .num {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* 多媒体控制 */
+    .media-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+
+    .media-card {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 28px;
+      border: 1px solid var(--border-color);
+      text-align: center;
+    }
+
+    .media-keys {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .media-key {
+      width: 64px;
+      height: 64px;
+      background: var(--bg-secondary);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.8rem;
+      border: 1px solid var(--border-color);
+    }
+
+    .plus-sign {
+      display: flex;
+      align-items: center;
+      font-size: 1.5rem;
+      color: var(--text-muted);
+    }
+
+    .media-action {
+      font-size: 1.5rem;
+      color: var(--accent-green);
+    }
+
+    .media-desc {
+      color: var(--text-secondary);
+      margin-top: 12px;
+      font-size: 0.95rem;
+    }
+
+    /* 快捷键表 */
+    .shortcuts-table {
+      background: var(--bg-card);
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid var(--border-color);
+    }
+
+    .shortcuts-table table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .shortcuts-table th,
+    .shortcuts-table td {
+      padding: 16px 24px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .shortcuts-table th {
+      background: var(--bg-secondary);
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .shortcuts-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .shortcuts-table tr:hover td {
+      background: var(--bg-card-hover);
+    }
+
+    .key-badge {
+      display: inline-block;
+      padding: 4px 10px;
+      background: var(--bg-secondary);
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      margin: 2px;
+      border: 1px solid var(--border-color);
+    }
+
+    /* 通知系统 */
+    .notifications {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 24px;
+    }
+
+    .notification-card {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 28px;
+      border: 1px solid var(--border-color);
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+    }
+
+    .notif-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.8rem;
+      flex-shrink: 0;
+    }
+
+    .notif-content h4 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .notif-content p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      margin-bottom: 10px;
+    }
+
+    .notif-cmd {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      padding: 6px 12px;
+      background: var(--bg-secondary);
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    /* 优先级图表 */
+    .priority-chart {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 32px;
+      border: 1px solid var(--border-color);
+    }
+
+    .priority-item {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .priority-item:last-child {
+      border-bottom: none;
+    }
+
+    .priority-level {
+      width: 48px;
+      height: 48px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 1.2rem;
+      flex-shrink: 0;
+    }
+
+    .priority-content {
+      flex: 1;
+    }
+
+    .priority-content h4 {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .priority-content p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+
+    /* 颜色预设 */
+    .colors-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+
+    .color-item {
+      background: var(--bg-card);
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+      border: 1px solid var(--border-color);
+      transition: all 0.2s;
+    }
+
+    .color-item:hover {
+      transform: translateY(-2px);
+      border-color: rgba(255,255,255,0.2);
+    }
+
+    .color-preview {
+      width: 48px;
+      height: 48px;
+      border-radius: 12px;
+      margin: 0 auto 12px;
+    }
+
+    .color-name {
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+
+    .color-num {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* 页脚 */
+    footer {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      border-top: 1px solid var(--border-color);
+      margin-top: 80px;
+    }
+
+    /* 动画 */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    @keyframes glow {
+      0%, 100% { box-shadow: 0 0 20px rgba(0,212,255,0.3); }
+      50% { box-shadow: 0 0 40px rgba(0,212,255,0.6); }
+    }
+
+    .glow { animation: glow 2s ease-in-out infinite; }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+      nav {
+        padding: 0 20px;
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      main {
+        padding: 80px 20px 40px;
+      }
+
+      .section-title {
+        font-size: 1.5rem;
+      }
+
+      .arch-nodes {
+        flex-direction: column;
+      }
+
+      .arch-arrow {
+        transform: rotate(90deg);
+      }
+
+      .shortcuts-table {
+        overflow-x: auto;
+      }
+    }
+
+    /* 滚动条 */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg-secondary);
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--bg-card-hover);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="bg-gradient"></div>
+
+  <nav>
+    <div class="nav-brand">
+      <div class="logo">MX</div>
+      <span>YYQ-MX9.0</span>
+    </div>
+    <div class="nav-links">
+      <a href="#overview">概览</a>
+      <a href="#keyboard">键盘</a>
+      <a href="#knob">旋钮</a>
+      <a href="#effects">灯光</a>
+      <a href="#media">媒体键</a>
+      <a href="#shortcuts">快捷键</a>
+      <a href="#system">系统</a>
+    </div>
+  </nav>
+
+  <main>
+    <!-- 概览 -->
+    <section id="overview">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">⚡</span>
+          硬件架构
+        </h2>
+        <p class="section-subtitle">YYQ-MX9.0 采用双芯片架构，S3 负责键盘主控，C3 负责灯光旋钮</p>
+      </div>
+
+      <div class="arch-diagram">
+        <div class="arch-nodes">
+          <div class="arch-node">
+            <div class="chip">🎮</div>
+            <div class="label">ESP32-S3</div>
+            <div class="desc">主控芯片<br>键盘扫描 / USB</div>
+          </div>
+          <div class="arch-arrow">⟷</div>
+          <div class="arch-node">
+            <div class="chip">🔄</div>
+            <div class="label">串口通讯</div>
+            <div class="desc">TX/RX<br>115200bps</div>
+          </div>
+          <div class="arch-arrow">⟷</div>
+          <div class="arch-node">
+            <div class="chip">💡</div>
+            <div class="label">ESP32-C3</div>
+            <div class="desc">旋钮控制<br>灯光管理</div>
+          </div>
+        </div>
+        <div class="arch-connector"></div>
+        <div class="arch-btns">
+          <div class="arch-btn">🔗 USB HID</div>
+          <div class="arch-btn">📡 BLE 蓝牙</div>
+          <div class="arch-btn">💾 FFat 存储</div>
+          <div class="arch-btn">🔌 MCP23017 I2C</div>
+        </div>
+      </div>
+
+      <div class="card-grid" style="margin-top: 32px;">
+        <div class="card">
+          <div class="card-icon" style="background: linear-gradient(135deg, #00d4ff33, #00d4ff22);">🎹</div>
+          <h3>160 键矩阵</h3>
+          <p>10行 × 16列扫描，通过 MCP23017 I2C 扩展芯片驱动，支持全键无冲</p>
+        </div>
+        <div class="card">
+          <div class="card-icon" style="background: linear-gradient(135deg, #b44aff33, #b44aff22);">🎨</div>
+          <h3>16 颗 RGB LED</h3>
+          <p>WS2812 可编程灯带，支持 14 种灯光效果模式，可自定义按键扩散颜色</p>
+        </div>
+        <div class="card">
+          <div class="card-icon" style="background: linear-gradient(135deg, #ff4a8d33, #ff4a8d22);">🎛️</div>
+          <h3>旋钮 + 按键</h3>
+          <p>旋转编码器支持音量/亮度/灯效调节，4 个物理按键切换不同控制模式</p>
+        </div>
+        <div class="card">
+          <div class="card-icon" style="background: linear-gradient(135deg, #00ff8833, #00ff8822);">📡</div>
+          <h3>双模连接</h3>
+          <p>USB 有线连接 + BLE 蓝牙，可通过蓝牙串口助手配置宏和接收通知</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 键盘布局 -->
+    <section id="keyboard">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">⌨️</span>
+          键盘布局
+        </h2>
+        <p class="section-subtitle">完整的按键矩阵定义，标注了功能分组</p>
+      </div>
+
+      <div class="keyboard-container">
+        <div class="keyboard">
+          <!-- Row 0 -->
+          <div class="kb-row">
+            <div class="kb-key fn">LAlt</div>
+            <div class="kb-key media">Vol+</div>
+            <div class="kb-key media">Vol-</div>
+            <div class="kb-key media">Mute</div>
+            <div class="kb-key">①</div>
+            <div class="kb-key">②</div>
+            <div class="kb-key">③</div>
+            <div class="kb-key">④</div>
+            <div class="kb-key nav">→</div>
+            <div class="kb-key nav">↓</div>
+            <div class="kb-key nav">←</div>
+            <div class="kb-key fn">RCtrl</div>
+            <div class="kb-key fn">FN</div>
+            <div class="kb-key fn">RWin</div>
+            <div class="kb-key fn">RAlt</div>
+            <div class="kb-key space">Space</div>
+          </div>
+          <!-- Row 1 -->
+          <div class="kb-row">
+            <div class="kb-key">\</div>
+            <div class="kb-key macro">MB</div>
+            <div class="kb-key macro">MA</div>
+            <div class="kb-key media">▶▶</div>
+            <div class="kb-key media">⏯</div>
+            <div class="kb-key media">◀◀</div>
+            <div class="kb-key logo">LOGO</div>
+            <div class="kb-key fn">LCtrl</div>
+            <div class="kb-key">⑤</div>
+            <div class="kb-key">⑥</div>
+            <div class="kb-key">⑦</div>
+            <div class="kb-key fn">LAlt</div>
+            <div class="kb-key fn">LWin</div>
+            <div class="kb-key">App</div>
+            <div class="kb-key">\</div>
+            <div class="kb-key"></div>
+          </div>
+          <!-- Row 2 -->
+          <div class="kb-row">
+            <div class="kb-key wide fn">LShift</div>
+            <div class="kb-key fn">LWin</div>
+            <div class="kb-key fn">LCtrl</div>
+            <div class="kb-key nav">↑</div>
+            <div class="kb-key wide fn">RShift</div>
+            <div class="kb-key">/</div>
+            <div class="kb-key">.</div>
+            <div class="kb-key">,</div>
+            <div class="kb-key">m</div>
+            <div class="kb-key">n</div>
+            <div class="kb-key">b</div>
+            <div class="kb-key">v</div>
+            <div class="kb-key">c</div>
+            <div class="kb-key">x</div>
+            <div class="kb-key">z</div>
+            <div class="kb-key"></div>
+          </div>
+          <!-- Row 3 -->
+          <div class="kb-row">
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+            <div class="kb-key"></div>
+          </div>
+          <!-- Row 4 -->
+          <div class="kb-row">
+            <div class="kb-key nav">End</div>
+            <div class="kb-key">Enter</div>
+            <div class="kb-key"></div>
+            <div class="kb-key">'</div>
+            <div class="kb-key">;</div>
+            <div class="kb-key">l</div>
+            <div class="kb-key">k</div>
+            <div class="kb-key">j</div>
+            <div class="kb-key">h</div>
+            <div class="kb-key">g</div>
+            <div class="kb-key">f</div>
+            <div class="kb-key">d</div>
+            <div class="kb-key">s</div>
+            <div class="kb-key">a</div>
+            <div class="kb-key">Caps</div>
+            <div class="kb-key">[</div>
+          </div>
+          <!-- Row 5 -->
+          <div class="kb-row">
+            <div class="kb-key nav">PgUp</div>
+            <div class="kb-key nav">Del</div>
+            <div class="kb-key">\</div>
+            <div class="kb-key">]</div>
+            <div class="kb-key">[</div>
+            <div class="kb-key">p</div>
+            <div class="kb-key">o</div>
+            <div class="kb-key">i</div>
+            <div class="kb-key">u</div>
+            <div class="kb-key">y</div>
+            <div class="kb-key">t</div>
+            <div class="kb-key">r</div>
+            <div class="kb-key">e</div>
+            <div class="kb-key">w</div>
+            <div class="kb-key">q</div>
+            <div class="kb-key">Tab</div>
+          </div>
+          <!-- Row 6 -->
+          <div class="kb-row">
+            <div class="kb-key">`</div>
+            <div class="kb-key nav">Home</div>
+            <div class="kb-key nav">Ins</div>
+            <div class="kb-key nav">Back</div>
+            <div class="kb-key">=</div>
+            <div class="kb-key">-</div>
+            <div class="kb-key">0</div>
+            <div class="kb-key">9</div>
+            <div class="kb-key">8</div>
+            <div class="kb-key">7</div>
+            <div class="kb-key">6</div>
+            <div class="kb-key">5</div>
+            <div class="kb-key">4</div>
+            <div class="kb-key">3</div>
+            <div class="kb-key">2</div>
+            <div class="kb-key">1</div>
+          </div>
+          <!-- Row 7 -->
+          <div class="kb-row">
+            <div class="kb-key">Esc</div>
+            <div class="kb-key">⑧</div>
+            <div class="kb-key">⑨</div>
+            <div class="kb-key">⑩</div>
+            <div class="kb-key">F12</div>
+            <div class="kb-key">F11</div>
+            <div class="kb-key">F10</div>
+            <div class="kb-key">F9</div>
+            <div class="kb-key">F8</div>
+            <div class="kb-key">F7</div>
+            <div class="kb-key">F6</div>
+            <div class="kb-key">F5</div>
+            <div class="kb-key">F4</div>
+            <div class="kb-key">F3</div>
+            <div class="kb-key">F2</div>
+            <div class="kb-key">F1</div>
+          </div>
+          <!-- Row 8 -->
+          <div class="kb-row">
+            <div class="kb-key macro">MC</div>
+            <div class="kb-key"></div>
+            <div class="kb-key macro">ME</div>
+            <div class="kb-key macro">M12</div>
+            <div class="kb-key macro">M11</div>
+            <div class="kb-key macro">M10</div>
+            <div class="kb-key macro">M9</div>
+            <div class="kb-key macro">M8</div>
+            <div class="kb-key macro">M7</div>
+            <div class="kb-key macro">M6</div>
+            <div class="kb-key macro">M5</div>
+            <div class="kb-key macro">M4</div>
+            <div class="kb-key macro">M3</div>
+            <div class="kb-key macro">M2</div>
+            <div class="kb-key macro">M1</div>
+            <div class="kb-key macro">MR</div>
+          </div>
+        </div>
+
+        <div class="key-legend">
+          <div class="legend-item">
+            <div class="legend-dot" style="background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));"></div>
+            <span>FN 组合键</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: linear-gradient(135deg, var(--accent-pink), var(--accent-orange));"></div>
+            <span>多媒体键</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: linear-gradient(135deg, var(--accent-purple), var(--accent-cyan));"></div>
+            <span>可编程宏</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: linear-gradient(135deg, var(--accent-yellow), var(--accent-red));"></div>
+            <span>LOGO 键</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: var(--accent-blue);"></div>
+            <span>导航键</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 旋钮控制 -->
+    <section id="knob">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">🎛️</span>
+          C3 旋钮控制
+        </h2>
+        <p class="section-subtitle">通过旋钮和物理按键切换不同控制模式</p>
+      </div>
+
+      <div class="knob-section">
+        <div class="knob-visual">
+          <div class="knob-display glow">
+            <div class="knob-inner">
+              <div class="knob-mode">亮度</div>
+              <div class="knob-value">140/220</div>
+            </div>
+          </div>
+
+          <div class="knob-btn-group">
+            <div class="knob-btn">
+              <div class="label">🔊 静音</div>
+              <div class="desc">切换音量模式</div>
+            </div>
+            <div class="knob-btn">
+              <div class="label">💡 灯光</div>
+              <div class="desc">短按切换亮度</div>
+            </div>
+            <div class="knob-btn">
+              <div class="label">🎨 CPG</div>
+              <div class="desc">切换灯效模式</div>
+            </div>
+            <div class="knob-btn">
+              <div class="label">⚙️ 旋钮</div>
+              <div class="desc">短按色彩配置</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="knob-modes">
+          <div class="mode-item">
+            <div class="mode-indicator" style="background: var(--accent-green);"></div>
+            <div class="mode-info">
+              <div class="mode-name">灯光模式 (默认)</div>
+              <div class="mode-desc">旋钮控制全局亮度 (0-220)</div>
+            </div>
+            <div class="mode-keys">
+              <span class="mini-key">左旋 -20</span>
+              <span class="mini-key">右旋 +20</span>
+            </div>
+          </div>
+
+          <div class="mode-item">
+            <div class="mode-indicator" style="background: var(--accent-red);"></div>
+            <div class="mode-info">
+              <div class="mode-name">音量模式</div>
+              <div class="mode-desc">旋钮发送音量增减指令给 S3</div>
+            </div>
+            <div class="mode-keys">
+              <span class="mini-key">左旋 V-</span>
+              <span class="mini-key">右旋 V+</span>
+            </div>
+          </div>
+
+          <div class="mode-item">
+            <div class="mode-indicator" style="background: var(--accent-purple);"></div>
+            <div class="mode-info">
+              <div class="mode-name">CPG 模式</div>
+              <div class="mode-desc">旋钮切换背景灯效 (1-13)</div>
+            </div>
+            <div class="mode-keys">
+              <span class="mini-key">左旋 上一</span>
+              <span class="mini-key">右旋 下一</span>
+            </div>
+          </div>
+
+          <div class="mode-item">
+            <div class="mode-indicator" style="background: var(--accent-cyan);"></div>
+            <div class="mode-info">
+              <div class="mode-name">按键色彩模式</div>
+              <div class="mode-desc">旋钮选择按键扩散灯光颜色</div>
+            </div>
+            <div class="mode-keys">
+              <span class="mini-key">左旋 上一色</span>
+              <span class="mini-key">右旋 下一色</span>
+            </div>
+          </div>
+
+          <div class="mode-item">
+            <div class="mode-indicator" style="background: var(--accent-yellow);"></div>
+            <div class="mode-info">
+              <div class="mode-name">特殊操作</div>
+              <div class="mode-desc">长按灯光键 2 秒强制关灯 / 长按旋钮一键关灯</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 灯光效果 -->
+    <section id="effects">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">✨</span>
+          灯光效果
+        </h2>
+        <p class="section-subtitle">14 种预设灯光模式，通过 CPG 模式旋钮切换</p>
+      </div>
+
+      <div class="effects-grid">
+        <div class="effect-card">
+          <div class="effect-preview" style="background: #111; color: #333;">⬛</div>
+          <div class="effect-info">
+            <div class="name">关灯</div>
+            <div class="num">Mode 0</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #ff0000, #cc0000);">🔴</div>
+          <div class="effect-info">
+            <div class="name">常亮 - 红</div>
+            <div class="num">Mode 1</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #00ff00, #00cc00);">🟢</div>
+          <div class="effect-info">
+            <div class="name">常亮 - 绿</div>
+            <div class="num">Mode 2</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #0088ff, #0066cc);">🔵</div>
+          <div class="effect-info">
+            <div class="name">常亮 - 蓝</div>
+            <div class="num">Mode 3</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #00ccff, #0099dd);">🩵</div>
+          <div class="effect-info">
+            <div class="name">常亮 - 冰蓝</div>
+            <div class="num">Mode 4</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #ffffff, #dddddd);">⚪</div>
+          <div class="effect-info">
+            <div class="name">常亮 - 白</div>
+            <div class="num">Mode 5</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #ff3333, #ff0000); animation: pulse 1s infinite;">💗</div>
+          <div class="effect-info">
+            <div class="name">呼吸 - 红</div>
+            <div class="num">Mode 6</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #33ff33, #00ff00); animation: pulse 1s infinite;">💚</div>
+          <div class="effect-info">
+            <div class="name">呼吸 - 绿</div>
+            <div class="num">Mode 7</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #3388ff, #0066ff); animation: pulse 1s infinite;">💙</div>
+          <div class="effect-info">
+            <div class="name">呼吸 - 蓝</div>
+            <div class="num">Mode 8</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #33ddff, #00ccff); animation: pulse 1s infinite;">💜</div>
+          <div class="effect-info">
+            <div class="name">呼吸 - 冰蓝</div>
+            <div class="num">Mode 9</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(90deg, #ff0000, #880000, #ff0000, #880000);">🏎️</div>
+          <div class="effect-info">
+            <div class="name">Knight Rider</div>
+            <div class="num">Mode 10 - 经典扫描</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(90deg, #b400ff, #00b4ff, #b400ff, #00b4ff);">🌈</div>
+          <div class="effect-info">
+            <div class="name">电竞跑马</div>
+            <div class="num">Mode 11 - 双色交叉</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: conic-gradient(red, yellow, green, cyan, blue, magenta, red);">🎨</div>
+          <div class="effect-info">
+            <div class="name">彩虹</div>
+            <div class="num">Mode 12</div>
+          </div>
+        </div>
+        <div class="effect-card">
+          <div class="effect-preview" style="background: linear-gradient(135deg, #ff0000, #00ff00, #0000ff, #ff00ff, #00ffff, #ffff00); animation: rotate 4s linear infinite;">♻️</div>
+          <div class="effect-info">
+            <div class="name">自动循环</div>
+            <div class="num">Mode 13 - 轮流播放 1-12</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 40px;">
+        <h3 style="margin-bottom: 20px; font-size: 1.3rem;">按键扩散颜色预设</h3>
+        <div class="colors-grid">
+          <div class="color-item">
+            <div class="color-preview" style="background: conic-gradient(#ff0000, #0000ff, #00ff00, #b400ff, #00ffff, #ffffff, #ff0000);"></div>
+            <div class="color-name">自动彩环</div>
+            <div class="color-num">#0</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #ff0000;"></div>
+            <div class="color-name">热血红</div>
+            <div class="color-num">#1</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #00ff00;"></div>
+            <div class="color-name">极光绿</div>
+            <div class="color-num">#2</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #0000ff;"></div>
+            <div class="color-name">深海蓝</div>
+            <div class="color-num">#3</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #00ffff;"></div>
+            <div class="color-name">冰晶蓝</div>
+            <div class="color-num">#4</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #b400ff;"></div>
+            <div class="color-name">幻境紫</div>
+            <div class="color-num">#5</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #ffff00;"></div>
+            <div class="color-name">柠檬黄</div>
+            <div class="color-num">#6</div>
+          </div>
+          <div class="color-item">
+            <div class="color-preview" style="background: #ffffff; border: 1px solid #333;"></div>
+            <div class="color-name">纯净白</div>
+            <div class="color-num">#7</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 多媒体键 -->
+    <section id="media">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">🎵</span>
+          多媒体控制
+        </h2>
+        <p class="section-subtitle">Fn 组合键实现系统级控制功能</p>
+      </div>
+
+      <div class="media-grid">
+        <div class="media-card">
+          <div class="media-keys">
+            <div class="media-key" style="background: linear-gradient(135deg, rgba(0,212,255,0.2), rgba(180,74,255,0.2));">FN</div>
+            <div class="plus-sign">+</div>
+            <div class="media-key">⏯</div>
+          </div>
+          <div class="media-action">😴 睡眠</div>
+          <div class="media-desc">进入系统睡眠模式</div>
+        </div>
+
+        <div class="media-card">
+          <div class="media-keys">
+            <div class="media-key" style="background: linear-gradient(135deg, rgba(0,212,255,0.2), rgba(180,74,255,0.2));">FN</div>
+            <div class="plus-sign">+</div>
+            <div class="media-key">▶▶</div>
+          </div>
+          <div class="media-action">🖥️ 唤醒</div>
+          <div class="media-desc">唤醒睡眠中的电脑</div>
+        </div>
+
+        <div class="media-card">
+          <div class="media-keys">
+            <div class="media-key" style="background: linear-gradient(135deg, rgba(0,212,255,0.2), rgba(180,74,255,0.2));">FN</div>
+            <div class="plus-sign">+</div>
+            <div class="media-key">◀◀</div>
+          </div>
+          <div class="media-action">⏻ 关机</div>
+          <div class="media-desc">关闭电脑电源</div>
+        </div>
+      </div>
+
+      <div style="margin-top: 32px;">
+        <div class="shortcuts-table">
+          <table>
+            <thead>
+              <tr>
+                <th>按键</th>
+                <th>单独按下</th>
+                <th>FN 组合</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="key-badge">▶▶ NEXT</span></td>
+                <td>媒体下一首</td>
+                <td><span class="key-badge">FN</span> + <span class="key-badge">▶▶</span> = 唤醒电脑</td>
+              </tr>
+              <tr>
+                <td><span class="key-badge">⏯ PLAY</span></td>
+                <td>播放/暂停</td>
+                <td><span class="key-badge">FN</span> + <span class="key-badge">⏯</span> = 进入睡眠</td>
+              </tr>
+              <tr>
+                <td><span class="key-badge">◀◀ PREV</span></td>
+                <td>媒体上一首</td>
+                <td><span class="key-badge">FN</span> + <span class="key-badge">◀◀</span> = 关机</td>
+              </tr>
+              <tr>
+                <td><span class="key-badge">Vol+ / Vol-</span></td>
+                <td>旋钮调节</td>
+                <td>通过 C3 旋钮发送音量指令</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- LOGO 快捷键 -->
+    <section id="shortcuts">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">🔑</span>
+          LOGO 键快捷操作
+        </h2>
+        <p class="section-subtitle">通过 LOGO 键的不同按压时长触发不同功能</p>
+      </div>
+
+      <div class="card-grid">
+        <div class="card" style="border-left: 4px solid var(--accent-yellow);">
+          <h3>🎯 单击 ( &lt; 2秒)</h3>
+          <p>切换 CHERRY_LOGO 灯效模式（开启/关闭），并执行已配置的 LOGO 宏</p>
+        </div>
+        <div class="card" style="border-left: 4px solid var(--accent-green);">
+          <h3>🔄 长按 2-8 秒</h3>
+          <p>发送 <code style="background: var(--bg-secondary); padding: 2px 8px; border-radius: 4px;">N_REBOT</code> 信号 → C3 显示重启动画 → 键盘普通重启</p>
+        </div>
+        <div class="card" style="border-left: 4px solid var(--accent-red);">
+          <h3>⚡ 长按 ≥ 8 秒</h3>
+          <p>发送 <code style="background: var(--bg-secondary); padding: 2px 8px; border-radius: 4px;">N_ROOT</code> 信号 → 强制进入 ROM 刷机模式</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 系统通知 -->
+    <section id="system">
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">🔔</span>
+          系统通知与优先级
+        </h2>
+        <p class="section-subtitle">C3 灯光优先级层级，高优先级可覆盖低优先级效果</p>
+      </div>
+
+      <div class="priority-chart">
+        <div class="priority-item">
+          <div class="priority-level" style="background: linear-gradient(135deg, #ff4466, #ff6644);">L0</div>
+          <div class="priority-content">
+            <h4>物理强关 (g_forceOff)</h4>
+            <p>长按灯光键 2 秒 → 强制关闭所有灯光，任何其他效果都无法覆盖</p>
+          </div>
+        </div>
+        <div class="priority-item">
+          <div class="priority-level" style="background: linear-gradient(135deg, #ff8844, #ffaa22);">L1</div>
+          <div class="priority-content">
+            <h4>蓝牙提示闪烁 (bt_alert)</h4>
+            <p>收到蓝牙 R/G/B/Y 指令 → 对应颜色闪烁，可覆盖常规灯效</p>
+          </div>
+        </div>
+        <div class="priority-item">
+          <div class="priority-level" style="background: linear-gradient(135deg, #00ff88, #00ddaa);">L2</div>
+          <div class="priority-content">
+            <h4>系统通知动画 (sysState)</h4>
+            <p>N_ME(记忆更新) / N_REBOT(重启) / N_ROOT(刷机) 特殊动画序列</p>
+          </div>
+        </div>
+        <div class="priority-item">
+          <div class="priority-level" style="background: linear-gradient(135deg, #b44aff, #8833ff);">L3</div>
+          <div class="priority-content">
+            <h4>按键扩散特效 (isRippleActive)</h4>
+            <p>按下任意键时触发的环形扩散动画，颜色可选</p>
+          </div>
+        </div>
+        <div class="priority-item">
+          <div class="priority-level" style="background: linear-gradient(135deg, #00d4ff, #0099cc);">L4</div>
+          <div class="priority-content">
+            <h4>常规背景灯效 (currentEffect)</h4>
+            <p>默认显示的 14 种灯效模式 (Mode 0-13)</p>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 40px;">
+        <h3 style="margin-bottom: 20px; font-size: 1.3rem;">串口通知指令表</h3>
+        <div class="notifications">
+          <div class="notification-card">
+            <div class="notif-icon" style="background: linear-gradient(135deg, #ffcc00, #00ffff);">💾</div>
+            <div class="notif-content">
+              <h4>N_ME 记忆更新</h4>
+              <p>S3 宏配置完成，触发记忆更新完成动画</p>
+              <span class="notif-cmd">黄青交替爆闪</span>
+            </div>
+          </div>
+          <div class="notification-card">
+            <div class="notif-icon" style="background: linear-gradient(135deg, #ff0000, #00ff00, #0000ff, #ffffff);">🔄</div>
+            <div class="notif-content">
+              <h4>N_REBOT 普通重启</h4>
+              <p>LOGO 长按 2-8 秒触发，系统正常重启</p>
+              <span class="notif-cmd">红→绿→蓝→白 过渡</span>
+            </div>
+          </div>
+          <div class="notification-card">
+            <div class="notif-icon" style="background: linear-gradient(135deg, #ff8800, #ffcc00);">⚡</div>
+            <div class="notif-content">
+              <h4>N_ROOT 刷机模式</h4>
+              <p>LOGO 长按 ≥8 秒，强制进入 ROM 刷机</p>
+              <span class="notif-cmd">橙色持续闪烁</span>
+            </div>
+          </div>
+          <div class="notification-card">
+            <div class="notif-icon" style="background: linear-gradient(135deg, #b44aff, #00d4ff);">👆</div>
+            <div class="notif-content">
+              <h4>N_KEY_PRESS 按键按下</h4>
+              <p>S3 检测到按键按下，触发扩散特效</p>
+              <span class="notif-cmd">环形扩散动画</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 底部指示灯 -->
+    <section>
+      <div class="section-header">
+        <h2 class="section-title">
+          <span class="icon">📊</span>
+          底部指示灯状态
+        </h2>
+        <p class="section-subtitle">C3 底部的 3 颗指示灯显示当前控制模式</p>
+      </div>
+
+      <div class="card-grid">
+        <div class="card" style="text-align: center;">
+          <div style="font-size: 3rem; margin-bottom: 16px;">💜</div>
+          <h3>灯 1 - 紫色</h3>
+          <p style="margin-top: 8px;">CPG 灯效控制模式</p>
+        </div>
+        <div class="card" style="text-align: center;">
+          <div style="font-size: 3rem; margin-bottom: 16px;">🔴</div>
+          <h3>灯 2 - 红色</h3>
+          <p style="margin-top: 8px;">音量控制模式</p>
+        </div>
+        <div class="card" style="text-align: center;">
+          <div style="font-size: 3rem; margin-bottom: 16px;">🟢</div>
+          <h3>灯 3 - 绿色</h3>
+          <p style="margin-top: 8px;">亮度控制模式（默认）</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>YYQ-MX9.0 机械键盘 · ESP32-S3 + ESP32-C3 双芯片架构</p>
+    <p style="margin-top: 8px;">Made with ❤️ by YYQ</p>
+  </footer>
+
+  <script>
+    // 平滑滚动
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+      anchor.addEventListener('click', function (e) {
+        e.preventDefault();
+        const target = document.querySelector(this.getAttribute('href'));
+        if (target) {
+          target.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start'
+          });
+        }
+      });
+    });
+
+    // 键盘按键动画
+    document.querySelectorAll('.kb-key').forEach(key => {
+      key.addEventListener('mouseenter', () => {
+        key.style.transform = 'scale(1.05)';
+      });
+      key.addEventListener('mouseleave', () => {
+        key.style.transform = 'scale(1)';
+      });
+    });
+
+    // 灯效卡片点击效果
+    document.querySelectorAll('.effect-card').forEach(card => {
+      card.addEventListener('click', () => {
+        card.style.transform = 'scale(0.98)';
+        setTimeout(() => {
+          card.style.transform = '';
+        }, 150);
+      });
+    });
+  </script>
+</body>
+</html>
