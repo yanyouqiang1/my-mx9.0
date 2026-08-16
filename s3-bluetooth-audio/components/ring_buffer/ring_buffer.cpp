@@ -11,25 +11,41 @@ RingBuffer::~RingBuffer() {
 }
 
 bool RingBuffer::write(const uint8_t* data, size_t len) {
-    if (len > capacity_ - count_) return false;
+    portENTER_CRITICAL(&mux_);
+    if (len > capacity_ - count_) {
+        portEXIT_CRITICAL(&mux_);
+        return false;
+    }
 
     for (size_t i = 0; i < len; i++) {
         buffer_[head_] = data[i];
         head_ = (head_ + 1) % capacity_;
         count_++;
     }
+    portEXIT_CRITICAL(&mux_);
     return true;
 }
 
 size_t RingBuffer::read(uint8_t* data, size_t len) {
+    portENTER_CRITICAL(&mux_);
     size_t actual = (len < count_) ? len : count_;
     for (size_t i = 0; i < actual; i++) {
         data[i] = buffer_[tail_];
         tail_ = (tail_ + 1) % capacity_;
         count_--;
     }
+    portEXIT_CRITICAL(&mux_);
     return actual;
 }
 
-size_t RingBuffer::available() const { return count_; }
-void RingBuffer::clear() { head_ = tail_ = count_ = 0; }
+size_t RingBuffer::available() const {
+    portENTER_CRITICAL(&mux_);
+    size_t result = count_;
+    portEXIT_CRITICAL(&mux_);
+    return result;
+}
+void RingBuffer::clear() {
+    portENTER_CRITICAL(&mux_);
+    head_ = tail_ = count_ = 0;
+    portEXIT_CRITICAL(&mux_);
+}

@@ -99,16 +99,29 @@ void BTAudioManager::begin() {
     const char* device_name = "YYQ-MX9.0-Audio";
     esp_bt_dev_set_device_name(device_name);
 
+    enabled_ = true;
+    state_ = BTAudioState::CONNECTED;
+
     ESP_LOGI(TAG, "蓝牙音频模块初始化完成");
 }
 
 void BTAudioManager::end() {
-    setEnabled(false);
-    esp_a2d_sink_deinit();
-    esp_bluedroid_disable();
-    esp_bluedroid_deinit();
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
+    if (state_ == BTAudioState::OFF) return;
+
+    if (esp_a2d_sink_is_ready()) {
+        esp_a2d_sink_deinit();
+    }
+    if (esp_bluedroid_is_enabled()) {
+        esp_bluedroid_disable();
+        esp_bluedroid_deinit();
+    }
+    if (esp_bt_controller_is_enabled()) {
+        esp_bt_controller_disable();
+        esp_bt_controller_deinit();
+    }
+
+    enabled_ = false;
+    state_ = BTAudioState::OFF;
     ESP_LOGI(TAG, "蓝牙音频模块已关闭");
 }
 

@@ -4,6 +4,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 class RingBuffer {
 public:
@@ -16,6 +18,7 @@ public:
     void clear();
 
 private:
+    portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
     uint8_t* buffer_;
     size_t capacity_;
     size_t head_;
