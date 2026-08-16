@@ -22,6 +22,8 @@
 
 #include "components/bt_audio/bt_audio.h"
 #include "components/usb_audio/usb_audio.h"
+#include "components/audio_output/audio_output.h"
+#include "esp_log.h"
 
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
@@ -32,6 +34,41 @@ Adafruit_MCP23X17 mcp;
 // 音频管理器实例
 BTAudioManager btAudio;
 USBAudioManager usbAudio;
+AudioOutput audioOutput;
+
+// 音频管线任务：从 USB 接收缓冲区读取（电脑→耳机）并通过 I2S 输出到外部 DAC
+void audioPipelineTask(void* param) {
+    static uint8_t audio_buf[512];
+
+    ESP_LOGI("AUDIO_PIPELINE", "音频管线任务启动");
+    while (true) {
+        // ====== 电脑 → 耳机（USB RX → I2S 输出）======
+        // tud_audio_rx_cb 将电脑发送的 USB 音频写入 usbAudio.getCaptureBuffer()
+        // 我们从该缓冲区读取并通过 I2S 输出到外部 DAC
+        size_t len = usbAudio.getCaptureBuffer()->read(audio_buf, sizeof(audio_buf));
+        if (len > 0) {
+            if (audioOutput.isReady()) {
+                size_t written = audioOutput.write(audio_buf, len);
+                if (written < len) {
+                    // I2S FIFO 满，部分数据丢弃（静音补偿已在 DAC 端自然产生）
+                }
+            }
+        } else {
+            // 缓冲区为空，填充少量静音帧防止 I2S 空闲
+            if (audioOutput.isReady()) {
+                audioOutput.writeSilence(AUDIO_FRAME_BYTES);
+            }
+        }
+
+        // ====== 耳机 → 电脑（A2DP → USB TX）======
+        // a2dp_data_callback 已将 A2DP PCM 数据写入 usbAudio.getPlaybackBuffer()
+        // tud_audio_tx_complete_cb 在 TX 完成时自动消费该缓冲区
+        // 无需在此任务中额外处理
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    vTaskDelete(NULL);
+}
 
 // ================= 引脚与通讯定义 =================
 #define I2C_SDA 14
@@ -423,6 +460,23 @@ void setup() {
 
     // USB Audio 初始化
     usbAudio.begin();
+
+    // I2S 音频输出初始化（必须在 USB.begin 之后，以便 USB Audio 配置完成）
+    if (audioOutput.begin()) {
+        ESP_LOGI("MAIN", "音频输出初始化成功");
+        // 创建音频管线任务（Core 1，与键盘扫描错开）
+        xTaskCreatePinnedToCore(
+            audioPipelineTask,
+            "audio_pipeline",
+            4096,
+            NULL,
+            3,   // 优先级略高于键盘任务
+            NULL,
+            1    // Core 1
+        );
+    } else {
+        ESP_LOGW("MAIN", "音频输出初始化失败（检查 I2S 引脚接线）");
+    }
 
     USB.begin();
 
