@@ -107,10 +107,19 @@ size_t AudioOutput::writeSilence(size_t len) {
     if (!ready_ || len == 0) return 0;
     static uint8_t silence[AUDIO_FRAME_BYTES] = {0};
     size_t total = 0;
-    while (total < len) {
+    const size_t maxRetries = 10;
+    size_t retries = 0;
+
+    while (total < len && retries < maxRetries) {
         size_t chunk = (len - total) > AUDIO_FRAME_BYTES ? AUDIO_FRAME_BYTES : (len - total);
-        total += write(silence, chunk);
-        if (chunk < AUDIO_FRAME_BYTES) break;
+        ssize_t written = write(silence, chunk);
+        if (written > 0) {
+            total += written;
+            retries = 0;  // Reset on success
+        } else {
+            retries++;
+        }
     }
+    // If we exit due to retries exhausted, that's OK - audio will have gaps
     return total;
 }

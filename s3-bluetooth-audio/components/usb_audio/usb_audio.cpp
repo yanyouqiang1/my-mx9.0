@@ -1,3 +1,16 @@
+// ===== Audio Data Flow =====
+// A2DP → USB TX path (headphone → computer):
+//   a2dp_data_callback (A2DP ISR)
+//     → getPlaybackBuffer()->write() (RingBuffer)
+//     → tud_audio_tx_complete_cb (TinyUSB task, reads from buffer)
+//     → tud_audio_write() → USB TX to computer
+//
+// USB RX → I2S path (computer → headphone):
+//   tud_audio_rx_cb (TinyUSB ISR, int16_t* PCM)
+//     → getCaptureBuffer()->write() (RingBuffer, uint8_t)
+//     → audioPipelineTask() (FreeRTOS task, reads from buffer)
+//     → AudioOutput.write() → I2S → DAC
+
 // s3-bluetooth-audio/components/usb_audio/usb_audio.cpp
 #include "usb_audio.h"
 #include "tusb.h"
