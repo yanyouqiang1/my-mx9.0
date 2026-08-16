@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>YYQ-MX9.0 键盘极客配置</title>
+    <style>
+        body { font-family: system-ui; max-width: 900px; margin: auto; padding: 20px; background: #eceff1; color: #263238; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); margin-bottom: 20px; }
+        h2 { border-left: 5px solid #007bff; padding-left: 10px; font-size: 1.2rem; }
+        h3 { font-size: 1rem; color: #444; margin-top: 10px; }
+        .btn { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn-add { background: #6c757d; padding: 5px 10px; font-size: 0.8rem; }
+        .btn-tag { background: #17a2b8; padding: 5px 8px; font-size: 0.8rem; margin-right: 5px; margin-bottom: 5px; }
+        .btn-send { background: #28a745; width: 100%; margin-top: 15px; }
+        .btn-me { background: #ff9800; }
+        .btn-scan { background: #6f42c1; }
+        .btn-disconnect { background: #dc3545; }
+        .btn-delete { background: #dc3545; padding: 3px 8px; font-size: 0.75rem; }
+        .btn-connect { background: #28a745; padding: 3px 8px; font-size: 0.75rem; }
+        select, input, textarea { padding: 10px; margin: 5px 0; border: 1px solid #cfd8dc; border-radius: 6px; width: 100%; box-sizing: border-box; }
+        .cmb-item { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; background: #f8f9fa; padding: 8px; border-radius: 6px; border: 1px solid #e2e8f0; }
+        .remove-btn { color: red; cursor: pointer; font-weight: bold; margin-left: auto; padding: 0 5px; }
+        .hint { font-size: 0.85rem; color: #666; margin-bottom: 10px; }
+        /* Toggle switch */
+        .switch { position: relative; display: inline-block; width: 48px; height: 24px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: 0.3s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: 0.3s; border-radius: 50%; }
+        input:checked + .slider { background-color: #007bff; }
+        input:checked + .slider:before { transform: translateX(24px); }
+        /* Scan results */
+        .scan-item { display: flex; align-items: center; gap: 10px; padding: 8px; background: #f0f0f0; border-radius: 6px; margin-bottom: 6px; }
+        /* Paired device */
+        .paired-item { display: flex; align-items: center; gap: 10px; padding: 8px; background: #f8f9fa; border-radius: 6px; margin-bottom: 6px; border: 1px solid #e2e8f0; }
+        .paired-name { flex: 1; font-weight: bold; }
+        .status-tag { font-size: 0.8rem; padding: 2px 8px; border-radius: 10px; font-weight: bold; }
+        .status-connected { background: #d4edda; color: #155724; }
+        .status-disconnected { background: #f8d7da; color: #721c24; }
+        #scanResults, #pairedDevices { max-height: 250px; overflow-y: auto; }
+        .scan-hint { font-size: 0.8rem; color: #888; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <h1>YYQ-MX9.0 键盘宏配置</h1>
+
+    <div class="card">
+        <h2>1. 通讯连接</h2>
+        <button class="btn" id="connectBtn">连接我的键盘</button>
+        <span id="status" style="margin-left: 10px; color: #f44336; font-weight: bold;">未连接</span>
+    </div>
+
+    <div class="card">
+        <h2>2. 设置宏按键 (MA-MC, M1-M12)</h2>
+        <label>目标物理按键:</label>
+        <select id="macroKey">
+            <optgroup label="侧边宏">
+                <option value="MA">MA</option><option value="MB">MB</option><option value="MC">MC</option><option value="MR">MR</option>
+            </optgroup>
+            <optgroup label="顶部宏">
+                <option value="M1">M1</option><option value="M2">M2</option><option value="M3">M3</option><option value="M4">M4</option>
+                <option value="M5">M5</option><option value="M6">M6</option><option value="M7">M7</option><option value="M8">M8</option>
+                <option value="M9">M9</option><option value="M10">M10</option><option value="M11">M11</option><option value="M12">M12</option>
+            </optgroup>
+        </select>
+
+        <div style="display: flex; gap: 20px; margin-top: 15px;">
+            <!-- 组合键部分 -->
+            <div style="flex: 1; border-right: 1px solid #eee; padding-right: 20px;">
+                <h3>组合键模式 (同时按下)</h3>
+                <div class="hint" style="color: #e91e63;">注意：如果需要同时按下含有 * 或 + 的组合键，请选择"特殊功能键"并找到"小键盘"相应键，避免触发Shift。</div>
+                <div id="cmbList"></div>
+                <button class="btn btn-add" id="addCmbBtn">+ 添加按键</button>
+                <button class="btn btn-send" id="sendCmbBtn">保存组合键</button>
+            </div>
+
+            <!-- 连续输入部分 -->
+            <div style="flex: 1;">
+                <h3>序列模式 (模拟打字)</h3>
+                <div class="hint">按顺序依次打字，支持插入特殊按键占位符</div>
+
+                <div>
+                    <button class="btn btn-tag" onclick="insertTag('[ENTER]')">插入回车 [ENTER]</button>
+                    <button class="btn btn-tag" onclick="insertTag('[TAB]')">插入Tab [TAB]</button>
+                    <button class="btn btn-tag" onclick="insertTag('[ESC]')">插入Esc [ESC]</button>
+                    <button class="btn btn-tag" onclick="insertTag('[BACKSPACE]')">插入退格 [BACKSPACE]</button>
+                </div>
+
+                <textarea id="seqInput" rows="4" placeholder="示例: admin[TAB]password123[ENTER]"></textarea>
+                <button class="btn btn-send" id="sendSeqBtn">保存序列</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>3. ME 键配置 (Hex 十六进制长文本)</h2>
+        <div class="hint">输入原始文本（支持中文、标点或网页任意内容），系统自动转为高效 Hex 存入 ME 键</div>
+        <textarea id="meRawInput" rows="4" placeholder="在此输入需要转成Hex的原始文本..."></textarea>
+        <button class="btn btn-send btn-me" id="sendMeBtn">转码并存入 ME 键</button>
+        <div id="progress" style="margin-top:10px; color: blue;"></div>
+    </div>
+
+    <!-- 蓝牙音频网关配置卡片 -->
+    <div class="card">
+        <h2>4. 蓝牙音频网关</h2>
+
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <label>蓝牙音频：</label>
+            <label class="switch">
+                <input type="checkbox" id="btAudioToggle">
+                <span class="slider"></span>
+            </label>
+            <span id="btAudioStatus">关闭</span>
+        </div>
+
+        <div id="btAudioSection" style="display: none; margin-top: 15px;">
+            <h3>连接状态：<span id="connectionStatus" class="status-tag status-disconnected">未连接</span></h3>
+            <h3>已连接设备：<span id="connectedDevice">-</span></h3>
+
+            <button class="btn btn-scan" id="scanBtn">扫描附近耳机</button>
+            <div id="scanResults" style="margin-top: 10px;"></div>
+
+            <h3>已配对设备：</h3>
+            <div id="pairedDevices"></div>
+        </div>
+    </div>
+
+<script>
+    const KEY_MAP = {
+        "Left Ctrl": 128, "Left Shift": 129, "Left Alt": 130, "Left Win": 131,
+        "Right Ctrl": 132, "Right Shift": 133, "Right Alt": 134, "Enter": 176,
+        "Tab": 179, "Backspace": 178, "Esc": 177, "Space": 32,
+        "Del": 212, "F1": 194, "F2": 195, "F3": 196, "F4": 197, "F5": 198, "F12": 205,
+        "小键盘 * (乘号)": 221, "小键盘 + (加号)": 223, "小键盘 - (减号)": 222, "小键盘 / (除号)": 220,
+        "小键盘 Enter": 224, "小键盘 . (点)": 235,
+        "小键盘 0": 234, "小键盘 1": 225, "小键盘 2": 226, "小键盘 3": 227,
+        "A": 97, "B": 98, "C": 99, "V": 118, "S": 115, "L": 108
+    };
+
+    // BLE UUIDs for s3-bluetooth-audio firmware
+    const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914c";
+    const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+    let myCharacteristic;
+    let myDevice;
+
+    // ====== Paired devices (stored in localStorage) ======
+    let pairedDevices = JSON.parse(localStorage.getItem('btAudioPaired') || '[]');
+
+    function savePairedDevices() {
+        localStorage.setItem('btAudioPaired', JSON.stringify(pairedDevices));
+    }
+
+    function renderPairedDevices() {
+        const container = document.getElementById('pairedDevices');
+        if (pairedDevices.length === 0) {
+            container.innerHTML = '<div class="hint">暂无已配对设备</div>';
+            return;
+        }
+        container.innerHTML = pairedDevices.map((d, i) => {
+            const isConnected = d.address === window._connectedBtAddr;
+            return `<div class="paired-item">
+                <span class="paired-name">${d.name}</span>
+                ${isConnected
+                    ? '<span class="status-tag status-connected">已连接</span>'
+                    : `<button class="btn btn-connect" onclick="btConnectPaired(${i})">连接</button>`
+                }
+                <button class="btn btn-delete" onclick="btDeletePaired(${i})">删除</button>
+            </div>`;
+        }).join('');
+    }
+
+    window._connectedBtAddr = null;
+
+    function insertTag(tag) {
+        const textarea = document.getElementById('seqInput');
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        const text = textarea.value;
+        textarea.value = text.substring(0, start) + tag + text.substring(end);
+        textarea.focus();
+        textarea.selectionStart = textarea.selectionEnd = start + tag.length;
+    }
+
+    // 动态切换组合按键输入类型
+    function toggleCmbType(selectElem) {
+        const parent = selectElem.parentElement;
+        const valSelect = parent.querySelector('.val-select');
+        const valInput = parent.querySelector('.val-input');
+        if (selectElem.value === 'preset') {
+            valSelect.style.display = 'inline-block';
+            valInput.style.display = 'none';
+            valInput.value = '';
+        } else {
+            valSelect.style.display = 'none';
+            valInput.style.display = 'inline-block';
+        }
+    }
+
+    // ====== BLE 连接键盘 ======
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+        try {
+            myDevice = await navigator.bluetooth.requestDevice({
+                acceptAllDevices: true,
+                optionalServices: [SERVICE_UUID]
+            });
+
+            const server = await myDevice.gatt.connect();
+            const service = await server.getPrimaryService(SERVICE_UUID);
+            myCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+            // 尝试开启通知（如果 characteristic 支持）
+            try {
+                await myCharacteristic.startNotifications();
+                myCharacteristic.addEventListener('characteristicvaluechanged', onBLENotification);
+            } catch (e) {
+                // Notify 不支持也不影响写命令
+                console.warn('BLE notify 不可用，仅支持单向命令:', e.message);
+            }
+
+            document.getElementById('status').innerText = "已连接";
+            document.getElementById('status').style.color = "green";
+        } catch(e) {
+            console.error("蓝牙连接详情:", e);
+            alert("蓝牙连接失败: " + (e.message || e));
+        }
+    });
+
+    // ====== BLE 命令发送 ======
+    async function sendBLE(str) {
+        if (!myCharacteristic) { alert("请先连接蓝牙！"); return; }
+        const encoder = new TextEncoder();
+        const data = encoder.encode(str);
+        try {
+            await myCharacteristic.writeValue(data);
+            await new Promise(r => setTimeout(r, 150));
+        } catch(e) {
+            console.error(e);
+            alert("发送失败，请尝试重新连接蓝牙！");
+        }
+    }
+
+    // ====== BLE 通知处理 ======
+    function onBLENotification(event) {
+        const decoder = new TextDecoder();
+        const value = decoder.decode(event.target.value);
+        console.log('[BLE Notify]', value);
+        handleBLEStatus(value);
+    }
+
+    function handleBLEStatus(data) {
+        // BTAUDIO:SCAN:<name>:<address>  - 扫描到的设备
+        if (data.startsWith('BTAUDIO:SCAN:')) {
+            const parts = data.split(':');
+            if (parts.length >= 4) {
+                const name = parts[2];
+                const address = parts[3];
+                addScanResult(name, address);
+            }
+        }
+        // BTAUDIO:CONNECTED:<name>  - 已连接
+        else if (data.startsWith('BTAUDIO:CONNECTED:')) {
+            const name = data.substring('BTAUDIO:CONNECTED:'.length);
+            document.getElementById('connectionStatus').innerText = '已连接';
+            document.getElementById('connectionStatus').className = 'status-tag status-connected';
+            document.getElementById('connectedDevice').innerText = name;
+            window._connectedBtAddr = window._lastConnectedAddr || null;
+            renderPairedDevices();
+        }
+        // BTAUDIO:DISCONNECTED  - 断开
+        else if (data === 'BTAUDIO:DISCONNECTED') {
+            document.getElementById('connectionStatus').innerText = '未连接';
+            document.getElementById('connectionStatus').className = 'status-tag status-disconnected';
+            document.getElementById('connectedDevice').innerText = '-';
+            window._connectedBtAddr = null;
+            renderPairedDevices();
+        }
+    }
+
+    // ====== 添加组合键 ======
+    document.getElementById('addCmbBtn').addEventListener('click', () => {
+        const div = document.createElement('div');
+        div.className = 'cmb-item';
+        let options = Object.keys(KEY_MAP).map(k => `<option value="${KEY_MAP[k]}">${k}</option>`).join('');
+        div.innerHTML = `
+            <select class="type-select" style="width: 120px; font-weight: bold;" onchange="toggleCmbType(this)">
+                <option value="preset">特殊功能键</option>
+                <option value="char">自定义字符</option>
+            </select>
+            <select class="val-select" style="width: 170px;">${options}</select>
+            <input class="val-input" type="text" maxlength="1" style="width: 120px; display: none;" placeholder="输入单字符">
+            <span class="remove-btn" onclick="this.parentElement.remove()">✕</span>
+        `;
+        document.getElementById('cmbList').appendChild(div);
+    });
+
+    document.getElementById('sendCmbBtn').addEventListener('click', async () => {
+        const key = document.getElementById('macroKey').value;
+        let codes = [];
+        document.querySelectorAll('.cmb-item').forEach(item => {
+            const type = item.querySelector('.type-select').value;
+            if (type === 'preset') {
+                const selectVal = item.querySelector('.val-select').value;
+                codes.push(selectVal);
+            } else {
+                const inputVal = item.querySelector('.val-input').value;
+                if(inputVal) {
+                    codes.push(inputVal.charCodeAt(0));
+                }
+            }
+        });
+        if(codes.length == 0) return alert("请添加按键");
+        await sendBLE(`SET:${key}:CMB:${codes.join(',')}`);
+        alert("组合键设置成功！");
+    });
+
+    document.getElementById('sendSeqBtn').addEventListener('click', async () => {
+        const key = document.getElementById('macroKey').value;
+        const text = document.getElementById('seqInput').value;
+        await sendBLE(`SET:${key}:SEQ:${text}`);
+        alert("序列设置成功！");
+    });
+
+    document.getElementById('sendMeBtn').addEventListener('click', async () => {
+        const rawText = document.getElementById('meRawInput').value;
+        if(!rawText) return;
+
+        const encoder = new TextEncoder();
+        const view = encoder.encode(rawText);
+        let hexStr = '';
+        for (let i = 0; i < view.length; i++) {
+            hexStr += view[i].toString(16).padStart(2, '0');
+        }
+
+        const prog = document.getElementById('progress');
+        prog.innerText = "传输中...";
+
+        await sendBLE("ME_START");
+        for(let i=0; i < hexStr.length; i += 128) {
+            await sendBLE("ME_DATA:" + hexStr.substring(i, i+128));
+            prog.innerText = `传输进度: ${Math.round((i/hexStr.length)*100)}%`;
+        }
+        await sendBLE("ME_END");
+        prog.innerText = "ME 键 Hex 存入成功！";
+    });
+
+    // ====== 蓝牙音频网关逻辑 ======
+
+    // 开关 toggle
+    document.getElementById('btAudioToggle').addEventListener('change', async (e) => {
+        const enabled = e.target.checked;
+        await sendBLE(`BTAUDIO:${enabled ? 1 : 0}`);
+        document.getElementById('btAudioSection').style.display = enabled ? 'block' : 'none';
+        document.getElementById('btAudioStatus').innerText = enabled ? '开启' : '关闭';
+    });
+
+    // 扫描附近耳机
+    let scanTimeout = null;
+    document.getElementById('scanBtn').addEventListener('click', async () => {
+        const btn = document.getElementById('scanBtn');
+        const resultsDiv = document.getElementById('scanResults');
+        resultsDiv.innerHTML = '<div class="hint">正在扫描...</div>';
+        btn.disabled = true;
+        btn.innerText = '扫描中...';
+
+        await sendBLE('BTAUDIO:SCAN');
+
+        // 3 秒后自动停止
+        if (scanTimeout) clearTimeout(scanTimeout);
+        scanTimeout = setTimeout(() => {
+            resultsDiv.innerHTML += '<div class="scan-hint">扫描结束</div>';
+            btn.disabled = false;
+            btn.innerText = '扫描附近耳机';
+        }, 3000);
+    });
+
+    // 扫描结果暂存（每次扫描前清空）
+    let scanResults = [];
+
+    function addScanResult(name, address) {
+        // 去重
+        if (scanResults.some(r => r.address === address)) return;
+        scanResults.push({ name, address });
+        renderScanResults();
+    }
+
+    function renderScanResults() {
+        const container = document.getElementById('scanResults');
+        if (scanResults.length === 0) {
+            container.innerHTML = '<div class="hint">点击"扫描附近耳机"开始搜索</div>';
+            return;
+        }
+        container.innerHTML = scanResults.map((d, i) => `
+            <div class="scan-item">
+                <input type="radio" name="scanResult" value="${i}">
+                <strong>${d.name}</strong>
+                <span style="color:#888;font-size:0.8rem">${d.address}</span>
+                <button class="btn btn-connect" style="margin-left:auto" onclick="btConnectScan(${i})">连接</button>
+            </div>
+        `).join('');
+    }
+
+    // 连接扫描结果中的设备
+    async function btConnectScan(index) {
+        const device = scanResults[index];
+        if (!device) return;
+        await sendBLE(`BTAUDIO:CONNECT:${device.address}`);
+        window._lastConnectedAddr = device.address;
+        // 添加到已配对列表
+        if (!pairedDevices.some(d => d.address === device.address)) {
+            pairedDevices.push({ name: device.name, address: device.address });
+            savePairedDevices();
+            renderPairedDevices();
+        }
+        // 清空扫描结果
+        scanResults = [];
+        document.getElementById('scanResults').innerHTML = '<div class="hint">点击"扫描附近耳机"开始搜索</div>';
+        alert(`正在连接 ${device.name}...`);
+    }
+
+    // 连接已配对设备
+    async function btConnectPaired(index) {
+        const device = pairedDevices[index];
+        if (!device) return;
+        await sendBLE(`BTAUDIO:CONNECT:${device.address}`);
+        window._lastConnectedAddr = device.address;
+        alert(`正在连接 ${device.name}...`);
+    }
+
+    // 删除已配对设备
+    function btDeletePaired(index) {
+        const device = pairedDevices[index];
+        if (!device) return;
+        if (!confirm(`确定删除配对设备 "${device.name}" 吗？`)) return;
+        pairedDevices.splice(index, 1);
+        savePairedDevices();
+        renderPairedDevices();
+    }
+
+    // 初始化已配对设备列表
+    renderPairedDevices();
+    renderScanResults();
+
+</script>
+</body>
+</html>
