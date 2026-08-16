@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include "ring_buffer.h"
 
+// Forward declaration so the A2DP data callback can access the USB Audio buffer
+class USBAudioManager;
+extern USBAudioManager* usbAudioPtr;
+
 // BLE Audio 状态
 enum class BTAudioState {
     OFF = 0,
