@@ -1,0 +1,30 @@
+# Binary files
+*.bin
+*.elf
+*.map
+*.hex
+*.out
+
+# PlatformIO
+.pio/
+.vscode/
+
+# Arduino
+*.d
+*.o
+*.a
+build/
+lib/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
