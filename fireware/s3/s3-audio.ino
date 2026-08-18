@@ -425,6 +425,31 @@ void scanKeyboardMatrix() {
     mcp.writeGPIOAB(0xFFFF); // 释放所有列驱动，降低能耗和串扰
 }
 
+// ================= USB Audio Microphone (returns silence) =================
+class USBAudioMicrophone {
+public:
+    USBAudioMicrophone() : muted(true), volume(100) {}
+
+    void begin() {
+        // USB Microphone is handled by TinyUSB descriptors
+    }
+
+    size_t read(int16_t* buffer, size_t len) {
+        // Always return silence since no microphone input
+        memset(buffer, 0, len * 2);
+        return len;
+    }
+
+    void setMuted(bool m) { muted = m; }
+    uint8_t getVolume() { return volume; }
+
+private:
+    bool muted;
+    uint8_t volume;
+};
+
+static USBAudioMicrophone usbMic;
+
 void setup() {
     Serial.begin(115200);
     Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); 
@@ -438,7 +463,8 @@ void setup() {
     Keyboard.begin();
     ConsumerControl.begin(); 
     USB.begin();
-    
+    usbMic.begin();
+
     // 初始化 I2C 与限时，防止因没有上拉或短路导致的代码卡死
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000); // 提升至 400kHz 快模式，减少在 I2C 里的阻塞时间
