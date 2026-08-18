@@ -331,7 +331,7 @@ bool readI2SAudio(int16_t* buffer, int samples) {
 
 // ================= USB Audio Speaker 路由函数 =================
 void handleAudioRouting() {
-    static int16_t audioBuffer[256];
+    static int16_t audioBuffer[512];  // 512 samples = 1024 bytes
     if (readI2SAudio(audioBuffer, 256)) {
         // 写入音频到 TinyUSB speaker buffer (立体声交错格式)
         tud_audio_n_write_frames(0, (const uint8_t*)audioBuffer, 256);
