@@ -212,9 +212,6 @@ void initI2S() {
 }
 
 void initBluetooth() {
-    // 初始化 I2S (必须在使用 i2s_write 之前)
-    initI2S();
-
     esp_err_t err;
 
     // 释放经典 BT 内存（如果不需要）
