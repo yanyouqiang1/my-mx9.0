@@ -1,10 +1,13 @@
 #pragma once
 #include <ESPAsyncWebServer.h>
+#include <Update.h>
 
-// Placeholder - 完整内容由 Task 5 实现
 class OTAHandlerClass {
+private:
+    static bool _enabled;
+
 public:
-    static void setup(AsyncWebServer* server) {
-        // TODO: 实现 OTA 处理
-    }
+    static void setup(AsyncWebServer* server);
+    static bool isEnabled() { return _enabled; }
+    static void setEnabled(bool enabled) { _enabled = enabled; }
 };
