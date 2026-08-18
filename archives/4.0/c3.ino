@@ -107,6 +107,12 @@ unsigned long lastKnobTime = 0;
 unsigned long knobPressStart = 0;
 bool knobWasPressed = false;
 
+// ================= S3 控制长按检测 =================
+unsigned long cpgLongPressStart = 0;
+unsigned long muteLongPressStart = 0;
+bool cpgLongPressSent = false;
+bool muteLongPressSent = false;
+
 // 编码器状态
 int lastClkState;
 unsigned long lastEffectUpdate = 0;
@@ -245,6 +251,18 @@ void exitSystemState() {
   }
 }
 
+// ================= S3 控制命令发送确认闪烁 =================
+void flashConfirm() {
+    for (int i = 0; i < 3; i++) {
+        indicatorStrip.fill(indicatorStrip.Color(255, 255, 255));
+        indicatorStrip.show();
+        delay(100);
+        indicatorStrip.clear();
+        indicatorStrip.show();
+        delay(100);
+    }
+}
+
 // ================= 2. 底部指示灯更新 =================
 void updateIndicators() {
   indicatorStrip.clear();
@@ -284,7 +302,9 @@ void handleButtons() {
     static bool muteTriggered = false;
     if (muteReading == LOW && !muteTriggered) {
       muteTriggered = true;
-      
+      muteLongPressStart = now;
+      muteLongPressSent = false;
+
       // 【物理唤醒】：如果在强关状态，任何按键点击都将其唤醒并切入该模式
       if (g_forceOff) {
         g_forceOff = false;
@@ -292,13 +312,22 @@ void handleButtons() {
         g_forceRedraw = true;
         Serial.println("强关解除：唤醒灯光系统");
       }
-      
+
       exitSystemState();
       currentMode = MODE_MUTE;
       updateIndicators();
       Serial.println("模式切换: 控制音量");
     } else if (muteReading == HIGH) {
-      muteTriggered = false;
+      if (muteTriggered) {
+        // 检查是否长按 >= 3秒
+        if (!muteLongPressSent && (now - muteLongPressStart >= 3000)) {
+          Serial1.println("N_S3_ROOT");
+          flashConfirm();
+          Serial.println("已发送 N_S3_ROOT 给 S3");
+        }
+        muteTriggered = false;
+        muteLongPressSent = false;
+      }
     }
   }
 
@@ -364,7 +393,9 @@ void handleButtons() {
     static bool cpgTriggered = false;
     if (cpgReading == LOW && !cpgTriggered) {
       cpgTriggered = true;
-      
+      cpgLongPressStart = now;
+      cpgLongPressSent = false;
+
       // 【物理唤醒】
       if (g_forceOff) {
         g_forceOff = false;
@@ -372,22 +403,31 @@ void handleButtons() {
         g_forceRedraw = true;
         Serial.println("强关解除：唤醒灯光系统");
       }
-      
+
       exitSystemState();
       if (currentMode != MODE_CPG) {
         currentMode = MODE_CPG;
         Serial.println("模式切换: CPG模式");
       } else {
         currentEffect = (currentEffect + 1) % MAX_EFFECTS;
-        if (currentEffect == 0) currentEffect = 1; 
+        if (currentEffect == 0) currentEffect = 1;
         Serial.printf("CPG模式内切换灯效: %d\n", currentEffect);
       }
-      
+
       updateIndicators();
       effectFrame = 0;
-      g_forceRedraw = true; 
+      g_forceRedraw = true;
     } else if (cpgReading == HIGH) {
-      cpgTriggered = false;
+      if (cpgTriggered) {
+        // 检查是否长按 >= 3秒
+        if (!cpgLongPressSent && (now - cpgLongPressStart >= 3000)) {
+          Serial1.println("N_S3_REBOT");
+          flashConfirm();
+          Serial.println("已发送 N_S3_REBOT 给 S3");
+        }
+        cpgTriggered = false;
+        cpgLongPressSent = false;
+      }
     }
   }
 
