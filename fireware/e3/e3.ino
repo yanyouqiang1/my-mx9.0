@@ -235,7 +235,7 @@ void initBluetooth() {
         return;
     }
 
-    err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    err = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
     if (err) {
         Serial.printf("BT 控制器使能失败: %s\n", esp_err_to_name(err));
         return;
@@ -340,4 +340,12 @@ void processCommand(String cmd) {
 void sendAudioToI2S() {
     // TODO: 将接收到的蓝牙音频数据发送到 I2S
     // 从蓝牙缓冲区读取，写入 I2S TX
+}
+
+void setup() {
+    setupE3();
+}
+
+void loop() {
+    loopE3();
 }
