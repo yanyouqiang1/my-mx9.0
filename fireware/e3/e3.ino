@@ -40,6 +40,10 @@ static uint32_t btWriteIdx = 0;
 // UART 命令缓冲
 String uartBuffer = "";
 
+// LED 状态变量
+unsigned long lastLedUpdate = 0;
+int ledState = 0;  // 0=空闲, 1=配对中, 2=已连接, 3=播放中, 4=通话中
+
 // 蓝牙回调函数声明
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
 static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param);
@@ -269,10 +273,27 @@ void initBluetooth() {
 }
 
 void handleBluetoothState() {
-    // TODO: 处理蓝牙连接状态变化
-    // - 更新 btConnected 状态
-    // - 控制 LED_STATUS_PIN 指示灯
-    // - 处理播放/暂停状态
+    unsigned long now = millis();
+
+    if (!btConnected) {
+        // 配对中 - 快速闪烁 (200ms间隔)
+        if (now - lastLedUpdate > 200) {
+            lastLedUpdate = now;
+            ledState = 1;
+            digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
+        }
+    } else if (!isPlaying) {
+        // 已连接但未播放 - 慢速闪烁 (1000ms间隔)
+        if (now - lastLedUpdate > 1000) {
+            lastLedUpdate = now;
+            ledState = 2;
+            digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
+        }
+    } else {
+        // 播放中 - 常亮
+        ledState = 3;
+        digitalWrite(LED_STATUS_PIN, HIGH);
+    }
 }
 
 void handleUartCommands() {
