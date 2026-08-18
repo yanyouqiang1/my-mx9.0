@@ -1,0 +1,12 @@
+# Binary files - don't commit
+*.bin
+
+# PlatformIO build files
+.pio/
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+
+# ESP32 build
+*.elf
+*.map
