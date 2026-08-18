@@ -1,9 +1,4 @@
-// s3-bluetooth-audio/s3-bt-audio.ino
-// USB复合设备主程序：键盘 + 蓝牙音频 + USB音频
-// 基于 最终版/s3.ino + BTAudioManager (Task1) + USBAudioManager (Task2)
-
 #include "USB.h"
-#include "USBAudio.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h" // 多媒体音量及播放控制
 #include "USBHIDSystemControl.h"   // 引入休眠、唤醒、关机等系统控制库
@@ -14,78 +9,34 @@
 #include <FFat.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
-#include <esp_system.h>
+#include <esp_system.h> 
 
 // 引入 ESP32-S3 特有的寄存器头文件，用于控制软件直接复位至 ROM 刷机模式
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-#include "components/bt_audio/bt_audio.h"
-#include "components/usb_audio/usb_audio.h"
-#include "components/audio_output/audio_output.h"
-#include "esp_log.h"
-
 USBHIDKeyboard Keyboard;
-USBHIDConsumerControl ConsumerControl;
+USBHIDConsumerControl ConsumerControl; 
 USBHIDSystemControl SystemControl; // 系统控制对象实例
 Preferences preferences;
 Adafruit_MCP23X17 mcp;
 
-// 音频管理器实例
-BTAudioManager btAudio;
-USBAudioManager usbAudio;
-AudioOutput audioOutput;
-
-// 音频管线任务：从 USB 接收缓冲区读取（电脑→耳机）并通过 I2S 输出到外部 DAC
-void audioPipelineTask(void* param) {
-    static uint8_t audio_buf[512];
-
-    ESP_LOGI("AUDIO_PIPELINE", "音频管线任务启动");
-    while (true) {
-        // ====== 电脑 → 耳机（USB RX → I2S 输出）======
-        // tud_audio_rx_cb 将电脑发送的 USB 音频写入 usbAudio.getCaptureBuffer()
-        // 我们从该缓冲区读取并通过 I2S 输出到外部 DAC
-        size_t len = usbAudio.getCaptureBuffer()->read(audio_buf, sizeof(audio_buf));
-        if (len > 0) {
-            if (audioOutput.isReady()) {
-                size_t written = audioOutput.write(audio_buf, len);
-                if (written < len) {
-                    // I2S FIFO 满，部分数据丢弃（静音补偿已在 DAC 端自然产生）
-                }
-            }
-        } else {
-            // 缓冲区为空，填充少量静音帧防止 I2S 空闲
-            if (audioOutput.isReady()) {
-                audioOutput.writeSilence(AUDIO_FRAME_BYTES);
-            }
-        }
-
-        // ====== 耳机 → 电脑（A2DP → USB TX）======
-        // a2dp_data_callback 已将 A2DP PCM 数据写入 usbAudio.getPlaybackBuffer()
-        // tud_audio_tx_complete_cb 在 TX 完成时自动消费该缓冲区
-        // 无需在此任务中额外处理
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    vTaskDelete(NULL);
-}
-
 // ================= 引脚与通讯定义 =================
 #define I2C_SDA 14
 #define I2C_SCL 13
-#define MCP23017_ADDR 0x20
+#define MCP23017_ADDR 0x20 
 
 #define RX_PIN 10  // 串口 RX 接 C3 的 20
 #define TX_PIN 9   // 串口 TX 接 C3 的 10
 
-const int rowPins[] = {1, 2, 42, 41, 40, 39, 38, 47, 21, 12};
+const int rowPins[] = {1, 2, 42, 41, 40, 39, 38, 47, 21, 12}; 
 const int numRows = 10;
-const int numCols = 16;
+const int numCols = 16; 
 
 #define DEBOUNCE_DELAY 20
-#define PRESSED_VAL LOW
+#define PRESSED_VAL LOW  
 
-#define MACRO_BASE 0x1000
+#define MACRO_BASE 0x1000 
 #define K_M1  (MACRO_BASE + 1)
 #define K_M2  (MACRO_BASE + 2)
 #define K_M3  (MACRO_BASE + 3)
@@ -110,8 +61,8 @@ const int numCols = 16;
 #define K_PLAY (MACRO_BASE + 20)
 #define K_PREV (MACRO_BASE + 21)
 
-// FN 键定义（固件内部逻辑宏键，不向电脑发送按键值）
-#define K_FN   (MACRO_BASE + 22)
+// 【修复 1】将 FN 定义为固件内部逻辑宏键，不向电脑发送按键值
+#define K_FN   (MACRO_BASE + 22) 
 bool fnPressed = false; // 记录 FN 键当前状态
 
 #ifndef CONSUMER_CONTROL_SCAN_NEXT_TRACK
@@ -134,49 +85,51 @@ void initKeyMatrix() {
     keyMatrix[0][0] = KEY_LEFT_ALT; keyMatrix[0][1] = 0xE9; keyMatrix[0][2] = 0xE8; keyMatrix[0][3] = 0xE7;
     keyMatrix[0][4] = 0xDE; keyMatrix[0][5] = 0xDD; keyMatrix[0][6] = 0xDC; keyMatrix[0][7] = 0xDB;
     keyMatrix[0][8] = KEY_RIGHT_ARROW; keyMatrix[0][9] = KEY_DOWN_ARROW; keyMatrix[0][10] = KEY_LEFT_ARROW;
+    
+    // 【修复 2】根据扫描表：Row 0, Col 13 ({0, 13}) 是物理 FN 键！将 KEY_RIGHT_GUI 改为 K_FN
     keyMatrix[0][11] = KEY_RIGHT_CTRL; keyMatrix[0][12] = 0xED; keyMatrix[0][13] = K_FN;
     keyMatrix[0][14] = KEY_RIGHT_ALT; keyMatrix[0][15] = ' ';
-
+    
     // Row 1
-    keyMatrix[1][0] = 0xDF; keyMatrix[1][1] = K_MB; keyMatrix[1][2] = K_MA;
+    keyMatrix[1][0] = 0xDF; keyMatrix[1][1] = K_MB; keyMatrix[1][2] = K_MA; 
     keyMatrix[1][3] = K_NEXT; // NEXT (>>) 媒体下一首 (FN时为唤醒)
     keyMatrix[1][4] = K_PLAY; // PLAY/PAUSE (>||) 媒体暂停/播放 (FN时为睡眠)
     keyMatrix[1][5] = K_PREV; // PREV (<<) 媒体上一首 (FN时为关机)
     keyMatrix[1][6] = K_LOGO; keyMatrix[1][7] = 0xE0;
     keyMatrix[1][8] = 0xEB; keyMatrix[1][9] = 0xEA; keyMatrix[1][10] = 0xE3; keyMatrix[1][11] = 0xE2;
     keyMatrix[1][12] = 0xE1; keyMatrix[1][13] = 0xE6; keyMatrix[1][14] = 0xE5; keyMatrix[1][15] = 0xE4;
-
+    
     // Row 2
     keyMatrix[2][0] = KEY_LEFT_SHIFT; keyMatrix[2][1] = KEY_LEFT_GUI; keyMatrix[2][2] = KEY_LEFT_CTRL;
     keyMatrix[2][3] = KEY_UP_ARROW; keyMatrix[2][4] = KEY_RIGHT_SHIFT; keyMatrix[2][5] = '/';
     keyMatrix[2][6] = '.'; keyMatrix[2][7] = ','; keyMatrix[2][8] = 'm'; keyMatrix[2][9] = 'n';
     keyMatrix[2][10] = 'b'; keyMatrix[2][11] = 'v'; keyMatrix[2][12] = 'c'; keyMatrix[2][13] = 'x';
     keyMatrix[2][14] = 'z';
-
+    
     // Row 4
     keyMatrix[4][0] = KEY_END; keyMatrix[4][1] = KEY_RETURN; keyMatrix[4][3] = '\''; keyMatrix[4][4] = ';';
     keyMatrix[4][5] = 'l'; keyMatrix[4][6] = 'k'; keyMatrix[4][7] = 'j'; keyMatrix[4][8] = 'h';
     keyMatrix[4][9] = 'g'; keyMatrix[4][10] = 'f'; keyMatrix[4][11] = 'd'; keyMatrix[4][12] = 's';
     keyMatrix[4][13] = 'a'; keyMatrix[4][14] = KEY_CAPS_LOCK; keyMatrix[4][15] = 0xD6;
-
+    
     // Row 5
     keyMatrix[5][0] = KEY_PAGE_UP; keyMatrix[5][1] = KEY_DELETE; keyMatrix[5][2] = '\\'; keyMatrix[5][3] = ']';
     keyMatrix[5][4] = '['; keyMatrix[5][5] = 'p'; keyMatrix[5][6] = 'o'; keyMatrix[5][7] = 'i';
     keyMatrix[5][8] = 'u'; keyMatrix[5][9] = 'y'; keyMatrix[5][10] = 't'; keyMatrix[5][11] = 'r';
     keyMatrix[5][12] = 'e'; keyMatrix[5][13] = 'w'; keyMatrix[5][14] = 'q'; keyMatrix[5][15] = KEY_TAB;
-
+    
     // Row 6
     keyMatrix[6][0] = '`'; keyMatrix[6][1] = KEY_HOME; keyMatrix[6][2] = KEY_INSERT; keyMatrix[6][3] = KEY_BACKSPACE;
     keyMatrix[6][4] = '='; keyMatrix[6][5] = '-'; keyMatrix[6][6] = '0'; keyMatrix[6][7] = '9';
     keyMatrix[6][8] = '8'; keyMatrix[6][9] = '7'; keyMatrix[6][10] = '6'; keyMatrix[6][11] = '5';
     keyMatrix[6][12] = '4'; keyMatrix[6][13] = '3'; keyMatrix[6][14] = '2'; keyMatrix[6][15] = '1';
-
+    
     // Row 7
     keyMatrix[7][0] = KEY_ESC; keyMatrix[7][1] = 0xD0; keyMatrix[7][2] = 0xCF; keyMatrix[7][3] = 0xCE;
     keyMatrix[7][4] = KEY_F12; keyMatrix[7][5] = KEY_F11; keyMatrix[7][6] = KEY_F10; keyMatrix[7][7] = KEY_F9;
     keyMatrix[7][8] = KEY_F8; keyMatrix[7][9] = KEY_F7; keyMatrix[7][10] = KEY_F6; keyMatrix[7][11] = KEY_F5;
     keyMatrix[7][12] = KEY_F4; keyMatrix[7][13] = KEY_F3; keyMatrix[7][14] = KEY_F2; keyMatrix[7][15] = KEY_F1;
-
+    
     // Row 8
     keyMatrix[8][0] = K_MC; keyMatrix[8][2] = K_ME; keyMatrix[8][3] = K_M12; keyMatrix[8][4] = K_M11;
     keyMatrix[8][5] = K_M10; keyMatrix[8][6] = K_M9; keyMatrix[8][7] = K_M8; keyMatrix[8][8] = K_M7;
@@ -187,12 +140,12 @@ void initKeyMatrix() {
 bool lastState[numRows][numCols] = {false};
 unsigned long lastDebounceTime[numRows][numCols] = {0};
 
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914c"
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 BLECharacteristic *pCharacteristic;
 
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+bool deviceConnected = false;     
+bool oldDeviceConnected = false;  
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { deviceConnected = true; }
@@ -203,20 +156,20 @@ class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pChar) {
         String data = pChar->getValue().c_str();
         if(data.length() == 0) return;
-
-        if (data == "ME_START") {
-            File f = FFat.open("/me_hex.txt", FILE_WRITE);
+        
+        if (data == "ME_START") { 
+            File f = FFat.open("/me_hex.txt", FILE_WRITE); 
             if(f) f.close();
             Serial.println("ME 开始写入，已清空/me_hex.txt");
-        }
-        else if (data == "ME_END") {
-            Serial1.println("N_ME");
+        } 
+        else if (data == "ME_END") { 
+            Serial1.println("N_ME"); 
             Serial.println("ME 写入完成并关闭，已通知 C3");
-        }
-        else if (data.startsWith("ME_DATA:")) {
-            File f = FFat.open("/me_hex.txt", FILE_APPEND);
+        } 
+        else if (data.startsWith("ME_DATA:")) { 
+            File f = FFat.open("/me_hex.txt", FILE_APPEND); 
             if(f) {
-                f.print(data.substring(8));
+                f.print(data.substring(8)); 
                 f.close();
             }
         }
@@ -226,27 +179,10 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                 String keyName = data.substring(4, firstColon);
                 String payload = data.substring(firstColon + 1);
                 preferences.putString(keyName.c_str(), payload);
-
-                if (keyName == "MR") {
+                
+                if (keyName == "MR") { 
                     Serial1.println("N_ME");
                 }
-            }
-        }
-        else if (data.startsWith("BTAUDIO:")) {
-            String cmd = data.substring(8);
-            if (cmd == "0") {
-                btAudio.setEnabled(false);
-                Serial1.println("N_BTAUDIO_OFF");
-            } else if (cmd == "1") {
-                btAudio.setEnabled(true);
-                Serial1.println("N_BTAUDIO_ON");
-            } else if (cmd == "SCAN") {
-                btAudio.startScan();
-            } else if (cmd.startsWith("CONNECT:")) {
-                String addr = cmd.substring(8);
-                btAudio.connect(addr);
-            } else if (cmd == "DISCONNECT") {
-                btAudio.disconnect();
             }
         }
     }
@@ -257,22 +193,22 @@ void executeMacro(String keyName) {
         if (FFat.exists("/me_hex.txt")) {
             File f = FFat.open("/me_hex.txt", FILE_READ);
             if (f) {
-                Keyboard.print("[HEXS]");
+                Keyboard.print("[HEXS]"); 
                 delay(20);
-
-                while (f.available()) {
-                    Keyboard.print((char)f.read());
-                    delay(1);
+                
+                while (f.available()) { 
+                    Keyboard.print((char)f.read()); 
+                    delay(1); 
                 }
                 f.close();
-
+                
                 delay(20);
                 Keyboard.print("[HEXE]");
-                return;
+                return; 
             }
         }
     }
-
+    
     String macroData = preferences.getString(keyName.c_str(), "");
     if (macroData.length() == 0) return;
 
@@ -292,7 +228,7 @@ void executeMacro(String keyName) {
                     else matched = false;
 
                     if (matched) {
-                        i = endBracket + 1;
+                        i = endBracket + 1; 
                         continue;
                     }
                 }
@@ -300,7 +236,7 @@ void executeMacro(String keyName) {
             Keyboard.print(seq[i++]);
             delay(5);
         }
-    }
+    } 
     else if (macroData.startsWith("CMB:")) {
         String cmb = macroData.substring(4);
         int commaIdx = 0;
@@ -332,15 +268,15 @@ void recoverI2CBus() {
     Serial.println("检测到 I2C 故障，正在尝试自我恢复并重新初始化 MCP23017...");
     Wire.end();
     delay(10);
-
+    
     Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);
-    Wire.setTimeOut(25);
+    Wire.setClock(400000);  
+    Wire.setTimeOut(25);    
 
     if (mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
-        for (int c = 0; c < numCols; c++) {
-            mcp.pinMode(c, OUTPUT);
-            mcp.digitalWrite(c, HIGH);
+        for (int c = 0; c < numCols; c++) { 
+            mcp.pinMode(c, OUTPUT); 
+            mcp.digitalWrite(c, HIGH); 
         }
         Serial.println("I2C 及 MCP23017 恢复成功！");
     } else {
@@ -352,19 +288,19 @@ void recoverI2CBus() {
 void scanKeyboardMatrix() {
     // 周期检测 I2C 状态，防止芯片锁死
     static unsigned long lastI2CCheck = 0;
-    if (millis() - lastI2CCheck > 500) {
+    if (millis() - lastI2CCheck > 500) { 
         lastI2CCheck = millis();
         Wire.beginTransmission(MCP23017_ADDR);
         if (Wire.endTransmission() != 0) {
-            recoverI2CBus();
-            return;
+            recoverI2CBus(); 
+            return;          
         }
     }
 
     // 键盘扫描逻辑
     for (int c = 0; c < numCols; c++) {
-        mcp.writeGPIOAB(~(1 << c));
-        delayMicroseconds(20);
+        mcp.writeGPIOAB(~(1 << c)); 
+        delayMicroseconds(20); 
 
         for (int r = 0; r < numRows; r++) {
             bool currentState = (digitalRead(rowPins[r]) == PRESSED_VAL);
@@ -372,7 +308,7 @@ void scanKeyboardMatrix() {
                 if (millis() - lastDebounceTime[r][c] > DEBOUNCE_DELAY) {
                     lastState[r][c] = currentState;
                     lastDebounceTime[r][c] = millis();
-
+                    
                     uint16_t keycode = keyMatrix[r][c];
                     if (keycode == 0) continue;
 
@@ -382,7 +318,7 @@ void scanKeyboardMatrix() {
                             Serial1.println("N_KEY_PRESS");
                         }
 
-                        // 拦截 FN 键状态
+                        // 【修复 3】拦截 FN 键状态
                         if (keycode == K_FN) {
                             fnPressed = true;
                             Serial.println("FN 键被按下");
@@ -423,7 +359,7 @@ void scanKeyboardMatrix() {
                         } else {
                             Keyboard.press((uint8_t)keycode);
                         }
-                    }
+                    } 
                     // ================= 按键被松开 =================
                     else {
                         if (keycode == K_FN) {
@@ -437,36 +373,19 @@ void scanKeyboardMatrix() {
                                 ConsumerControl.release();
                             } else if (keycode == K_LOGO) {
                                 unsigned long pressedDuration = millis() - lastDebounceTime[r][c];
-
+                                
                                 if (pressedDuration >= 2000 && pressedDuration < 8000) {
                                     Serial1.println("N_REBOT");
                                     Serial.println("检测到长按 LOGO 2S~8S 释放，发送 N_REBOT 普通重启...");
                                     delay(200);
                                     esp_restart();
-                                }
+                                } 
                                 else if (pressedDuration < 2000) {
                                     cherryLogoEnabled = !cherryLogoEnabled;
                                     preferences.putBool("cherryLogo", cherryLogoEnabled);
                                     Serial.printf("CHERRY_LOGO 状态已切换为: %s\n", cherryLogoEnabled ? "开启 (ON)" : "关闭 (OFF)");
-
-                                    executeMacro("LOGO");
-                                }
-                            } else if (keycode == K_ME) {
-                                // 长按 ME 键 (Row 8, Col 2) 切换蓝牙音频开关
-                                unsigned long pressedDuration = millis() - lastDebounceTime[r][c];
-                                if (pressedDuration >= 2000) {
-                                    static bool btAudioEnabled = false;
-                                    btAudioEnabled = !btAudioEnabled;
-                                    btAudio.setEnabled(btAudioEnabled);
-                                    if (btAudioEnabled) {
-                                        Serial1.println("N_BTAUDIO_ON");
-                                        Serial.println("蓝牙音频已开启");
-                                    } else {
-                                        Serial1.println("N_BTAUDIO_OFF");
-                                        Serial.println("蓝牙音频已关闭");
-                                    }
-                                } else {
-                                    executeMacro("ME");
+                                    
+                                    executeMacro("LOGO"); 
                                 }
                             }
                         }
@@ -475,48 +394,27 @@ void scanKeyboardMatrix() {
             }
         }
     }
-    mcp.writeGPIOAB(0xFFFF);
+    mcp.writeGPIOAB(0xFFFF); 
 }
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); 
 
     // USB 设置
-    USB.VID(0x303A);
-    USB.PID(0x0020);
-    USB.productName("YYQ-MX9.0");
-    USB.manufacturerName("YYQ");
+    USB.VID(0x303A);              
+    USB.PID(0x001F);              
+    USB.productName("YYQ-MX9.0");  
+    USB.manufacturerName("YYQ");  
 
     Keyboard.begin();
-    ConsumerControl.begin();
-    SystemControl.begin();
-
-    // USB Audio 初始化
-    usbAudio.begin();
-
-    // I2S 音频输出初始化（必须在 USB.begin 之后，以便 USB Audio 配置完成）
-    if (audioOutput.begin()) {
-        ESP_LOGI("MAIN", "音频输出初始化成功");
-        // 创建音频管线任务（Core 1，与键盘扫描错开）
-        xTaskCreatePinnedToCore(
-            audioPipelineTask,
-            "audio_pipeline",
-            4096,
-            NULL,
-            3,   // 优先级略高于键盘任务
-            NULL,
-            1    // Core 1
-        );
-    } else {
-        ESP_LOGW("MAIN", "音频输出初始化失败（检查 I2S 引脚接线）");
-    }
-
+    ConsumerControl.begin(); 
+    SystemControl.begin();  
     USB.begin();
-
+    
     Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);
-    Wire.setTimeOut(25);
+    Wire.setClock(400000); 
+    Wire.setTimeOut(25);   
 
     if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
         Serial.println("MCP23017 初始化失败，总线可能存在故障！尝试进行急救...");
@@ -524,7 +422,7 @@ void setup() {
     }
 
     preferences.begin("macros", false);
-
+    
     cherryLogoEnabled = preferences.getBool("cherryLogo", false);
     Serial.printf("读取到 CHERRY_LOGO 初始状态: %s\n", cherryLogoEnabled ? "开启 (ON)" : "关闭 (OFF)");
 
@@ -539,12 +437,9 @@ void setup() {
     for (int c = 0; c < numCols; c++) { mcp.pinMode(c, OUTPUT); mcp.digitalWrite(c, HIGH); }
     for (int r = 0; r < numRows; r++) { pinMode(rowPins[r], INPUT_PULLUP); }
 
-    // 蓝牙音频初始化
-    btAudio.begin();
-
     BLEDevice::init("YYQ-MX9.0");
-    BLEDevice::setMTU(517);
-
+    BLEDevice::setMTU(517); 
+    
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
     BLEService *pService = pServer->createService(SERVICE_UUID);
@@ -552,27 +447,16 @@ void setup() {
     pCharacteristic->setCallbacks(new MyCallbacks());
     pService->start();
     BLEDevice::startAdvertising();
-
-    // 创建蓝牙音频任务
-    xTaskCreatePinnedToCore(
-        [](void* param) { btAudio.task(param); },
-        "bt_audio",
-        4096,
-        NULL,
-        2,
-        NULL,
-        0  // Core 0
-    );
 }
 
 // 调度器所需的时间变量
 unsigned long lastScanTime = 0;
-const unsigned long SCAN_INTERVAL = 3;
+const unsigned long SCAN_INTERVAL = 3; 
 
 void loop() {
     if (!deviceConnected && oldDeviceConnected) {
-        delay(500);
-        BLEDevice::startAdvertising();
+        delay(500); 
+        BLEDevice::startAdvertising(); 
         oldDeviceConnected = deviceConnected;
     }
     if (deviceConnected && !oldDeviceConnected) {
@@ -593,16 +477,16 @@ void loop() {
     }
 
     // ======== 长按 LOGO (Row 1, Col 6) 8 秒重启至烧录模式 ========
-    if (lastState[1][6]) {
+    if (lastState[1][6]) { 
         unsigned long pressedDuration = millis() - lastDebounceTime[1][6];
         if (pressedDuration >= 8000) {
             Serial.println("检测到长按 LOGO 达到 8 秒，强行向 C3 发送 N_ROOT 并写入寄存器复位至硬件 ROM 刷机模式...");
-
+            
             for (int k = 0; k < 15; k++) {
                 Serial1.println("N_ROOT");
-                delay(100);
+                delay(100); 
             }
-
+            
             REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
             esp_restart();
         }
@@ -614,5 +498,5 @@ void loop() {
         scanKeyboardMatrix();
     }
 
-    delay(1);
+    delay(1); 
 }
