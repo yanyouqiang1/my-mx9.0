@@ -32,8 +32,8 @@ void WebServerClass::begin() {
     // GET /status - 返回设备状态 JSON
     _server->on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
         DynamicJsonDocument doc(256);
-        doc["firmware"] = "1.0.0";
-        doc["freeHeap"] = ESP.getFreeHeap();
+        doc["firmwareVersion"] = "1.0.0";
+        doc["freeMemory"] = ESP.getFreeHeap();
         doc["uptime"] = millis() / 1000;
         doc["otaEnabled"] = WebServerClass::isOTAEnabled();
         doc["chipModel"] = "ESP32-S3";
