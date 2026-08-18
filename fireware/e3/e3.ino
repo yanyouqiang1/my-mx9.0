@@ -37,6 +37,9 @@ static int16_t i2sTxBuffer[I2S_BUFFER_SIZE * 2]; // 立体声
 static bool isStreaming = false;
 static uint32_t btWriteIdx = 0;
 
+// UART 命令缓冲
+String uartBuffer = "";
+
 // 蓝牙回调函数声明
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
 static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param);
@@ -273,8 +276,44 @@ void handleBluetoothState() {
 }
 
 void handleUartCommands() {
-    // TODO: 处理来自 S3 的 UART 命令
-    // 解析命令并执行相应操作
+    while (Serial1.available()) {
+        char c = Serial1.read();
+        if (c == '\n') {
+            uartBuffer.trim();
+            processCommand(uartBuffer);
+            uartBuffer = "";
+        } else if (c != '\r') {
+            uartBuffer += c;
+        }
+    }
+}
+
+void processCommand(String cmd) {
+    if (cmd.startsWith("CTRL_")) {
+        String action = cmd.substring(5);
+
+        if (action == "PLAYPAUSE") {
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_PRESSED);
+            delay(50);
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
+        else if (action == "NEXT") {
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_FORWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
+            delay(50);
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_FORWARD, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
+        else if (action == "PREV") {
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_BACKWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
+            delay(50);
+            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_BACKWARD, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
+        else if (action.startsWith("VOLUME:")) {
+            int volume = atoi(action.substring(7).c_str());
+            // 蓝牙音量控制
+            uint8_t volume_u8 = (uint8_t)(volume * 127 / 100);
+            esp_a2d_sink_set_abs_vol(volume_u8);
+        }
+    }
 }
 
 void sendAudioToI2S() {
