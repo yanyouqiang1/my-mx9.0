@@ -1,5 +1,6 @@
 #include "driver/i2s.h"
 #include "USB.h"
+#include "tusb.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h" // 多媒体音量及播放控制
 #include <BLEDevice.h>
@@ -69,6 +70,10 @@ const int numCols = 16;
 #ifndef CONSUMER_CONTROL_PLAY_PAUSE
 #define CONSUMER_CONTROL_PLAY_PAUSE 0x00CD
 #endif
+
+// ================= USB Audio Speaker 状态 =================
+enum AudioState { AUDIO_IDLE, AUDIO_READY, AUDIO_STREAMING };
+AudioState audioState = AUDIO_IDLE;
 
 // ================= I2S RX 配置 (接收 E3 音频) =================
 #define I2S_RX_BCK_PIN   5
@@ -324,6 +329,20 @@ bool readI2SAudio(int16_t* buffer, int samples) {
     return bytesRead > 0;
 }
 
+// ================= USB Audio Speaker 路由函数 =================
+void handleAudioRouting() {
+    static int16_t audioBuffer[256];
+    if (readI2SAudio(audioBuffer, 256)) {
+        // 写入音频到 TinyUSB speaker buffer (立体声交错格式)
+        tud_audio_n_write_frames(0, (const uint8_t*)audioBuffer, 256);
+        audioState = AUDIO_STREAMING;
+    } else {
+        if (audioState == AUDIO_STREAMING) {
+            audioState = AUDIO_READY;
+        }
+    }
+}
+
 // 键盘矩阵扫描函数（状态机架构）
 void scanKeyboardMatrix() {
     // 周期检测 I2C 状态，防止芯片锁死
@@ -517,6 +536,10 @@ void loop() {
         scanKeyboardMatrix();
     }
     // =========================================================
+
+    // ======== USB Audio Speaker 路由 ========
+    handleAudioRouting();
+    // ======================================
 
     delay(1); // 保证 RTOS 多任务有切换调度的空间
 }
