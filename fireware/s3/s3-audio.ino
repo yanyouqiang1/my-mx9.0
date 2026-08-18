@@ -329,6 +329,36 @@ bool readI2SAudio(int16_t* buffer, int samples) {
     return bytesRead > 0;
 }
 
+// ================= E3 UART 命令处理函数 =================
+void handleE3Commands() {
+    while (Serial2.available()) {
+        String cmd = Serial2.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd.startsWith("BT_CONNECTED:")) {
+            audioState = AUDIO_READY;
+            Serial.println("E3: 蓝牙已连接");
+        }
+        else if (cmd == "BT_DISCONNECTED") {
+            audioState = AUDIO_IDLE;
+            Serial.println("E3: 蓝牙已断开");
+        }
+        else if (cmd.startsWith("BT_PLAYBACK:")) {
+            String state = cmd.substring(12);
+            if (state == "playing") {
+                audioState = AUDIO_STREAMING;
+            } else {
+                audioState = AUDIO_READY;
+            }
+        }
+        else if (cmd.startsWith("AUDIO_RATE:")) {
+            int rate = atoi(cmd.substring(11).c_str());
+            // TinyUSB handles sample rate automatically, no action needed
+            Serial.printf("E3: 音频采样率 %d Hz\n", rate);
+        }
+    }
+}
+
 // ================= USB Audio Speaker 路由函数 =================
 void handleAudioRouting() {
     static int16_t audioBuffer[512];  // 512 samples = 1024 bytes
@@ -452,7 +482,8 @@ static USBAudioMicrophone usbMic;
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); 
+    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+    Serial2.begin(115200, SERIAL_8N1, 16, 15);  // RX=16, TX=15 
 
     // USB 设置
     USB.VID(0x303A);              
@@ -564,6 +595,7 @@ void loop() {
     // =========================================================
 
     // ======== USB Audio Speaker 路由 ========
+    handleE3Commands();
     handleAudioRouting();
     // ======================================
 
