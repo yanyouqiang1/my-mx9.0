@@ -118,11 +118,10 @@
         .btn-blue { background-color: #2962ff; box-shadow: 0 4px 12px rgba(41,98,255,0.3); }
         .btn-green { background-color: #00c853; box-shadow: 0 4px 12px rgba(0,200,83,0.3); }
         .btn-yellow { background-color: #ffd600; color: #000; box-shadow: 0 4px 12px rgba(255,214,0,0.3); }
-        
-        .btn-stop { 
-            grid-column: span 2; 
-            background-color: #37474f; 
-            box-shadow: 0 4px 12px rgba(55,71,79,0.3); 
+        .btn-stop {
+            grid-column: span 2;
+            background-color: #37474f;
+            box-shadow: 0 4px 12px rgba(55,71,79,0.3);
         }
 
         .console-panel {
@@ -141,13 +140,133 @@
         .console-line {
             margin-bottom: 4px;
         }
+
+        /* OTA Section */
+        .ota-section {
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .ota-section h3 {
+            margin: 0 0 16px 0;
+            font-size: 16px;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .ota-status {
+            margin-bottom: 12px;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            display: none;
+        }
+
+        .ota-status.info {
+            background: rgba(100, 181, 246, 0.1);
+            border: 1px solid rgba(100, 181, 246, 0.3);
+            color: #64b5f6;
+        }
+
+        .ota-status.success {
+            background: rgba(0, 230, 118, 0.1);
+            border: 1px solid rgba(0, 230, 118, 0.3);
+            color: #00e676;
+        }
+
+        .ota-status.error {
+            background: rgba(255, 23, 68, 0.1);
+            border: 1px solid rgba(255, 23, 68, 0.3);
+            color: #ff1744;
+        }
+
+        .ota-status.active {
+            background: rgba(255, 214, 0, 0.1);
+            border: 1px solid rgba(255, 214, 0, 0.3);
+            color: #ffd600;
+            display: block;
+        }
+
+        .ota-progress {
+            margin-top: 8px;
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .ota-progress-bar {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.2s;
+        }
+
+        .btn-ota {
+            width: 100%;
+            padding: 14px;
+            background-color: #37474f;
+            color: #ffffff;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-top: 12px;
+        }
+
+        .btn-ota:hover {
+            background-color: #455a64;
+        }
+
+        .btn-ota:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-ota.uploading {
+            background-color: #ff6f00;
+        }
+
+        #ota-file {
+            display: none;
+        }
+
+        .file-label {
+            display: block;
+            padding: 16px;
+            border: 2px dashed var(--border-color);
+            border-radius: 8px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .file-label:hover {
+            border-color: var(--primary);
+        }
+
+        .file-label.has-file {
+            border-color: #00e676;
+            border-style: solid;
+        }
+
+        .file-info {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 8px;
+        }
     </style>
 </head>
 <body>
 
 <div class="container">
     <h2>ESP32-C3 蓝牙灯效测试</h2>
-    
+
     <div class="status-panel" id="status-panel">
         <div>
             <span class="status-indicator"></span>
@@ -181,6 +300,41 @@
         </button>
     </div>
 
+    <!-- OTA Firmware Update Section -->
+    <div class="ota-section">
+        <h3>固件更新</h3>
+
+        <div class="ota-status info" id="ota-status">
+            选择 .bin 固件文件，通过蓝牙 OTA 升级 C3
+        </div>
+
+        <div class="ota-status success" id="ota-success">
+            OTA 升级成功！设备将自动重启。
+        </div>
+
+        <div class="ota-status error" id="ota-error">
+            OTA 升级失败: <span id="ota-error-msg"></span>
+        </div>
+
+        <div class="ota-status active" id="ota-progress">
+            正在上传固件...
+            <div class="ota-progress">
+                <div class="ota-progress-bar" id="ota-progress-bar"></div>
+            </div>
+            <span id="ota-progress-text">0%</span>
+        </div>
+
+        <input type="file" id="ota-file" accept=".bin">
+        <label for="ota-file" class="file-label" id="file-label">
+            <div id="file-label-text">点击选择固件文件 (.bin)</div>
+            <div class="file-info" id="file-info"></div>
+        </label>
+
+        <button id="btn-ota" class="btn-ota" onclick="startOTA()" disabled>
+            开始 OTA 升级
+        </button>
+    </div>
+
     <div class="console-panel" id="console">
         <div class="console-line">> 调试控制台已就绪...</div>
     </div>
@@ -191,14 +345,33 @@
     const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 
+    // OTA Service UUID
+    const OTA_SERVICE_UUID = "0000ffff-0000-1000-8000-00805f9b34fb";
+    const OTA_CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb";
+
     let device = null;
     let characteristic = null;
+    let otaCharacteristic = null;
+    let selectedFile = null;
 
     const connectBtn = document.getElementById("btn-connect");
     const statusPanel = document.getElementById("status-panel");
     const statusText = document.getElementById("status-text");
     const deviceInfo = document.getElementById("device-info");
     const consoleBox = document.getElementById("console");
+
+    const otaStatus = document.getElementById("ota-status");
+    const otaSuccess = document.getElementById("ota-success");
+    const otaError = document.getElementById("ota-error");
+    const otaProgress = document.getElementById("ota-progress");
+    const otaProgressBar = document.getElementById("ota-progress-bar");
+    const otaProgressText = document.getElementById("ota-progress-text");
+    const otaErrorMsg = document.getElementById("ota-error-msg");
+    const fileLabel = document.getElementById("file-label");
+    const fileLabelText = document.getElementById("file-label-text");
+    const fileInfo = document.getElementById("file-info");
+    const btnOta = document.getElementById("btn-ota");
+    const otaFileInput = document.getElementById("ota-file");
 
     function log(msg) {
         const time = new Date().toLocaleTimeString();
@@ -207,6 +380,28 @@
         line.innerText = `[${time}] ${msg}`;
         consoleBox.appendChild(line);
         consoleBox.scrollTop = consoleBox.scrollHeight;
+    }
+
+    function hideAllOtaStatus() {
+        otaStatus.style.display = 'none';
+        otaSuccess.style.display = 'none';
+        otaError.style.display = 'none';
+        otaProgress.style.display = 'none';
+    }
+
+    function showOtaStatus(type, msg) {
+        hideAllOtaStatus();
+        if (type === 'info') {
+            otaStatus.style.display = 'block';
+            if (msg) otaStatus.innerHTML = msg;
+        } else if (type === 'success') {
+            otaSuccess.style.display = 'block';
+        } else if (type === 'error') {
+            otaError.style.display = 'block';
+            otaErrorMsg.textContent = msg;
+        } else if (type === 'progress') {
+            otaProgress.style.display = 'block';
+        }
     }
 
     connectBtn.addEventListener("click", async () => {
@@ -218,16 +413,14 @@
 
         log("开始检索键盘蓝牙设备...");
         try {
-            // 扫描特定广播名称或特定服务的 BLE 设备
             device = await navigator.bluetooth.requestDevice({
                 filters: [{ name: "C3_Keyboard_BLE" }],
-                optionalServices: [SERVICE_UUID]
+                optionalServices: [SERVICE_UUID, OTA_SERVICE_UUID]
             });
 
             log(`已选择设备: ${device.name}`);
             deviceInfo.innerText = device.name;
 
-            // 监听断开连接事件
             device.addEventListener('gattserverdisconnected', onDisconnected);
 
             log("正在连接 GATT 服务器...");
@@ -239,13 +432,20 @@
             log("正在获取 RX 写入特征值...");
             characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
 
-            // 连接成功状态更新
+            // 获取 OTA 服务
+            log("正在获取 OTA 服务...");
+            const otaService = await server.getPrimaryService(OTA_SERVICE_UUID);
+            otaCharacteristic = await otaService.getCharacteristic(OTA_CHAR_UUID);
+            log("OTA 特征值获取成功");
+
             statusPanel.classList.add("connected");
             statusText.innerText = "已连接";
             connectBtn.innerText = "断开蓝牙连接";
             connectBtn.style.backgroundColor = "#ff1744";
             connectBtn.style.color = "#ffffff";
             log("连接成功！控制通道已就绪。");
+
+            showOtaStatus('info', '已连接！选择固件文件开始 OTA 升级');
 
         } catch (error) {
             log(`连接过程出错: ${error}`);
@@ -261,10 +461,12 @@
         connectBtn.style.color = "#000";
         deviceInfo.innerText = "无设备";
         characteristic = null;
+        otaCharacteristic = null;
         log("设备已断开连接。");
+        hideAllOtaStatus();
+        showOtaStatus('info', '选择 .bin 固件文件，通过蓝牙 OTA 升级 C3');
     }
 
-    // 发送串口指令的核心函数
     async function sendCommand(cmdChar) {
         if (!characteristic) {
             log("发送失败：未连接到蓝牙特征值，请先建立连接！");
@@ -272,22 +474,103 @@
         }
 
         try {
-            log(`准备写入指令: ${cmdChar}`);
             const encoder = new TextEncoder();
             const dataBytes = encoder.encode(cmdChar);
 
-            // 优先使用新标准支持的 writeValueWithResponse
             if (typeof characteristic.writeValueWithResponse === "function") {
                 await characteristic.writeValueWithResponse(dataBytes);
             } else if (typeof characteristic.writeValue === "function") {
-                // 向后兼容旧版浏览器环境
                 await characteristic.writeValue(dataBytes);
-            } else {
-                throw new Error("当前浏览器版本不支持标准的写入方法！");
             }
             log(`特征值写入成功 => "${cmdChar}"`);
         } catch (error) {
             log(`指令发送异常: ${error}`);
+        }
+    }
+
+    // 文件选择处理
+    otaFileInput.addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            if (!file.name.endsWith('.bin')) {
+                log("错误：只支持 .bin 格式的固件文件");
+                showOtaStatus('error', '只支持 .bin 格式的固件文件');
+                return;
+            }
+
+            selectedFile = file;
+            fileLabelText.textContent = file.name;
+            fileInfo.textContent = `大小: ${(file.size / 1024).toFixed(1)} KB`;
+            fileLabel.classList.add('has-file');
+            btnOta.disabled = false;
+            hideAllOtaStatus();
+            showOtaStatus('info', `已选择: ${file.name} (${(file.size / 1024).toFixed(1)} KB)<br>点击"开始 OTA 升级"按钮进行升级`);
+            log(`已选择固件文件: ${file.name} (${file.size} bytes)`);
+        }
+    });
+
+    // OTA 升级
+    async function startOTA() {
+        if (!otaCharacteristic || !selectedFile) {
+            log("OTA 失败：未连接或未选择固件文件");
+            return;
+        }
+
+        hideAllOtaStatus();
+        showOtaStatus('progress', '正在上传固件...');
+        btnOta.classList.add('uploading');
+        btnOta.disabled = true;
+        log("开始 OTA 升级...");
+
+        try {
+            const fileBuffer = await selectedFile.arrayBuffer();
+            const chunkSize = 512; // 每次写入512字节
+            const totalChunks = Math.ceil(fileBuffer.byteLength / chunkSize);
+
+            log(`固件大小: ${fileBuffer.byteLength} 字节，分 ${totalChunks} 包传输`);
+
+            // 发送 OTA 开始命令
+            const startCmd = new Uint8Array([0xF0]);
+            await otaCharacteristic.writeValue(startCmd);
+            log("已发送 OTA 开始命令");
+            await new Promise(r => setTimeout(r, 100));
+
+            // 分包发送固件
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * chunkSize;
+                const end = Math.min(start + chunkSize, fileBuffer.byteLength);
+                const chunk = new Uint8Array(fileBuffer.slice(start, end));
+
+                await otaCharacteristic.writeValue(chunk);
+
+                const progress = Math.round((i + 1) / totalChunks * 100);
+                otaProgressBar.style.width = progress + '%';
+                otaProgressText.textContent = progress + '%';
+
+                // 每10包输出一次日志
+                if (i % 10 === 0 || i === totalChunks - 1) {
+                    log(`上传进度: ${i + 1}/${totalChunks} (${progress}%)`);
+                }
+
+                // 添加小延迟避免蓝牙阻塞
+                await new Promise(r => setTimeout(r, 10));
+            }
+
+            // 发送 OTA 结束命令
+            const endCmd = new Uint8Array([0xF1]);
+            await otaCharacteristic.writeValue(endCmd);
+            log("已发送 OTA 结束命令");
+
+            hideAllOtaStatus();
+            showOtaStatus('success');
+            log("OTA 升级成功！设备将自动重启。");
+
+        } catch (error) {
+            log(`OTA 升级失败: ${error}`);
+            hideAllOtaStatus();
+            showOtaStatus('error', error.message || String(error));
+            btnOta.classList.remove('uploading');
+            btnOta.disabled = false;
         }
     }
 </script>
