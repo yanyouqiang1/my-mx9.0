@@ -3,6 +3,11 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Update.h>
+
+// ================= 蓝牙OTA服务配置 =================
+#define OTA_SERVICE_UUID "0000FFFF-0000-1000-8000-00805F9B34FB"
+#define OTA_CHAR_UUID    "0000FF01-0000-1000-8000-00805F9B34FB"
 
 // ================= C3 引脚定义 =================
 #define PIN_CPG         1   // CPG按键 (切换到CPG模式/切换灯效)
@@ -122,16 +127,39 @@ class MyBLECallbacks : public BLECharacteristicCallbacks {
     if (rxValue.length() > 0) {
       char cmd = rxValue[0];
       Serial.printf("蓝牙收到指令: %c\n", cmd);
-      
+
       if (cmd == 'R' || cmd == 'B' || cmd == 'G' || cmd == 'Y') {
         bt_alert = cmd;
         g_forceRedraw = true; // 强制灯效引擎即时重绘，接管控制
         Serial.printf("触发蓝牙提示闪烁: %c\n", cmd);
-      } 
+      }
       else if (cmd == 'S') {
         bt_alert = '\0';      // 蓝牙提示失效
         g_forceRedraw = true; // 重新触发背景或键盘动画绘制
         Serial.println("蓝牙提示关闭，恢复常规键盘与CPG控制");
+      }
+    }
+  }
+};
+
+// ================= 蓝牙OTA回调类 =================
+class OtaCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    std::string rxData = pCharacteristic->getValue();
+    if (rxData.length() > 0) {
+      if (rxData[0] == 0xF0) {  // OTA开始命令
+        if (Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.setAuthCode(0xF0);
+          Serial.println("OTA开始接收固件...");
+        }
+      } else if (rxData[0] == 0xF1) {  // OTA结束命令
+        if (Update.end(true)) {
+          Serial.println("OTA完成，正在重启...");
+          delay(100);
+          ESP.restart();
+        }
+      } else {
+        Update.write((uint8_t*)rxData.data(), rxData.size());
       }
     }
   }
@@ -180,6 +208,22 @@ void setup() {
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
   Serial.println("蓝牙模块启动完毕，等待主控端连接...");
+
+  // 初始化蓝牙OTA服务
+  initOTA();
+}
+
+// ================= 蓝牙OTA初始化 =================
+void initOTA() {
+  BLEService *pOtaService = pServer->createService(OTA_SERVICE_UUID);
+  BLECharacteristic *pOtaChar = pOtaService->createCharacteristic(
+      OTA_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pOtaChar->setCallbacks(new OtaCharacteristicCallbacks());
+  pOtaService->start();
+  pAdvertising->addServiceUUID(OTA_SERVICE_UUID);
+  Serial.println("BLE OTA服务已启动");
 }
 
 void loop() {
