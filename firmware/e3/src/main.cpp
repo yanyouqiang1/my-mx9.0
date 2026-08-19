@@ -1,6 +1,6 @@
-// firmware/e3/e3.ino - E3 蓝牙音频网关固件
-// 功能: 蓝牙A2DP音频网关 + OLED屏幕 + 温湿度传感器 + 麦克风切换
-
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
@@ -15,38 +15,35 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_SHT31.h>
 
+#include "wifi_manager.h"
+#include "web_server.h"
+
+WiFiManagerClass WiFiManager;
+WebServerClass WebServer;
+
 // ================= 引脚定义 =================
-// I2S 音频接口 (连接到S3)
-#define I2S_WS_PIN    2   // 字选择
-#define I2S_BCK_PIN   3   // 位时钟
-#define I2S_DOUT_PIN  1   // 播放数据输出 (到S3 DIN)
-#define I2S_DIN_PIN   4   // 录音数据输入 (从INMP441或S3)
+#define I2S_WS_PIN    2
+#define I2S_BCK_PIN   3
+#define I2S_DOUT_PIN  1
+#define I2S_DIN_PIN   4
 
-// UART 控制接口 (连接到S3)
-#define UART_TX_PIN   5   // → S3 GPIO6
-#define UART_RX_PIN   6   // ← S3 GPIO5
+#define UART_TX_PIN   5
+#define UART_RX_PIN   6
 
-// I2C 接口 (OLED + SHT31共用)
 #define I2C_SDA_PIN   7
 #define I2C_SCL_PIN   8
 
-#define LED_STATUS_PIN 10  // 蓝牙状态指示灯
+#define LED_STATUS_PIN 10
 
-// ================= 音频参数 =================
 #define I2S_SAMPLE_RATE   48000
-#define I2S_BUFFER_SIZE   512
 
 // ================= 全局状态 =================
 static bool btConnected = false;
 static bool isPlaying = false;
-static bool audioSourceLocal = false;  // false=蓝牙MIC, true=INMP441
+static bool audioSourceLocal = false;
 static String deviceName = "YYQ-BT-Audio";
-
-// A2DP 状态
 static bool isStreaming = false;
-static uint32_t btWriteIdx = 0;
 
-// Task handles
 static TaskHandle_t i2s_rx_task_handle = NULL;
 static TaskHandle_t i2s_inmp441_task_handle = NULL;
 
@@ -69,23 +66,18 @@ OledState oledState = {false, false, false, 0, 0, 0};
 // ================= SHT31传感器 =================
 Adafruit_SHT31 sht31 = Adafruit_SHT31();
 unsigned long lastSHT31Read = 0;
-const unsigned long SHT31_READ_INTERVAL = 5000;  // 5秒
+const unsigned long SHT31_READ_INTERVAL = 5000;
 
-// ================= UART命令缓冲 =================
 String uartBuffer = "";
 
-// ================= LED状态 =================
 unsigned long lastLedUpdate = 0;
-int ledState = 0;  // 0=空闲, 1=配对中, 2=已连接, 3=播放中
+int ledState = 0;
 
-// ================= 蓝牙回调函数声明 =================
+// ================= 蓝牙回调函数 =================
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
 static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param);
 static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len);
 
-// ================= 蓝牙回调函数实现 =================
-
-// A2DP 栈事件回调
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param) {
     esp_a2d_cb_event_t a2d_event = (esp_a2d_cb_event_t)event;
     esp_a2d_cb_param_t *a2d_param = (esp_a2d_cb_param_t *)p_param;
@@ -116,25 +108,12 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param) {
             }
             break;
         }
-        case ESP_A2D_AUDIO_CFG_EVT: {
-            Serial.printf("A2DP 音频配置改变: 采样率已更新\n");
-            break;
-        }
-        case ESP_A2D_PROF_STATE_EVT: {
-            if (a2d_param->a2d_prof_state.state == ESP_A2D_INIT_SUCCESS) {
-                Serial.println("A2DP 初始化成功");
-            } else if (a2d_param->a2d_prof_state.state == ESP_A2D_DEINIT_SUCCESS) {
-                Serial.println("A2DP 去初始化成功");
-            }
-            break;
-        }
         default:
             Serial.printf("A2DP 事件: %d\n", a2d_event);
             break;
     }
 }
 
-// AVRCP 控制事件回调
 static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
     esp_avrc_ct_cb_event_t avrc_event = (esp_avrc_ct_cb_event_t)event;
     esp_avrc_ct_cb_param_t *avrc_param = (esp_avrc_ct_cb_param_t *)p_param;
@@ -166,13 +145,7 @@ static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
                     oledState.isPlaying = false;
                     Serial1.println("BT_PLAYBACK:paused");
                     break;
-                default:
-                    break;
             }
-            break;
-        }
-        case ESP_AVRC_CT_AVRC_PLAYER_APP_SETTINGS_EVT: {
-            Serial.println("AVRCP 播放器设置事件");
             break;
         }
         default:
@@ -180,20 +153,15 @@ static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
     }
 }
 
-// A2DP 数据回调 - 写入 I2S
 static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len) {
     if (!btConnected) return 0;
-
     size_t bytesWritten = 0;
     i2s_write(I2S_NUM_0, data, len, &bytesWritten, portMAX_DELAY);
-    btWriteIdx += bytesWritten;
-
     return bytesWritten;
 }
 
-// ================= I2S初始化 (双向) =================
+// ================= I2S初始化 =================
 void initI2S() {
-    // I2S TX配置 (播放到S3)
     i2s_config_t i2s_tx_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = I2S_SAMPLE_RATE,
@@ -219,7 +187,6 @@ void initI2S() {
     i2s_set_pin(I2S_NUM_0, &i2s_tx_pin_config);
     i2s_set_clk(I2S_NUM_0, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 
-    // I2S RX配置 (从S3接收音频)
     i2s_config_t i2s_rx_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = I2S_SAMPLE_RATE,
@@ -245,16 +212,12 @@ void initI2S() {
     i2s_set_pin(I2S_NUM_1, &i2s_rx_pin_config);
     i2s_set_clk(I2S_NUM_1, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 
-    // 启动I2S RX任务
     xTaskCreate(i2s_rx_task, "i2s_rx_task", 4096, NULL, 5, &i2s_rx_task_handle);
-
-    // 启动INMP441麦克风任务
     xTaskCreate(i2s_inmp441_task, "i2s_inmp441_task", 4096, NULL, 5, &i2s_inmp441_task_handle);
 
     Serial.println("I2S初始化完成");
 }
 
-// I2S RX任务 - 从S3接收USB音频并发送到蓝牙耳机
 void i2s_rx_task(void* param) {
     uint8_t i2s_rx_buffer[1024];
     while (1) {
@@ -262,27 +225,23 @@ void i2s_rx_task(void* param) {
         i2s_read(I2S_NUM_1, i2s_rx_buffer, sizeof(i2s_rx_buffer), &bytes_read, portMAX_DELAY);
         if (bytes_read > 0 && btConnected) {
             size_t bytes_written = 0;
-            // 写入I2S0 TX，发送音频到蓝牙耳机
             i2s_write(I2S_NUM_0, i2s_rx_buffer, bytes_read, &bytes_written, portMAX_DELAY);
         }
     }
 }
 
-// INMP441麦克风任务 - 从本地麦克风录音并发送到S3
 void i2s_inmp441_task(void* param) {
     uint8_t inmp441_buffer[1024];
     while (1) {
         if (audioSourceLocal) {
             size_t bytes_read = 0;
-            // 从INMP441读取音频 (通过I2S1)
             i2s_read(I2S_NUM_1, inmp441_buffer, sizeof(inmp441_buffer), &bytes_read, portMAX_DELAY);
             if (bytes_read > 0) {
-                // 发送到S3 (通过I2S0 DOUT)
                 size_t bytes_written = 0;
                 i2s_write(I2S_NUM_0, inmp441_buffer, bytes_read, &bytes_written, portMAX_DELAY);
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(10));  // 节省CPU
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
@@ -323,22 +282,19 @@ void initBluetooth() {
 
     esp_bt_dev_set_device_name(deviceName.c_str());
 
-    // 初始化 A2DP
     esp_a2d_register_callback(bt_av_hdl_stack_evt);
     esp_a2d_sink_register_data_callback(bt_i2s_write_data);
     esp_a2d_sink_init();
 
-    // 初始化 AVRCP
     esp_avrc_ct_register_callback(bt_av_hdl_avrc_evt);
     esp_avrc_ct_init();
 
-    // 设置扫描模式
     esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
 
     Serial.println("蓝牙初始化完成，等待连接...");
 }
 
-// ================= OLED初始化和显示 =================
+// ================= OLED =================
 void initOLED() {
     if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         Serial.println("SSD1306 OLED初始化失败");
@@ -352,34 +308,30 @@ void initOLED() {
 }
 
 void updateOLED() {
-    if (millis() - oledState.lastUpdate < 1000) return;  // 每秒更新一次
+    if (millis() - oledState.lastUpdate < 1000) return;
     oledState.lastUpdate = millis();
 
     display.clearDisplay();
     display.setCursor(0, 0);
 
-    // 蓝牙状态
     display.print("BT: ");
     display.println(oledState.btConnected ? "Connected" : "Disconnected");
 
-    // 播放状态
     display.print("Status: ");
     display.println(oledState.isPlaying ? "Playing" : "Paused");
 
-    // 音频源
     display.print("MIC: ");
     display.println(oledState.audioSourceLocal ? "Local (INMP441)" : "Bluetooth");
 
-    // 温湿度
     display.printf("Temp: %.1f C\n", oledState.temperature);
     display.printf("Humi: %.1f %%", oledState.humidity);
 
     display.display();
 }
 
-// ================= SHT31初始化和读取 =================
+// ================= SHT31 =================
 void initSHT31() {
-    if (!sht31.begin(0x44)) {  // SHT31默认地址0x44
+    if (!sht31.begin(0x44)) {
         Serial.println("SHT31初始化失败");
         return;
     }
@@ -409,32 +361,29 @@ void setAudioSource(bool local) {
     }
 }
 
-// ================= 蓝牙状态处理 =================
+// ================= LED状态 =================
 void handleBluetoothState() {
     unsigned long now = millis();
 
     if (!btConnected) {
-        // 配对中 - 快速闪烁 (200ms间隔)
         if (now - lastLedUpdate > 200) {
             lastLedUpdate = now;
             ledState = 1;
             digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
         }
     } else if (!isPlaying) {
-        // 已连接但未播放 - 慢速闪烁 (1000ms间隔)
         if (now - lastLedUpdate > 1000) {
             lastLedUpdate = now;
             ledState = 2;
             digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
         }
     } else {
-        // 播放中 - 常亮
         ledState = 3;
         digitalWrite(LED_STATUS_PIN, HIGH);
     }
 }
 
-// ================= UART命令处理 =================
+// ================= UART命令 =================
 void handleUartCommands() {
     while (Serial1.available()) {
         char c = Serial1.read();
@@ -481,31 +430,85 @@ void processCommand(String cmd) {
     }
 }
 
-// ================= setup和loop =================
-void setup() {
-    Serial.begin(115200);           // 调试串口
-    Serial1.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);  // 与S3通信
+// ================= WiFi-OTA 智能模式 =================
+const unsigned long WIFI_TIMEOUT_MS = 30000;
+const unsigned long WIFI_RECHECK_MS = 5000;
+bool wifiEnabled = true;
+bool wifiWasConnected = false;
+unsigned long bootTime = 0;
 
-    // 初始化I2C (OLED + SHT31)
+void disableWiFi() {
+    if (!wifiEnabled) return;
+
+    Serial.println("No connection in 30s, disabling WiFi to save power...");
+    WebServer.end();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiEnabled = false;
+    Serial.println("WiFi disabled.");
+}
+
+void checkWiFiConnection() {
+    if (!wifiEnabled) return;
+
+    wifi_sta_list_t stationList;
+    memset(&stationList, 0, sizeof(wifi_sta_list_t));
+    esp_wifi_ap_get_sta_list(&stationList);
+
+    if (stationList.num > 0) {
+        if (!wifiWasConnected) {
+            Serial.printf("Device connected! (%d device(s))\n", stationList.num);
+            wifiWasConnected = true;
+        }
+    } else if (wifiWasConnected) {
+        Serial.println("All devices disconnected.");
+    }
+}
+
+// ================= setup =================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    bootTime = millis();
+
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println("  E3 Firmware v" + String(BUILD_FIRMWARE_VERSION));
+    Serial.println("  ESP32-S3 Bluetooth Audio Gateway + WiFi-OTA");
+    Serial.println("=================================");
+
+    Serial1.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
-    // 初始化状态LED
     pinMode(LED_STATUS_PIN, OUTPUT);
     digitalWrite(LED_STATUS_PIN, LOW);
 
-    // 初始化I2S
     initI2S();
 
-    // 初始化蓝牙
+    // 初始化WiFi AP + Web服务器 (WiFi-OTA)
+    String chipID = WiFiManager.getChipID();
+    String ssid = "E3_" + chipID;
+    Serial.printf("AP SSID: %s\n", ssid.c_str());
+    Serial.printf("AP Password: 12345678\n");
+    Serial.printf("WiFi will auto-disable after 30s if no connection\n");
+
+    WiFiManager.begin(ssid.c_str(), "12345678");
+    WebServer.begin();
+
+    Serial.printf("OTA URL: http://%s\n", WiFiManager.getIP().c_str());
+
     initBluetooth();
 
-    // 初始化OLED
     initOLED();
 
-    // 初始化SHT31
     initSHT31();
 
-    Serial.println("E3 初始化完成");
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println("  System Ready!");
+    Serial.println("=================================");
 }
 
 void loop() {
@@ -513,4 +516,16 @@ void loop() {
     handleUartCommands();
     updateOLED();
     handleSHT31();
+
+    // WiFi-OTA 智能管理
+    if (wifiEnabled) {
+        unsigned long elapsed = millis() - bootTime;
+
+        if (elapsed >= WIFI_TIMEOUT_MS && !wifiWasConnected) {
+            disableWiFi();
+        }
+        else if (elapsed % WIFI_RECHECK_MS < 20) {
+            checkWiFiConnection();
+        }
+    }
 }
