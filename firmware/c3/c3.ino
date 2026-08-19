@@ -274,17 +274,22 @@ void updateIndicators() {
 void handleButtons() {
   unsigned long now = millis();
 
-  // 1. 静音按键 -> 切换音量控制模式
+  // 1. 静音按键 -> 短按切换音量模式 / 长按3-8秒重启S3 / 长按8秒+进入刷机模式
   bool muteReading = digitalRead(PIN_MUTE);
   if (muteReading != lastMuteState) {
     lastMuteTime = now;
     lastMuteState = muteReading;
   }
   if ((now - lastMuteTime) > 50) {
+    static unsigned long mutePressStart = 0;
     static bool muteTriggered = false;
+    static bool muteLongPressHandled = false;
+
     if (muteReading == LOW && !muteTriggered) {
       muteTriggered = true;
-      
+      mutePressStart = now;
+      muteLongPressHandled = false;
+
       // 【物理唤醒】：如果在强关状态，任何按键点击都将其唤醒并切入该模式
       if (g_forceOff) {
         g_forceOff = false;
@@ -292,13 +297,40 @@ void handleButtons() {
         g_forceRedraw = true;
         Serial.println("强关解除：唤醒灯光系统");
       }
-      
+
       exitSystemState();
-      currentMode = MODE_MUTE;
-      updateIndicators();
-      Serial.println("模式切换: 控制音量");
-    } else if (muteReading == HIGH) {
+    }
+
+    // 长按检测：在按下期间持续检测
+    if (muteReading == LOW && muteTriggered && !muteLongPressHandled) {
+      unsigned long pressDuration = now - mutePressStart;
+
+      // 长按 3-8秒: 发送 N_S3_REBOT
+      if (pressDuration >= 3000 && pressDuration < 8000) {
+        Serial1.println("N_S3_REBOT");
+        Serial.println("Mute长按3-8秒: 发送N_S3_REBOT");
+        muteLongPressHandled = true;
+      }
+      // 长按 8秒以上: 发送 N_S3_ROOT
+      else if (pressDuration >= 8000) {
+        Serial1.println("N_S3_ROOT");
+        Serial.println("Mute长按8秒+: 发送N_S3_ROOT");
+        muteLongPressHandled = true;
+      }
+    }
+
+    if (muteReading == HIGH && muteTriggered) {
+      unsigned long pressDuration = now - mutePressStart;
+
+      // 短按 (< 3秒): 切换音量模式
+      if (pressDuration < 3000 && !muteLongPressHandled) {
+        currentMode = MODE_MUTE;
+        updateIndicators();
+        Serial.println("Mute短按: 切换到音量控制模式");
+      }
+
       muteTriggered = false;
+      muteLongPressHandled = false;
     }
   }
 
@@ -354,17 +386,22 @@ void handleButtons() {
     }
   }
 
-  // 3. CPG 按键 -> 强制切回 CPG 模式并控制背景灯效
+  // 3. CPG 按键 -> 短按切换灯效 / 长按3秒+进入刷机模式
   bool cpgReading = digitalRead(PIN_CPG);
   if (cpgReading != lastCpgState) {
     lastCpgTime = now;
     lastCpgState = cpgReading;
   }
   if ((now - lastCpgTime) > 50) {
+    static unsigned long cpgPressStart = 0;
     static bool cpgTriggered = false;
+    static bool cpgLongPressHandled = false;
+
     if (cpgReading == LOW && !cpgTriggered) {
       cpgTriggered = true;
-      
+      cpgPressStart = now;
+      cpgLongPressHandled = false;
+
       // 【物理唤醒】
       if (g_forceOff) {
         g_forceOff = false;
@@ -372,22 +409,42 @@ void handleButtons() {
         g_forceRedraw = true;
         Serial.println("强关解除：唤醒灯光系统");
       }
-      
+
       exitSystemState();
-      if (currentMode != MODE_CPG) {
-        currentMode = MODE_CPG;
-        Serial.println("模式切换: CPG模式");
-      } else {
-        currentEffect = (currentEffect + 1) % MAX_EFFECTS;
-        if (currentEffect == 0) currentEffect = 1; 
-        Serial.printf("CPG模式内切换灯效: %d\n", currentEffect);
+    }
+
+    // 长按检测：在按下期间持续检测
+    if (cpgReading == LOW && cpgTriggered && !cpgLongPressHandled) {
+      unsigned long pressDuration = now - cpgPressStart;
+
+      // 长按 3秒以上: 发送 N_S3_ROOT
+      if (pressDuration >= 3000) {
+        Serial1.println("N_S3_ROOT");
+        Serial.println("CPG长按3秒+: 发送N_S3_ROOT");
+        cpgLongPressHandled = true;
       }
-      
-      updateIndicators();
-      effectFrame = 0;
-      g_forceRedraw = true; 
-    } else if (cpgReading == HIGH) {
+    }
+
+    if (cpgReading == HIGH && cpgTriggered) {
+      unsigned long pressDuration = now - cpgPressStart;
+
+      // 短按 (< 3秒): 切换灯效
+      if (pressDuration < 3000 && !cpgLongPressHandled) {
+        if (currentMode != MODE_CPG) {
+          currentMode = MODE_CPG;
+          Serial.println("模式切换: CPG模式");
+        } else {
+          currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+          if (currentEffect == 0) currentEffect = 1;
+          Serial.printf("CPG模式内切换灯效: %d\n", currentEffect);
+        }
+        updateIndicators();
+        effectFrame = 0;
+        g_forceRedraw = true;
+      }
+
       cpgTriggered = false;
+      cpgLongPressHandled = false;
     }
   }
 
