@@ -9,11 +9,15 @@
 #include <FFat.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
-#include <esp_system.h> 
+#include <esp_system.h>
+#include <driver/i2s.h>
 
 // 引入 ESP32-S3 特有的寄存器头文件，用于控制软件直接复位至 ROM 刷机模式
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+
+// E3 UART (Serial2) 用于控制E3
+#define E3_SERIAL Serial2
 
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl; 
@@ -24,10 +28,20 @@ Adafruit_MCP23X17 mcp;
 // ================= 引脚与通讯定义 =================
 #define I2C_SDA 14
 #define I2C_SCL 13
-#define MCP23017_ADDR 0x20 
+#define MCP23017_ADDR 0x20
 
 #define RX_PIN 10  // 串口 RX 接 C3 的 20
 #define TX_PIN 9   // 串口 TX 接 C3 的 10
+
+// I2S接口 (连接到E3)
+#define I2S_BCK_PIN   11
+#define I2S_WS_PIN    12
+#define I2S_DOUT_PIN  13  // 播放数据输出 -> E3 DIN
+#define I2S_DIN_PIN   15  // 录音数据输入 <- E3 DOUT (使用空闲引脚15)
+
+// UART接口 (控制E3)
+#define E3_UART_TX_PIN 5
+#define E3_UART_RX_PIN 6
 
 const int rowPins[] = {1, 2, 42, 41, 40, 39, 38, 47, 21, 12}; 
 const int numRows = 10;
@@ -399,7 +413,13 @@ void scanKeyboardMatrix() {
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); 
+    Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+
+    // E3 UART (控制E3)
+    E3_SERIAL.begin(115200, SERIAL_8N1, E3_UART_RX_PIN, E3_UART_TX_PIN);
+
+    // 初始化I2S (连接到E3)
+    initI2S_S3();
 
     // USB 设置
     USB.VID(0x303A);              
@@ -476,6 +496,23 @@ void loop() {
         }
     }
 
+    // 处理来自E3的UART响应
+    while (E3_SERIAL.available()) {
+        String cmd = E3_SERIAL.readStringUntil('\n');
+        cmd.trim();
+        if (cmd.startsWith("BT_CONNECTED")) {
+            Serial.println("E3: 蓝牙已连接");
+        } else if (cmd.startsWith("BT_DISCONNECTED")) {
+            Serial.println("E3: 蓝牙已断开");
+        } else if (cmd == "AUDIO_SRC_LOCAL_ACK") {
+            Serial.println("E3: 音频源已切换到本地麦克风");
+        } else if (cmd == "AUDIO_SRC_BT_ACK") {
+            Serial.println("E3: 音频源已切换到蓝牙麦克风");
+        } else if (cmd == "OTA_START_ACK") {
+            Serial.println("E3: 进入OTA模式");
+        }
+    }
+
     // ======== 长按 LOGO (Row 1, Col 6) 8 秒重启至烧录模式 ========
     if (lastState[1][6]) { 
         unsigned long pressedDuration = millis() - lastDebounceTime[1][6];
@@ -498,5 +535,70 @@ void loop() {
         scanKeyboardMatrix();
     }
 
-    delay(1); 
+    delay(1);
+}
+
+// ================= I2S初始化 (连接到E3) =================
+void initI2S_S3() {
+    // I2S TX配置 (播放到E3)
+    i2s_config_t i2s_tx_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = 48000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+    };
+
+    i2s_pin_config_t i2s_tx_pin_config = {
+        .bck_io_num = I2S_BCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_DOUT_PIN,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_tx_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &i2s_tx_pin_config);
+    i2s_set_clk(I2S_NUM_0, 48000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+    // I2S RX配置 (从E3接收录音)
+    i2s_config_t i2s_rx_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 48000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 64,
+        .use_apll = false,
+    };
+
+    i2s_pin_config_t i2s_rx_pin_config = {
+        .bck_io_num = I2S_BCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_DIN_PIN
+    };
+
+    i2s_driver_install(I2S_NUM_1, &i2s_rx_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_1, &i2s_rx_pin_config);
+    i2s_set_clk(I2S_NUM_1, 48000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+    Serial.println("S3 I2S初始化完成 (连接到E3)");
+}
+
+// ================= 发送音频源切换命令到E3 =================
+void sendAudioSourceCommand(bool local) {
+    if (local) {
+        E3_SERIAL.println("AUDIO_SRC_LOCAL");
+        Serial.println("发送命令: 切换到本地麦克风");
+    } else {
+        E3_SERIAL.println("AUDIO_SRC_BT");
+        Serial.println("发送命令: 切换到蓝牙麦克风");
+    }
 }
