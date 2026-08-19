@@ -1,5 +1,5 @@
-// fireware/e3/e3.ino - E3 蓝牙音频接收器固件
-// 功能: 接收蓝牙A2DP/HFP音频，通过I2S输出到S3
+// firmware/e3/e3.ino - E3 蓝牙音频网关固件
+// 功能: 蓝牙A2DP音频网关 + OLED屏幕 + 温湿度传感器 + 麦克风切换
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -10,14 +10,25 @@
 #include "esp_bt_main.h"
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_SHT31.h>
 
 // ================= 引脚定义 =================
-#define I2S_WS_PIN    3
-#define I2S_BCK_PIN   2
-#define I2S_DATA_PIN  1
+// I2S 音频接口 (连接到S3)
+#define I2S_WS_PIN    2   // 字选择
+#define I2S_BCK_PIN   3   // 位时钟
+#define I2S_DOUT_PIN  1   // 播放数据输出 (到S3 DIN)
+#define I2S_DIN_PIN   4   // 录音数据输入 (从INMP441或S3)
 
-#define UART_TX_PIN   5   // → S3 GPIO16
-#define UART_RX_PIN   4   // ← S3 GPIO15
+// UART 控制接口 (连接到S3)
+#define UART_TX_PIN   5   // → S3 GPIO6
+#define UART_RX_PIN   6   // ← S3 GPIO5
+
+// I2C 接口 (OLED + SHT31共用)
+#define I2C_SDA_PIN   7
+#define I2C_SCL_PIN   8
 
 #define LED_STATUS_PIN 10  // 蓝牙状态指示灯
 
@@ -28,23 +39,46 @@
 // ================= 全局状态 =================
 static bool btConnected = false;
 static bool isPlaying = false;
+static bool audioSourceLocal = false;  // false=蓝牙MIC, true=INMP441
 static String deviceName = "YYQ-BT-Audio";
-
-// I2S 发送缓冲区
-static int16_t i2sTxBuffer[I2S_BUFFER_SIZE * 2]; // 立体声
 
 // A2DP 状态
 static bool isStreaming = false;
 static uint32_t btWriteIdx = 0;
 
-// UART 命令缓冲
+// Task handles
+static TaskHandle_t i2s_rx_task_handle = NULL;
+static TaskHandle_t i2s_inmp441_task_handle = NULL;
+
+// ================= OLED显示 =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+struct OledState {
+    bool btConnected;
+    bool isPlaying;
+    bool audioSourceLocal;
+    float temperature;
+    float humidity;
+    unsigned long lastUpdate;
+};
+OledState oledState = {false, false, false, 0, 0, 0};
+
+// ================= SHT31传感器 =================
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+unsigned long lastSHT31Read = 0;
+const unsigned long SHT31_READ_INTERVAL = 5000;  // 5秒
+
+// ================= UART命令缓冲 =================
 String uartBuffer = "";
 
-// LED 状态变量
+// ================= LED状态 =================
 unsigned long lastLedUpdate = 0;
-int ledState = 0;  // 0=空闲, 1=配对中, 2=已连接, 3=播放中, 4=通话中
+int ledState = 0;  // 0=空闲, 1=配对中, 2=已连接, 3=播放中
 
-// 蓝牙回调函数声明
+// ================= 蓝牙回调函数声明 =================
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
 static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param);
 static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len);
@@ -59,6 +93,7 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param) {
     switch (a2d_event) {
         case ESP_A2D_CONNECTION_STATE_EVT: {
             btConnected = a2d_param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED;
+            oledState.btConnected = btConnected;
             if (btConnected) {
                 Serial1.println("BT_CONNECTED:YYQ-BT-Audio");
                 digitalWrite(LED_STATUS_PIN, HIGH);
@@ -107,6 +142,7 @@ static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
     switch (avrc_event) {
         case ESP_AVRC_CT_CONNECTION_STATE_EVT: {
             btConnected = avrc_param->conn_stat.connected;
+            oledState.btConnected = btConnected;
             if (btConnected) {
                 Serial1.println("BT_CONNECTED:YYQ-BT-Audio");
                 digitalWrite(LED_STATUS_PIN, HIGH);
@@ -121,11 +157,13 @@ static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
             switch (avrc_param->play_stat.play_status) {
                 case ESP_AVRC_PLAYBACK_PLAYING:
                     isPlaying = true;
+                    oledState.isPlaying = true;
                     Serial1.println("BT_PLAYBACK:playing");
                     break;
                 case ESP_AVRC_PLAYBACK_PAUSED:
                 case ESP_AVRC_PLAYBACK_STOPPED:
                     isPlaying = false;
+                    oledState.isPlaying = false;
                     Serial1.println("BT_PLAYBACK:paused");
                     break;
                 default:
@@ -146,53 +184,17 @@ static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
 static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len) {
     if (!btConnected) return 0;
 
-    // 将 BT 数据写入 I2S DMA 缓冲区
-    // data 是 SBC 编码数据，ESP32 A2DP Sink 内部已解码为 PCM 数据
     size_t bytesWritten = 0;
-
-    // 写入 I2S TX FIFO
     i2s_write(I2S_NUM_0, data, len, &bytesWritten, portMAX_DELAY);
-
     btWriteIdx += bytesWritten;
 
     return bytesWritten;
 }
 
-void setupE3() {
-    // 初始化串口 (用于控制命令)
-    Serial1.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-
-    // 初始化状态 LED
-    pinMode(LED_STATUS_PIN, OUTPUT);
-    digitalWrite(LED_STATUS_PIN, LOW);
-
-    // 初始化 I2S (Master TX)
-    initI2S();
-
-    // 初始化蓝牙
-    initBluetooth();
-
-    Serial.println("E3 蓝牙音频接收器初始化完成");
-}
-
-void loopE3() {
-    // 处理蓝牙状态
-    handleBluetoothState();
-
-    // 处理 UART 命令
-    handleUartCommands();
-
-    // 发送音频数据到 I2S
-    sendAudioToI2S();
-}
-
-// ================= 存根函数 (后续任务实现) =================
-
+// ================= I2S初始化 (双向) =================
 void initI2S() {
-    // 初始化 I2S Master TX 接口
-    // 配置 WS=3, BCK=2, DATA=1
-    // 设置采样率 48000
-    i2s_config_t i2s_config = {
+    // I2S TX配置 (播放到S3)
+    i2s_config_t i2s_tx_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = I2S_SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -206,28 +208,94 @@ void initI2S() {
         .fixed_mclk = 0
     };
 
-    i2s_pin_config_t pin_config = {
+    i2s_pin_config_t i2s_tx_pin_config = {
         .bck_io_num = I2S_BCK_PIN,
         .ws_io_num = I2S_WS_PIN,
-        .data_out_num = I2S_DATA_PIN,
+        .data_out_num = I2S_DOUT_PIN,
         .data_in_num = I2S_PIN_NO_CHANGE
     };
 
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_driver_install(I2S_NUM_0, &i2s_tx_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &i2s_tx_pin_config);
     i2s_set_clk(I2S_NUM_0, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+    // I2S RX配置 (从S3接收音频)
+    i2s_config_t i2s_rx_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t i2s_rx_pin_config = {
+        .bck_io_num = I2S_BCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_DIN_PIN
+    };
+
+    i2s_driver_install(I2S_NUM_1, &i2s_rx_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_1, &i2s_rx_pin_config);
+    i2s_set_clk(I2S_NUM_1, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+    // 启动I2S RX任务
+    xTaskCreate(i2s_rx_task, "i2s_rx_task", 4096, NULL, 5, &i2s_rx_task_handle);
+
+    // 启动INMP441麦克风任务
+    xTaskCreate(i2s_inmp441_task, "i2s_inmp441_task", 4096, NULL, 5, &i2s_inmp441_task_handle);
+
+    Serial.println("I2S初始化完成");
 }
 
+// I2S RX任务 - 从S3接收USB音频并发送到蓝牙耳机
+void i2s_rx_task(void* param) {
+    uint8_t i2s_rx_buffer[1024];
+    while (1) {
+        size_t bytes_read = 0;
+        i2s_read(I2S_NUM_1, i2s_rx_buffer, sizeof(i2s_rx_buffer), &bytes_read, portMAX_DELAY);
+        if (bytes_read > 0 && btConnected) {
+            size_t bytes_written = 0;
+            // 写入I2S0 TX，发送音频到蓝牙耳机
+            i2s_write(I2S_NUM_0, i2s_rx_buffer, bytes_read, &bytes_written, portMAX_DELAY);
+        }
+    }
+}
+
+// INMP441麦克风任务 - 从本地麦克风录音并发送到S3
+void i2s_inmp441_task(void* param) {
+    uint8_t inmp441_buffer[1024];
+    while (1) {
+        if (audioSourceLocal) {
+            size_t bytes_read = 0;
+            // 从INMP441读取音频 (通过I2S1)
+            i2s_read(I2S_NUM_1, inmp441_buffer, sizeof(inmp441_buffer), &bytes_read, portMAX_DELAY);
+            if (bytes_read > 0) {
+                // 发送到S3 (通过I2S0 DOUT)
+                size_t bytes_written = 0;
+                i2s_write(I2S_NUM_0, inmp441_buffer, bytes_read, &bytes_written, portMAX_DELAY);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));  // 节省CPU
+        }
+    }
+}
+
+// ================= 蓝牙初始化 =================
 void initBluetooth() {
     esp_err_t err;
 
-    // 释放经典 BT 内存（如果不需要）
     err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
     if (err) {
         Serial.printf("BT 内存释放失败: %s\n", esp_err_to_name(err));
     }
 
-    // 初始化 BT 控制器
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     err = esp_bt_controller_init(&bt_cfg);
     if (err) {
@@ -241,7 +309,6 @@ void initBluetooth() {
         return;
     }
 
-    // 初始化 Bluedroid
     err = esp_bluedroid_init();
     if (err) {
         Serial.printf("Bluedroid 初始化失败: %s\n", esp_err_to_name(err));
@@ -254,7 +321,6 @@ void initBluetooth() {
         return;
     }
 
-    // 设置设备名称
     esp_bt_dev_set_device_name(deviceName.c_str());
 
     // 初始化 A2DP
@@ -272,6 +338,78 @@ void initBluetooth() {
     Serial.println("蓝牙初始化完成，等待连接...");
 }
 
+// ================= OLED初始化和显示 =================
+void initOLED() {
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("SSD1306 OLED初始化失败");
+        return;
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.display();
+    Serial.println("OLED初始化成功");
+}
+
+void updateOLED() {
+    if (millis() - oledState.lastUpdate < 1000) return;  // 每秒更新一次
+    oledState.lastUpdate = millis();
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+
+    // 蓝牙状态
+    display.print("BT: ");
+    display.println(oledState.btConnected ? "Connected" : "Disconnected");
+
+    // 播放状态
+    display.print("Status: ");
+    display.println(oledState.isPlaying ? "Playing" : "Paused");
+
+    // 音频源
+    display.print("MIC: ");
+    display.println(oledState.audioSourceLocal ? "Local (INMP441)" : "Bluetooth");
+
+    // 温湿度
+    display.printf("Temp: %.1f C\n", oledState.temperature);
+    display.printf("Humi: %.1f %%", oledState.humidity);
+
+    display.display();
+}
+
+// ================= SHT31初始化和读取 =================
+void initSHT31() {
+    if (!sht31.begin(0x44)) {  // SHT31默认地址0x44
+        Serial.println("SHT31初始化失败");
+        return;
+    }
+    Serial.println("SHT31初始化成功");
+}
+
+void handleSHT31() {
+    if (millis() - lastSHT31Read < SHT31_READ_INTERVAL) return;
+    lastSHT31Read = millis();
+
+    oledState.temperature = sht31.readTemperature();
+    oledState.humidity = sht31.readHumidity();
+
+    Serial.printf("SHT31: Temp=%.1f C, Humi=%.1f %%\n", oledState.temperature, oledState.humidity);
+}
+
+// ================= 音频源切换 =================
+void setAudioSource(bool local) {
+    audioSourceLocal = local;
+    oledState.audioSourceLocal = local;
+    if (local) {
+        Serial1.println("AUDIO_SRC_LOCAL_ACK");
+        Serial.println("音频源切换: INMP441本地麦克风");
+    } else {
+        Serial1.println("AUDIO_SRC_BT_ACK");
+        Serial.println("音频源切换: 蓝牙耳机麦克风");
+    }
+}
+
+// ================= 蓝牙状态处理 =================
 void handleBluetoothState() {
     unsigned long now = millis();
 
@@ -296,6 +434,7 @@ void handleBluetoothState() {
     }
 }
 
+// ================= UART命令处理 =================
 void handleUartCommands() {
     while (Serial1.available()) {
         char c = Serial1.read();
@@ -330,22 +469,48 @@ void processCommand(String cmd) {
         }
         else if (action.startsWith("VOLUME:")) {
             int volume = atoi(action.substring(7).c_str());
-            // 蓝牙音量控制
             uint8_t volume_u8 = (uint8_t)(volume * 127 / 100);
             esp_a2d_sink_set_abs_vol(volume_u8);
         }
     }
+    else if (cmd == "AUDIO_SRC_LOCAL") {
+        setAudioSource(true);
+    }
+    else if (cmd == "AUDIO_SRC_BT") {
+        setAudioSource(false);
+    }
 }
 
-void sendAudioToI2S() {
-    // TODO: 将接收到的蓝牙音频数据发送到 I2S
-    // 从蓝牙缓冲区读取，写入 I2S TX
-}
-
+// ================= setup和loop =================
 void setup() {
-    setupE3();
+    Serial.begin(115200);           // 调试串口
+    Serial1.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);  // 与S3通信
+
+    // 初始化I2C (OLED + SHT31)
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // 初始化状态LED
+    pinMode(LED_STATUS_PIN, OUTPUT);
+    digitalWrite(LED_STATUS_PIN, LOW);
+
+    // 初始化I2S
+    initI2S();
+
+    // 初始化蓝牙
+    initBluetooth();
+
+    // 初始化OLED
+    initOLED();
+
+    // 初始化SHT31
+    initSHT31();
+
+    Serial.println("E3 初始化完成");
 }
 
 void loop() {
-    loopE3();
+    handleBluetoothState();
+    handleUartCommands();
+    updateOLED();
+    handleSHT31();
 }
