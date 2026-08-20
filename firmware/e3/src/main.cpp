@@ -1,531 +1,357 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLEAudio.h>
-#include <driver/i2s.h>
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_a2dp_api.h"
-#include "esp_avrc_api.h"
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_SHT31.h>
-
-#include "wifi_manager.h"
-#include "web_server.h"
-
-WiFiManagerClass WiFiManager;
-WebServerClass WebServer;
+#include <ESPAsyncWebServer.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_bt_device.h>
+#include <esp_gap_bt_api.h>
+#include <esp_a2dp_api.h>
+#include <vector>
 
 // ================= 引脚定义 =================
-#define I2S_WS_PIN    2
-#define I2S_BCK_PIN   3
-#define I2S_DOUT_PIN  1
-#define I2S_DIN_PIN   4
-
-#define UART_TX_PIN   5
-#define UART_RX_PIN   6
-
-#define I2C_SDA_PIN   7
-#define I2C_SCL_PIN   8
-
-#define LED_STATUS_PIN 10
-
-#define I2S_SAMPLE_RATE   48000
+const int LED_STATUS_PIN = 10;
 
 // ================= 全局状态 =================
-static bool btConnected = false;
-static bool isPlaying = false;
-static bool audioSourceLocal = false;
-static String deviceName = "YYQ-BT-Audio";
-static bool isStreaming = false;
+bool btConnected = false;
+bool isStreaming = false;
+String btDeviceName = "";
+String btMacAddress = "";
 
-static TaskHandle_t i2s_rx_task_handle = NULL;
-static TaskHandle_t i2s_inmp441_task_handle = NULL;
-
-// ================= OLED显示 =================
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-struct OledState {
-    bool btConnected;
-    bool isPlaying;
-    bool audioSourceLocal;
-    float temperature;
-    float humidity;
-    unsigned long lastUpdate;
+// ================= 蓝牙扫描结果 =================
+struct BTScanResult {
+    String name;
+    String address;
+    int rssi;
+    bool connected;
 };
-OledState oledState = {false, false, false, 0, 0, 0};
-
-// ================= SHT31传感器 =================
-Adafruit_SHT31 sht31 = Adafruit_SHT31();
-unsigned long lastSHT31Read = 0;
-const unsigned long SHT31_READ_INTERVAL = 5000;
-
-String uartBuffer = "";
-
-unsigned long lastLedUpdate = 0;
-int ledState = 0;
-
-// ================= 蓝牙回调函数 =================
-static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
-static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param);
-static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len);
-
-static void bt_av_hdl_stack_evt(uint16_t event, void *p_param) {
-    esp_a2d_cb_event_t a2d_event = (esp_a2d_cb_event_t)event;
-    esp_a2d_cb_param_t *a2d_param = (esp_a2d_cb_param_t *)p_param;
-
-    switch (a2d_event) {
-        case ESP_A2D_CONNECTION_STATE_EVT: {
-            btConnected = a2d_param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED;
-            oledState.btConnected = btConnected;
-            if (btConnected) {
-                Serial1.println("BT_CONNECTED:YYQ-BT-Audio");
-                digitalWrite(LED_STATUS_PIN, HIGH);
-                Serial.println("A2DP 已连接");
-            } else {
-                Serial1.println("BT_DISCONNECTED");
-                digitalWrite(LED_STATUS_PIN, LOW);
-                isStreaming = false;
-                Serial.println("A2DP 已断开");
-            }
-            break;
-        }
-        case ESP_A2D_AUDIO_STATE_EVT: {
-            if (a2d_param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-                isStreaming = true;
-                Serial.println("A2DP 音频开始");
-            } else if (a2d_param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
-                isStreaming = false;
-                Serial.println("A2DP 音频停止");
-            }
-            break;
-        }
-        default:
-            Serial.printf("A2DP 事件: %d\n", a2d_event);
-            break;
-    }
-}
-
-static void bt_av_hdl_avrc_evt(uint16_t event, void *p_param) {
-    esp_avrc_ct_cb_event_t avrc_event = (esp_avrc_ct_cb_event_t)event;
-    esp_avrc_ct_cb_param_t *avrc_param = (esp_avrc_ct_cb_param_t *)p_param;
-
-    switch (avrc_event) {
-        case ESP_AVRC_CT_CONNECTION_STATE_EVT: {
-            btConnected = avrc_param->conn_stat.connected;
-            oledState.btConnected = btConnected;
-            if (btConnected) {
-                Serial1.println("BT_CONNECTED:YYQ-BT-Audio");
-                digitalWrite(LED_STATUS_PIN, HIGH);
-            } else {
-                Serial1.println("BT_DISCONNECTED");
-                digitalWrite(LED_STATUS_PIN, LOW);
-                isStreaming = false;
-            }
-            break;
-        }
-        case ESP_AVRC_CT_PLAY_STATE_RC_EVT: {
-            switch (avrc_param->play_stat.play_status) {
-                case ESP_AVRC_PLAYBACK_PLAYING:
-                    isPlaying = true;
-                    oledState.isPlaying = true;
-                    Serial1.println("BT_PLAYBACK:playing");
-                    break;
-                case ESP_AVRC_PLAYBACK_PAUSED:
-                case ESP_AVRC_PLAYBACK_STOPPED:
-                    isPlaying = false;
-                    oledState.isPlaying = false;
-                    Serial1.println("BT_PLAYBACK:paused");
-                    break;
-            }
-            break;
-        }
-        default:
-            break;
-    }
-}
-
-static int32_t bt_i2s_write_data(const uint8_t *data, int32_t len) {
-    if (!btConnected) return 0;
-    size_t bytesWritten = 0;
-    i2s_write(I2S_NUM_0, data, len, &bytesWritten, portMAX_DELAY);
-    return bytesWritten;
-}
-
-// ================= I2S初始化 =================
-void initI2S() {
-    i2s_config_t i2s_tx_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = I2S_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 64,
-        .use_apll = false,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t i2s_tx_pin_config = {
-        .bck_io_num = I2S_BCK_PIN,
-        .ws_io_num = I2S_WS_PIN,
-        .data_out_num = I2S_DOUT_PIN,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-
-    i2s_driver_install(I2S_NUM_0, &i2s_tx_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &i2s_tx_pin_config);
-    i2s_set_clk(I2S_NUM_0, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
-
-    i2s_config_t i2s_rx_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = I2S_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 64,
-        .use_apll = false,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t i2s_rx_pin_config = {
-        .bck_io_num = I2S_BCK_PIN,
-        .ws_io_num = I2S_WS_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DIN_PIN
-    };
-
-    i2s_driver_install(I2S_NUM_1, &i2s_rx_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_1, &i2s_rx_pin_config);
-    i2s_set_clk(I2S_NUM_1, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
-
-    xTaskCreate(i2s_rx_task, "i2s_rx_task", 4096, NULL, 5, &i2s_rx_task_handle);
-    xTaskCreate(i2s_inmp441_task, "i2s_inmp441_task", 4096, NULL, 5, &i2s_inmp441_task_handle);
-
-    Serial.println("I2S初始化完成");
-}
-
-void i2s_rx_task(void* param) {
-    uint8_t i2s_rx_buffer[1024];
-    while (1) {
-        size_t bytes_read = 0;
-        i2s_read(I2S_NUM_1, i2s_rx_buffer, sizeof(i2s_rx_buffer), &bytes_read, portMAX_DELAY);
-        if (bytes_read > 0 && btConnected) {
-            size_t bytes_written = 0;
-            i2s_write(I2S_NUM_0, i2s_rx_buffer, bytes_read, &bytes_written, portMAX_DELAY);
-        }
-    }
-}
-
-void i2s_inmp441_task(void* param) {
-    uint8_t inmp441_buffer[1024];
-    while (1) {
-        if (audioSourceLocal) {
-            size_t bytes_read = 0;
-            i2s_read(I2S_NUM_1, inmp441_buffer, sizeof(inmp441_buffer), &bytes_read, portMAX_DELAY);
-            if (bytes_read > 0) {
-                size_t bytes_written = 0;
-                i2s_write(I2S_NUM_0, inmp441_buffer, bytes_read, &bytes_written, portMAX_DELAY);
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-}
-
-// ================= 蓝牙初始化 =================
-void initBluetooth() {
-    esp_err_t err;
-
-    err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (err) {
-        Serial.printf("BT 内存释放失败: %s\n", esp_err_to_name(err));
-    }
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    err = esp_bt_controller_init(&bt_cfg);
-    if (err) {
-        Serial.printf("BT 控制器初始化失败: %s\n", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
-    if (err) {
-        Serial.printf("BT 控制器使能失败: %s\n", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_bluedroid_init();
-    if (err) {
-        Serial.printf("Bluedroid 初始化失败: %s\n", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_bluedroid_enable();
-    if (err) {
-        Serial.printf("Bluedroid 使能失败: %s\n", esp_err_to_name(err));
-        return;
-    }
-
-    esp_bt_dev_set_device_name(deviceName.c_str());
-
-    esp_a2d_register_callback(bt_av_hdl_stack_evt);
-    esp_a2d_sink_register_data_callback(bt_i2s_write_data);
-    esp_a2d_sink_init();
-
-    esp_avrc_ct_register_callback(bt_av_hdl_avrc_evt);
-    esp_avrc_ct_init();
-
-    esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
-
-    Serial.println("蓝牙初始化完成，等待连接...");
-}
-
-// ================= OLED =================
-void initOLED() {
-    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        Serial.println("SSD1306 OLED初始化失败");
-        return;
-    }
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.display();
-    Serial.println("OLED初始化成功");
-}
-
-void updateOLED() {
-    if (millis() - oledState.lastUpdate < 1000) return;
-    oledState.lastUpdate = millis();
-
-    display.clearDisplay();
-    display.setCursor(0, 0);
-
-    display.print("BT: ");
-    display.println(oledState.btConnected ? "Connected" : "Disconnected");
-
-    display.print("Status: ");
-    display.println(oledState.isPlaying ? "Playing" : "Paused");
-
-    display.print("MIC: ");
-    display.println(oledState.audioSourceLocal ? "Local (INMP441)" : "Bluetooth");
-
-    display.printf("Temp: %.1f C\n", oledState.temperature);
-    display.printf("Humi: %.1f %%", oledState.humidity);
-
-    display.display();
-}
-
-// ================= SHT31 =================
-void initSHT31() {
-    if (!sht31.begin(0x44)) {
-        Serial.println("SHT31初始化失败");
-        return;
-    }
-    Serial.println("SHT31初始化成功");
-}
-
-void handleSHT31() {
-    if (millis() - lastSHT31Read < SHT31_READ_INTERVAL) return;
-    lastSHT31Read = millis();
-
-    oledState.temperature = sht31.readTemperature();
-    oledState.humidity = sht31.readHumidity();
-
-    Serial.printf("SHT31: Temp=%.1f C, Humi=%.1f %%\n", oledState.temperature, oledState.humidity);
-}
-
-// ================= 音频源切换 =================
-void setAudioSource(bool local) {
-    audioSourceLocal = local;
-    oledState.audioSourceLocal = local;
-    if (local) {
-        Serial1.println("AUDIO_SRC_LOCAL_ACK");
-        Serial.println("音频源切换: INMP441本地麦克风");
-    } else {
-        Serial1.println("AUDIO_SRC_BT_ACK");
-        Serial.println("音频源切换: 蓝牙耳机麦克风");
-    }
-}
+std::vector<BTScanResult> btDevices;
 
 // ================= LED状态 =================
+unsigned long lastLedUpdate = 0;
+
 void handleBluetoothState() {
     unsigned long now = millis();
-
     if (!btConnected) {
-        if (now - lastLedUpdate > 200) {
+        if (now - lastLedUpdate > 500) {
             lastLedUpdate = now;
-            ledState = 1;
-            digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
-        }
-    } else if (!isPlaying) {
-        if (now - lastLedUpdate > 1000) {
-            lastLedUpdate = now;
-            ledState = 2;
             digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
         }
     } else {
-        ledState = 3;
         digitalWrite(LED_STATUS_PIN, HIGH);
     }
 }
 
-// ================= UART命令 =================
-void handleUartCommands() {
-    while (Serial1.available()) {
-        char c = Serial1.read();
-        if (c == '\n') {
-            uartBuffer.trim();
-            processCommand(uartBuffer);
-            uartBuffer = "";
-        } else if (c != '\r') {
-            uartBuffer += c;
+// ================= 蓝牙回调 =================
+static void bt_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    switch(event) {
+        case ESP_BT_GAP_DISC_RES_EVT: {
+            char bda_str[18];
+            snprintf(bda_str, sizeof(bda_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     param->disc_res.bda[0], param->disc_res.bda[1], param->disc_res.bda[2],
+                     param->disc_res.bda[3], param->disc_res.bda[4], param->disc_res.bda[5]);
+
+            // 检查是否已存在
+            for (auto& r : btDevices) {
+                if (r.address == String(bda_str)) return;
+            }
+
+            BTScanResult result;
+            result.address = String(bda_str);
+            result.name = "";
+            result.rssi = 0;
+            result.connected = false;
+            btDevices.push_back(result);
+
+            Serial.printf("[BT] Found: %s\n", bda_str);
+            break;
         }
+        default:
+            break;
     }
 }
 
-void processCommand(String cmd) {
-    if (cmd.startsWith("CTRL_")) {
-        String action = cmd.substring(5);
-
-        if (action == "PLAYPAUSE") {
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_PRESSED);
-            delay(50);
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_RELEASED);
+static void a2d_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
+    switch(event) {
+        case ESP_A2D_CONNECTION_STATE_EVT: {
+            esp_a2d_connection_state_t state = param->conn_stat.state;
+            if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+                btConnected = true;
+                char bda_str[18];
+                snprintf(bda_str, sizeof(bda_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                         param->conn_stat.remote_bda[0], param->conn_stat.remote_bda[1], param->conn_stat.remote_bda[2],
+                         param->conn_stat.remote_bda[3], param->conn_stat.remote_bda[4], param->conn_stat.remote_bda[5]);
+                btMacAddress = String(bda_str);
+                Serial.println("[BT] Connected: " + btMacAddress);
+            } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+                btConnected = false;
+                isStreaming = false;
+                Serial.println("[BT] Disconnected");
+            }
+            break;
         }
-        else if (action == "NEXT") {
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_FORWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
-            delay(50);
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_FORWARD, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        case ESP_A2D_AUDIO_STATE_EVT: {
+            if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+                isStreaming = true;
+                Serial.println("[BT] Audio Started");
+            } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
+                isStreaming = false;
+                Serial.println("[BT] Audio Stopped");
+            }
+            break;
         }
-        else if (action == "PREV") {
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_BACKWARD, ESP_AVRC_PT_CMD_STATE_PRESSED);
-            delay(50);
-            esp_avrc_ct_send_passthrough_cmd(0, ESP_AVRC_PT_CMD_BACKWARD, ESP_AVRC_PT_CMD_STATE_RELEASED);
-        }
-        else if (action.startsWith("VOLUME:")) {
-            int volume = atoi(action.substring(7).c_str());
-            uint8_t volume_u8 = (uint8_t)(volume * 127 / 100);
-            esp_a2d_sink_set_abs_vol(volume_u8);
-        }
-    }
-    else if (cmd == "AUDIO_SRC_LOCAL") {
-        setAudioSource(true);
-    }
-    else if (cmd == "AUDIO_SRC_BT") {
-        setAudioSource(false);
-    }
-}
-
-// ================= WiFi-OTA 智能模式 =================
-const unsigned long WIFI_TIMEOUT_MS = 30000;
-const unsigned long WIFI_RECHECK_MS = 5000;
-bool wifiEnabled = true;
-bool wifiWasConnected = false;
-unsigned long bootTime = 0;
-
-void disableWiFi() {
-    if (!wifiEnabled) return;
-
-    Serial.println("No connection in 30s, disabling WiFi to save power...");
-    WebServer.end();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    wifiEnabled = false;
-    Serial.println("WiFi disabled.");
-}
-
-void checkWiFiConnection() {
-    if (!wifiEnabled) return;
-
-    wifi_sta_list_t stationList;
-    memset(&stationList, 0, sizeof(wifi_sta_list_t));
-    esp_wifi_ap_get_sta_list(&stationList);
-
-    if (stationList.num > 0) {
-        if (!wifiWasConnected) {
-            Serial.printf("Device connected! (%d device(s))\n", stationList.num);
-            wifiWasConnected = true;
-        }
-    } else if (wifiWasConnected) {
-        Serial.println("All devices disconnected.");
+        default:
+            break;
     }
 }
 
-// ================= setup =================
+// ================= Web服务器 =================
+AsyncWebServer server(80);
+
+void setupWebServer() {
+    // 主页
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String html = "<!DOCTYPE html><html><head>";
+        html += "<meta charset='UTF-8'>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+        html += "<title>E3 Bluetooth Audio Gateway</title>";
+        html += "<style>";
+        html += "body{font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:15px;background:#1a1a2e;color:#eee;}";
+        html += "h1{color:#00d4ff;text-align:center;margin-bottom:20px;}";
+        html += "h2{color:#00d4ff;font-size:16px;margin:15px 0 10px;}";
+        html += ".card{background:#16213e;padding:15px;border-radius:10px;margin:15px 0;}";
+        html += ".status{display:flex;justify-content:space-around;text-align:center;flex-wrap:wrap;}";
+        html += ".status-item{background:#0f3460;padding:15px;border-radius:8px;min-width:100px;margin:5px;}";
+        html += ".value{font-size:20px;font-weight:bold;color:#00d4ff;}";
+        html += ".label{color:#888;font-size:12px;margin-top:5px;}";
+        html += ".btn{background:#00d4ff;color:#1a1a2e;padding:12px 20px;border:none;border-radius:5px;";
+        html += "cursor:pointer;font-size:14px;font-weight:bold;width:100%;margin:8px 0;}";
+        html += ".btn:hover{background:#00a8cc;} .btn:disabled{background:#555;color:#888;cursor:not-allowed;}";
+        html += ".btn-danger{background:#ff6b6b;}.btn-danger:hover{background:#ff4757;}";
+        html += ".btn-success{background:#2ed573;}.btn-success:hover{background:#26de81;}";
+        html += ".log{background:#000;padding:12px;border-radius:5px;height:180px;overflow-y:auto;font-family:monospace;font-size:12px;max-height:250px;}";
+        html += ".log-line{padding:3px 0;border-bottom:1px solid #222;}";
+        html += ".log-time{color:#666;}";
+        html += ".log-bt{color:#00d4ff;}";
+        html += ".log-sys{color:#2ed573;}";
+        html += ".info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}";
+        html += ".info-item{background:#0f3460;padding:10px;border-radius:5px;}";
+        html += ".info-label{color:#888;font-size:12px;}";
+        html += ".info-value{color:#00d4ff;font-weight:bold;}";
+        html += ".device-list{max-height:200px;overflow-y:auto;}";
+        html += ".device-item{display:flex;justify-content:space-between;align-items:center;padding:10px;background:#0f3460;margin:8px 0;border-radius:5px;}";
+        html += ".device-name{font-weight:bold;}";
+        html += ".device-rssi{color:#888;font-size:12px;}";
+        html += ".device-btn{padding:8px 15px;font-size:12px;}";
+        html += ".connected-badge{background:#2ed573;color:#1a1a2e;padding:5px 10px;border-radius:5px;font-size:12px;}";
+        html += "</style></head><body>";
+
+        html += "<h1>E3 Bluetooth Audio Gateway</h1>";
+
+        // 状态
+        html += "<div class='card'>";
+        html += "<h2>Status</h2>";
+        html += "<div class='status'>";
+        html += "<div class='status-item'><div class='value' id='btStatus'>Disconnected</div><div class='label'>Bluetooth</div></div>";
+        html += "<div class='status-item'><div class='value'>AP</div><div class='label'>Mode</div></div>";
+        html += "<div class='status-item'><div class='value'>v1.0.0</div><div class='label'>Firmware</div></div>";
+        html += "</div></div>";
+
+        // 操作
+        html += "<div class='card'>";
+        html += "<h2>Actions</h2>";
+        html += "<button class='btn' id='scanBtn' onclick='scanBT()'>Scan Bluetooth Devices</button>";
+        html += "<button class='btn btn-danger' onclick='disconnectBT()'>Disconnect</button>";
+        html += "<button class='btn' onclick='clearLog()'>Clear Log</button>";
+        html += "<button class='btn btn-danger' onclick='restartDevice()'>Restart Device</button>";
+        html += "</div>";
+
+        // 设备列表
+        html += "<div class='card'>";
+        html += "<h2>Bluetooth Devices</h2>";
+        html += "<div class='device-list' id='deviceList'><p style='color:#888;'>Click 'Scan' to find devices</p></div>";
+        html += "</div>";
+
+        // 日志
+        html += "<div class='card'>";
+        html += "<h2>System Log</h2>";
+        html += "<div class='log' id='logBox'></div>";
+        html += "</div>";
+
+        // 信息
+        html += "<div class='card'>";
+        html += "<h2>Device Info</h2>";
+        html += "<div class='info-grid'>";
+        html += "<div class='info-item'><div class='info-label'>BT MAC</div><div class='info-value' id='btMac'>-</div></div>";
+        html += "<div class='info-item'><div class='info-label'>BT Name</div><div class='info-value'>E3-BT-Audio</div></div>";
+        html += "<div class='info-item'><div class='info-label'>Flash</div><div class='info-value'>4MB</div></div>";
+        html += "<div class='info-item'><div class='info-label'>RAM</div><div class='info-value'>320KB</div></div>";
+        html += "</div></div>";
+
+        html += "<script>";
+        html += "function addLog(msg, type='sys'){";
+        html += "var box=document.getElementById('logBox');";
+        html += "var cls=type==='bt'?'log-bt':'log-sys';";
+        html += "var time='<span class=\"log-time\">'+new Date().toLocaleTimeString()+'</span> ';";
+        html += "box.innerHTML='<div class=\"log-line\">'+time+'<span class=\"'+cls+'\">'+msg+'</span></div>'+box.innerHTML;";
+        html += "}";
+        html += "function updateStatus(){";
+        html += "fetch('/api/status').then(r=>r.json()).then(d=>{";
+        html += "document.getElementById('btStatus').textContent=d.connected?'Connected':'Disconnected';";
+        html += "document.getElementById('btStatus').style.color=d.connected?'#2ed573':'#ff6b6b';";
+        html += "document.getElementById('btMac').textContent=d.btMac||'-';";
+        html += "});}";
+        html += "function loadDevices(){";
+        html += "fetch('/api/devices').then(r=>r.json()).then(d=>{";
+        html += "var html='';";
+        html += "if(d.devices.length===0){html='<p style=\"color:#888;\">No devices found. Click Scan.</p>';}";
+        html += "d.devices.forEach(dev=>{";
+        html += "var btn=dev.connected?'<span class=\"connected-badge\">Connected</span>':'<button class=\"btn btn-success device-btn\" onclick=\"connectBT(\\''+dev.address+'\\')\">Connect</button>';";
+        html += "html+='<div class=\"device-item\"><div><div class=\"device-name\">'+dev.name+'</div><div class=\"device-rssi\">'+dev.address+' | '+dev.rssi+' dBm</div></div>'+btn+'</div>';";
+        html += "});";
+        html += "document.getElementById('deviceList').innerHTML=html;";
+        html += "});}";
+        html += "function scanBT(){";
+        html += "document.getElementById('scanBtn').disabled=true;";
+        html += "addLog('[BT] Scanning for devices...','bt');";
+        html += "fetch('/api/scan').then(r=>r.text()).then(d=>{";
+        html += "addLog('[BT] Scan complete','bt');";
+        html += "document.getElementById('scanBtn').disabled=false;";
+        html += "loadDevices();";
+        html += "});}";
+        html += "function connectBT(addr){";
+        html += "addLog('[BT] Connecting to '+addr+'...','bt');";
+        html += "fetch('/api/connect?addr='+addr).then(r=>r.text()).then(d=>addLog(d,'bt'));";
+        html += "}";
+        html += "function disconnectBT(){";
+        html += "addLog('[BT] Disconnecting...','bt');";
+        html += "fetch('/api/disconnect').then(r=>r.text()).then(d=>addLog(d,'bt'));";
+        html += "}";
+        html += "function clearLog(){document.getElementById('logBox').innerHTML='';}";
+        html += "function restartDevice(){if(confirm('Restart device?'))fetch('/api/restart');}";
+        html += "addLog('[SYS] Web interface ready','sys');";
+        html += "updateStatus();loadDevices();";
+        html += "setInterval(updateStatus,3000);";
+        html += "setInterval(loadDevices,5000);";
+        html += "</script></body></html>";
+        request->send(200, "text/html; charset=utf-8", html);
+    });
+
+    // API: 状态
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = "{\"connected\":" + String(btConnected ? "true" : "false") + ",\"btMac\":\"" + btMacAddress + "\"}";
+        request->send(200, "application/json", json);
+    });
+
+    // API: 设备列表
+    server.on("/api/devices", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = "{\"devices\":[";
+        for (size_t i = 0; i < btDevices.size(); i++) {
+            if (i > 0) json += ",";
+            json += "{\"name\":\"" + btDevices[i].name + "\",\"address\":\"" + btDevices[i].address + "\",\"rssi\":" + btDevices[i].rssi + ",\"connected\":" + (btDevices[i].connected ? "true" : "false") + "}";
+        }
+        json += "]}";
+        request->send(200, "application/json", json);
+    });
+
+    // API: 扫描
+    server.on("/api/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+        btDevices.clear();
+        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+        request->send(200, "text/plain", "[BT] Scan started");
+    });
+
+    // API: 连接
+    server.on("/api/connect", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("addr")) {
+            String addr = request->getParam("addr")->value();
+            int bda[6];
+            sscanf(addr.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &bda[0], &bda[1], &bda[2], &bda[3], &bda[4], &bda[5]);
+            esp_bd_addr_t bda_addr;
+            for (int i = 0; i < 6; i++) bda_addr[i] = (uint8_t)bda[i];
+            esp_a2d_sink_connect(bda_addr);
+            request->send(200, "text/plain", "[BT] Connecting...");
+        } else {
+            request->send(400, "text/plain", "[ERR] Missing address");
+        }
+    });
+
+    // API: 断开
+    server.on("/api/disconnect", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (btConnected && btMacAddress.length() > 0) {
+            int bda[6];
+            sscanf(btMacAddress.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &bda[0], &bda[1], &bda[2], &bda[3], &bda[4], &bda[5]);
+            esp_bd_addr_t bda_addr;
+            for (int i = 0; i < 6; i++) bda_addr[i] = (uint8_t)bda[i];
+            esp_a2d_sink_disconnect(bda_addr);
+            request->send(200, "text/plain", "[BT] Disconnecting...");
+        } else {
+            request->send(200, "text/plain", "[BT] Not connected");
+        }
+    });
+
+    // API: 重启
+    server.on("/api/restart", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", "Restarting...");
+        delay(100);
+        ESP.restart();
+    });
+
+    server.begin();
+}
+
 void setup() {
     Serial.begin(115200);
-    delay(1000);
-
-    bootTime = millis();
+    delay(500);
 
     Serial.println();
-    Serial.println("=================================");
-    Serial.println("  E3 Firmware v" + String(BUILD_FIRMWARE_VERSION));
-    Serial.println("  ESP32-S3 Bluetooth Audio Gateway + WiFi-OTA");
-    Serial.println("=================================");
-
-    Serial1.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Serial.println("============================================");
+    Serial.println("  E3 Firmware v1.0.0");
+    Serial.println("  ESP32 Bluetooth Audio Gateway + WiFi OTA");
+    Serial.println("============================================");
 
     pinMode(LED_STATUS_PIN, OUTPUT);
     digitalWrite(LED_STATUS_PIN, LOW);
 
-    initI2S();
+    // 初始化蓝牙
+    Serial.println("[BT] Initializing...");
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    esp_bt_dev_set_device_name("E3-BT-Audio");
 
-    // 初始化WiFi AP + Web服务器 (WiFi-OTA)
-    String chipID = WiFiManager.getChipID();
-    String ssid = "E3_" + chipID;
-    Serial.printf("AP SSID: %s\n", ssid.c_str());
-    Serial.printf("AP Password: 12345678\n");
-    Serial.printf("WiFi will auto-disable after 30s if no connection\n");
+    // 注册回调
+    esp_bt_gap_register_callback(bt_gap_callback);
+    esp_a2d_register_callback(a2d_callback);
+    esp_a2d_sink_init();
 
-    WiFiManager.begin(ssid.c_str(), "12345678");
-    WebServer.begin();
+    // 获取本地MAC
+    const uint8_t* local_bda = esp_bt_dev_get_address();
+    char bda_str[18];
+    snprintf(bda_str, sizeof(bda_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             local_bda[0], local_bda[1], local_bda[2],
+             local_bda[3], local_bda[4], local_bda[5]);
+    Serial.printf("[BT] MAC: %s\n", bda_str);
 
-    Serial.printf("OTA URL: http://%s\n", WiFiManager.getIP().c_str());
+    // WiFi AP
+    Serial.println("[WiFi] Starting AP...");
+    String ssid = "E3_Test";
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid.c_str(), "12345678");
+    Serial.printf("[WiFi] SSID: %s | IP: %s\n", ssid.c_str(), WiFi.softAPIP().toString().c_str());
 
-    initBluetooth();
+    // Web服务器
+    Serial.println("[Web] Starting server...");
+    setupWebServer();
 
-    initOLED();
-
-    initSHT31();
-
-    Serial.println();
-    Serial.println("=================================");
-    Serial.println("  System Ready!");
-    Serial.println("=================================");
+    Serial.println("============================================");
+    Serial.println("[OK] System Ready!");
+    Serial.println("============================================");
 }
 
 void loop() {
     handleBluetoothState();
-    handleUartCommands();
-    updateOLED();
-    handleSHT31();
-
-    // WiFi-OTA 智能管理
-    if (wifiEnabled) {
-        unsigned long elapsed = millis() - bootTime;
-
-        if (elapsed >= WIFI_TIMEOUT_MS && !wifiWasConnected) {
-            disableWiFi();
-        }
-        else if (elapsed % WIFI_RECHECK_MS < 20) {
-            checkWiFiConnection();
-        }
-    }
+    delay(10);
 }
