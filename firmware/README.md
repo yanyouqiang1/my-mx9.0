@@ -17,7 +17,19 @@ firmware/
 |------|------|-------|-------|------|
 | C3  | ESP32-C3 | 4MB | 无 | LED 控制器 + 蓝牙 OTA |
 | S3  | ESP32-S3 | 16MB | 8MB | USB 声卡 + I2S 音频 |
-| E3  | ESP32-S3 | 16MB | 8MB | 蓝牙音频网关 |
+| E3  | ESP32-S3 | 4MB | | 蓝牙音频网关 |
+
+
+E3配置信息
+Auto-detected: /dev/cu.usbserial-110
+Uploading .pio/build/esp32dev/firmware.bin
+esptool.py v4.11.0
+Serial port /dev/cu.usbserial-110
+Connecting.....
+Chip is ESP32-D0WD-V3 (revision v3.1)
+Features: WiFi, BT, Dual Core, 240MHz, VRef calibration in efuse, Coding Scheme None
+Crystal is 40MHz
+MAC: 88:f1:55:a2:4d:f4
 
 ## 编译前准备
 
@@ -163,7 +175,7 @@ pio device monitor --baud 115200
 各固件使用自定义分区表以支持 OTA：
 
 - **C3**: 4MB Flash，APP0 + APP1 + SPIFFS
-- **S3/E3**: 16MB Flash，APP0 + APP1 + SPIFFS
+- **S3/E3**: 4MB Flash，APP0 + APP1 + SPIFFS
 
 详细分区信息见各模块 `src/partitions.csv` 文件。
 
