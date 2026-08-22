@@ -3,6 +3,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_system.h> 
 
 // ================= C3 引脚定义 =================
 #define PIN_CPG         1   
@@ -33,7 +34,7 @@ enum ControlMode {
   MODE_CPG,         
   MODE_MUTE,        
   MODE_LIGHT,       
-  MODE_KEY_COLOR    // 按键特效配置模式 (旋钮控制款式与颜色)
+  MODE_KEY_COLOR    
 };
 ControlMode currentMode = MODE_LIGHT; 
 
@@ -63,44 +64,48 @@ int reactionStep = 0;
 unsigned long lastReactionUpdate = 0;
 uint32_t currentReactionColor = 0;
 
-// 【修改点】扩展配置范围 0~23
 // 0~7: 中间散开 (Ripple)
-// 8~15: 左向右发射 (Shoot)
-// 16~23: 堆积木 (Stack)
+// 8~15: 右向左发射 (Shoot)
+// 16~23: 右向左堆积木 (Stack)
 uint8_t keypressStyle = 0; 
-uint8_t reactionType = 0; // 0=散开, 1=发射, 2=堆积木
-int stackCount = 0;       // 记录堆积木的数量
+uint8_t reactionType = 0; 
+int stackCount = 0;       
 
 const uint32_t keypressColors[] = {
-  0x000000,   // 0: 自动模式 (按键循环变色)
-  0xFF0000,   // 1: 红
-  0x00FF00,   // 2: 绿
-  0x0000FF,   // 3: 蓝
-  0x00FFFF,   // 4: 冰蓝
-  0xB400FF,   // 5: 紫
-  0xFFFF00,   // 6: 黄
-  0xFFFFFF    // 7: 白
+  0x000000,   
+  0xFF0000,   
+  0x00FF00,   
+  0x0000FF,   
+  0x00FFFF,   
+  0xB400FF,   
+  0xFFFF00,   
+  0xFFFFFF    
 };
 
 // ================= 物理按键状态变量 =================
 bool lastMuteState = HIGH;
 unsigned long lastMuteTime = 0;
+bool muteTriggered = false;
+unsigned long mutePressStart = 0;
+bool muteLongPressSent = false;
 
 bool lastLightState = HIGH;
 unsigned long lastLightTime = 0;
+bool lightTriggered = false;
+unsigned long lightPressStart = 0;
+bool lightLongPressSent = false;
 
 bool lastCpgState = HIGH;
 unsigned long lastCpgTime = 0;
+bool cpgTriggered = false;
+unsigned long cpgPressStart = 0;
+bool cpgLongPressSent = false;
 
 bool lastKnobState = HIGH;
 unsigned long lastKnobTime = 0;
+bool knobTriggered = false;
 unsigned long knobPressStart = 0;
-bool knobWasPressed = false;
-
-unsigned long cpgLongPressStart = 0;
-unsigned long muteLongPressStart = 0;
-bool cpgLongPressSent = false;
-bool muteLongPressSent = false;
+bool knobLongPressSent = false;
 
 int lastClkState;
 unsigned long lastEffectUpdate = 0;
@@ -204,8 +209,6 @@ void processSerialCommand(String cmd) {
   else if (cmd == "N_KEY_PRESS") {
     if (sysState == SYS_NORMAL) {
       triggerKeyReaction();
-      currentMode = MODE_KEY_COLOR; 
-      updateIndicators();
     }
   }
 }
@@ -258,70 +261,71 @@ void updateIndicators() {
 void handleButtons() {
   unsigned long now = millis();
 
-  // 1. 静音按键 -> 长按3S发送 N_S3_REBOT
+  // ------------------ 1. 静音按键 ------------------
   bool muteReading = digitalRead(PIN_MUTE);
   if (muteReading != lastMuteState) {
     lastMuteTime = now;
     lastMuteState = muteReading;
   }
   if ((now - lastMuteTime) > 50) {
-    static bool muteTriggered = false;
-    if (muteReading == LOW && !muteTriggered) {
-      muteTriggered = true;
-      muteLongPressStart = now;
-      muteLongPressSent = false;
-
-      if (g_forceOff) {
-        g_forceOff = false;
-        currentEffect = 1;
-        g_forceRedraw = true;
-      }
-      exitSystemState();
-      currentMode = MODE_MUTE;
-      updateIndicators();
-    } else if (muteReading == HIGH) {
-      if (muteTriggered) {
-        // 【修改点】长按发送普通的重启指令
-        if (!muteLongPressSent && (now - muteLongPressStart >= 3000)) {
+    if (muteReading == LOW) { 
+      if (!muteTriggered) {
+        muteTriggered = true;
+        mutePressStart = now;
+        muteLongPressSent = false;
+      } else {
+        if (!muteLongPressSent && (now - mutePressStart >= 3000)) {
+          muteLongPressSent = true;
           Serial1.println("N_S3_REBOT");
           flashConfirm();
-          Serial.println("已发送 N_S3_REBOT 给 S3");
+          delay(200);
+          ESP.restart(); 
         }
+      }
+    } else { 
+      if (muteTriggered) {
         muteTriggered = false;
-        muteLongPressSent = false;
+        if (!muteLongPressSent) {
+          if (g_forceOff) { g_forceOff = false; currentEffect = 1; g_forceRedraw = true; }
+          exitSystemState();
+          currentMode = MODE_MUTE; 
+          updateIndicators();
+        }
       }
     }
   }
 
-  // 2. 灯光按键 
+  // ------------------ 2. 灯光按键 ------------------
   bool lightReading = digitalRead(PIN_LIGHT);
   if (lightReading != lastLightState) {
     lastLightTime = now;
     lastLightState = lightReading;
   }
   if ((now - lastLightTime) > 50) {
-    static bool lightTriggered = false;
-    static bool longPressTriggered = false;
-
     if (lightReading == LOW) {
       if (!lightTriggered) {
         lightTriggered = true;
-        longPressTriggered = false;
-      }
-      if (!longPressTriggered && (now - lastLightTime >= 2000)) {
-        longPressTriggered = true;
-        g_forceOff = true;       
-        bt_alert = '\0';         
-        sysState = SYS_NORMAL;   
-        isReactionActive = false;
-        currentEffect = 0;       
-        strip.clear();
-        strip.show();
+        lightPressStart = now;
+        lightLongPressSent = false;
+      } else {
+        if (!lightLongPressSent && (now - lightPressStart >= 2000)) {
+          lightLongPressSent = true;
+          g_forceOff = true;       
+          bt_alert = '\0';         
+          sysState = SYS_NORMAL;   
+          
+          isReactionActive = false; // 清空残留
+          stackCount = 0;           
+
+          currentEffect = 0;       
+          strip.clear();
+          strip.show();
+        }
       }
     } else {
       if (lightTriggered) {
         lightTriggered = false;
-        if (!longPressTriggered) {
+        if (!lightLongPressSent) {
           if (g_forceOff) {
             g_forceOff = false;
             currentEffect = 1;
@@ -336,51 +340,56 @@ void handleButtons() {
     }
   }
 
-  // 3. CPG 按键 -> 长按3S发送 N_S3_ROOT
+  // ------------------ 3. CPG 按键 ------------------
   bool cpgReading = digitalRead(PIN_CPG);
   if (cpgReading != lastCpgState) {
     lastCpgTime = now;
     lastCpgState = cpgReading;
   }
   if ((now - lastCpgTime) > 50) {
-    static bool cpgTriggered = false;
-    if (cpgReading == LOW && !cpgTriggered) {
-      cpgTriggered = true;
-      cpgLongPressStart = now;
-      cpgLongPressSent = false;
-
-      if (g_forceOff) {
-        g_forceOff = false;
-        currentEffect = 1;
-        g_forceRedraw = true;
-      }
-
-      exitSystemState();
-      if (currentMode != MODE_CPG) {
-        currentMode = MODE_CPG;
+    if (cpgReading == LOW) {
+      if (!cpgTriggered) {
+        cpgTriggered = true;
+        cpgPressStart = now;
+        cpgLongPressSent = false;
       } else {
-        currentEffect = (currentEffect + 1) % MAX_EFFECTS;
-        if (currentEffect == 0) currentEffect = 1;
-      }
-
-      updateIndicators();
-      effectFrame = 0;
-      g_forceRedraw = true;
-    } else if (cpgReading == HIGH) {
-      if (cpgTriggered) {
-        // 【修改点】长按发送Root刷机指令
-        if (!cpgLongPressSent && (now - cpgLongPressStart >= 3000)) {
+        if (!cpgLongPressSent && (now - cpgPressStart >= 3000)) {
+          cpgLongPressSent = true;
           Serial1.println("N_S3_ROOT");
           flashConfirm();
-          Serial.println("已发送 N_S3_ROOT 给 S3");
         }
+      }
+    } else {
+      if (cpgTriggered) {
         cpgTriggered = false;
-        cpgLongPressSent = false;
+        if (!cpgLongPressSent) {
+          if (g_forceOff) {
+            g_forceOff = false;
+            currentEffect = 1;
+            g_forceRedraw = true;
+          }
+          exitSystemState();
+          
+          // 【核心修复】：只要按了CPG键，瞬间清空打字特效层，让下层的CPG背景显露出来
+          isReactionActive = false;
+          stackCount = 0;
+          
+          if (currentMode != MODE_CPG) {
+            currentMode = MODE_CPG;
+            if (currentEffect == 0) currentEffect = 1;
+          } else {
+            currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+            if (currentEffect == 0) currentEffect = 1;
+          }
+          updateIndicators();
+          effectFrame = 0;
+          g_forceRedraw = true;
+        }
       }
     }
   }
 
-  // 4. 旋钮按键 
+  // ------------------ 4. 旋钮按键 ------------------
   bool knobReading = digitalRead(PIN_KNOB_BTN);
   if (knobReading != lastKnobState) {
     lastKnobTime = now;
@@ -388,118 +397,124 @@ void handleButtons() {
   }
   if ((now - lastKnobTime) > 50) {
     if (knobReading == LOW) {
-      if (!knobWasPressed) {
-        knobWasPressed = true;
+      if (!knobTriggered) {
+        knobTriggered = true;
         knobPressStart = now;
+        knobLongPressSent = false;
+      } else {
+        if (!knobLongPressSent && (now - knobPressStart >= 800)) {
+          knobLongPressSent = true;
+          if (g_forceOff) {
+            g_forceOff = false;
+            currentEffect = 1;
+            g_forceRedraw = true;
+          } else {
+            currentEffect = 0; 
+            stackCount = 0; 
+            isReactionActive = false;
+            g_forceRedraw = true; 
+          }
+        }
       }
     } else {
-      if (knobWasPressed) {
-        unsigned long pressDuration = now - knobPressStart;
-        knobWasPressed = false;
-        
-        if (g_forceOff) {
-          g_forceOff = false;
-          currentEffect = 1;
-          g_forceRedraw = true;
-        }
-        
-        exitSystemState();
-        if (pressDuration < 800) {
-          currentMode = MODE_KEY_COLOR;
+      if (knobTriggered) {
+        knobTriggered = false;
+        if (!knobLongPressSent) {
+          if (g_forceOff) {
+            g_forceOff = false;
+            currentEffect = 1;
+            g_forceRedraw = true;
+          }
+          exitSystemState();
+
+          // 切换到按键特效设置时，清空之前状态
+          stackCount = 0; 
+          isReactionActive = false;
+
+          currentMode = MODE_KEY_COLOR; 
           updateIndicators();
-        } else {
-          currentEffect = 0; 
-          g_forceRedraw = true; 
+          
+          // 【体验优化】切换过来的时候，自动发射一次当前特效给你预览，不用再去按键盘！
+          triggerKeyReaction();
         }
       }
     }
   }
 }
 
-// ================= 4. 旋转编码器处理 (修复反向误触) =================
 void handleEncoder() {
   int currentClk = digitalRead(PIN_ENCODER_A);
   static unsigned long lastEncoderTime = 0;
   
-  // 只有 A相 状态发生跳变时才进入判断
   if (currentClk != lastClkState) {
     unsigned long now = millis();
-    
-    // 【消抖核心】：如果距离上次触发不足 5 毫秒，认为是机械毛刺，直接过滤掉
     if (now - lastEncoderTime > 5) {
       lastEncoderTime = now;
-      
-      // 我们只在 A相 为低电平（下降沿）时执行动作
       if (currentClk == LOW) {
-        
-        // 稍微等待 100 微秒，让 B相 的电平完全稳定下来再读取（不影响主程序运行）
         delayMicroseconds(100);
         int bState = digitalRead(PIN_ENCODER_B);
         
-        // 唤醒强关状态
-        if (g_forceOff) {
-          g_forceOff = false;
-          currentEffect = 1;
-          g_forceRedraw = true;
-          Serial.println("强关解除：唤醒灯光系统");
-        }
+        if (g_forceOff) { g_forceOff = false; currentEffect = 1; g_forceRedraw = true; }
         exitSystemState(); 
-
-        // 判断方向 (原逻辑：B状态与A相同则为右，当前A是LOW，所以B是LOW即为右旋)
         bool isRight = (bState == LOW);
 
-        // ------ 根据当前模式执行功能 ------
         if (currentMode == MODE_LIGHT) {
-          if (isRight) {
-            brightness = (brightness <= 200) ? brightness + 20 : 220; 
-          } else {
-            brightness = (brightness >= 20) ? brightness - 20 : 0;
-          }
+          if (isRight) brightness = (brightness <= 200) ? brightness + 20 : 220; 
+          else brightness = (brightness >= 20) ? brightness - 20 : 0;
           strip.setBrightness(brightness);
           if (currentEffect == 0 && brightness > 0) currentEffect = 1; 
+
+          // 调节亮度时清空遮挡，方便肉眼观察变化
+          stackCount = 0;
+          isReactionActive = false;
+
           g_forceRedraw = true; 
           strip.show();
           
         } else if (currentMode == MODE_MUTE) {
-          if (isRight) {
-            Serial1.println("V+");
-          } else {
-            Serial1.println("V-");
-          }
+          if (isRight) Serial1.println("V+");
+          else Serial1.println("V-");
           
         } else if (currentMode == MODE_CPG) {
-          if (isRight) {
-            currentEffect = (currentEffect + 1) % MAX_EFFECTS;
-          } else {
-            currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
-          }
+          if (isRight) currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+          else currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
+          
+          // 旋钮切背景图时，也瞬间清除顶层的键盘特效，防止背景被挡着看不见
+          stackCount = 0;
+          isReactionActive = false;
+
           effectFrame = 0; 
           g_forceRedraw = true; 
           
         } else if (currentMode == MODE_KEY_COLOR) {
-          if (isRight) {
-            keypressStyle = (keypressStyle + 1) % 24;
-          } else {
-            keypressStyle = (keypressStyle == 0) ? 23 : keypressStyle - 1;
-          }
+          if (isRight) keypressStyle = (keypressStyle + 1) % 24;
+          else keypressStyle = (keypressStyle == 0) ? 23 : keypressStyle - 1;
           updateIndicators(); 
+          
+          // 【体验优化】你旋转挑选按键特效时，每次转动都会自动发射一次给你预览！
+          stackCount = 0;
+          triggerKeyReaction();
         }
       }
     }
-    // 更新上一帧的 A相 状态
     lastClkState = currentClk;
   }
 }
 
-// 【修改点】触发按键灯效引擎
 void triggerKeyReaction() {
+  // 【核心修复】：如果上一个“堆积木”特效还在飞行途中，又按下了新按键，
+  // 我们直接让上一个积木“瞬间落地”结算，保证快速打字时积木不会丢失。
+  if (isReactionActive && reactionType == 2) {
+    stackCount++;
+    if (stackCount >= NUM_LEDS) stackCount = 0; 
+  }
+
   isReactionActive = true;
   reactionStep = 0;
   lastReactionUpdate = millis();
   
-  // 计算当前特效大类与颜色小类
-  reactionType = keypressStyle / 8;     // 0=散开, 1=发射, 2=积木
-  uint8_t colorIdx = keypressStyle % 8; // 0=自动, 1-7=指定颜色
+  reactionType = keypressStyle / 8;     
+  uint8_t colorIdx = keypressStyle % 8; 
 
   if (colorIdx == 0) {
     static uint8_t autoIndex = 0;
@@ -511,15 +526,12 @@ void triggerKeyReaction() {
   }
 }
 
-// 按键动画执行器 (修改发射与堆叠方向为从右到左)
 void updateKeyReaction() {
   unsigned long now = millis();
   if (now - lastReactionUpdate > 25) { 
     lastReactionUpdate = now;
 
-    // 1. 拖影与背景消散处理
     for (int i = 0; i < NUM_LEDS; i++) {
-      // 堆积木模式下，已固定的积木不能被变暗擦除（现在积木堆积在左侧，索引 0 到 stackCount-1）
       if (reactionType == 2 && i < stackCount) {
         strip.setPixelColor(i, currentReactionColor); 
         continue;
@@ -531,9 +543,7 @@ void updateKeyReaction() {
       strip.setPixelColor(i, strip.Color(r * 0.4, g * 0.4, b * 0.4));
     }
 
-    // 2. 动画帧更新
     if (reactionType == 0) {
-      // 模式0：中间向两边散开 (保持不变)
       int left = (NUM_LEDS / 2 - 1) - reactionStep;
       int right = (NUM_LEDS / 2) + reactionStep;
       if (left >= 0) strip.setPixelColor(left, currentReactionColor);
@@ -546,9 +556,7 @@ void updateKeyReaction() {
       }
     } 
     else if (reactionType == 1) {
-      // 模式1：像激光一样从【右边】发射到【左边】
       if (reactionStep < NUM_LEDS) {
-        // 反向索引：总数减1，再减去当前步数
         strip.setPixelColor((NUM_LEDS - 1) - reactionStep, currentReactionColor);
       }
       reactionStep++;
@@ -558,21 +566,15 @@ void updateKeyReaction() {
       }
     } 
     else if (reactionType == 2) {
-      // 模式2：从【右边】发射，到【左边】堆积
       if (reactionStep < NUM_LEDS - stackCount) {
-        // 反向索引
         strip.setPixelColor((NUM_LEDS - 1) - reactionStep, currentReactionColor);
       }
       reactionStep++;
       
-      // 当触碰到左侧边界或已存在的积木时
       if (reactionStep >= NUM_LEDS - stackCount) {
         isReactionActive = false;
         stackCount++;
-        // 满了就清空重置
-        if (stackCount >= NUM_LEDS) {
-          stackCount = 0; 
-        }
+        if (stackCount >= NUM_LEDS) stackCount = 0; 
         g_forceRedraw = true; 
       }
     }
@@ -580,7 +582,6 @@ void updateKeyReaction() {
   }
 }
 
-// 蓝牙与系统通知逻辑保持不变
 void handleBluetoothAlert(unsigned long now) {
   static unsigned long lastFlashUpdate = 0;
   static bool flashOn = false;
@@ -668,23 +669,19 @@ void updateLightingEffect() {
     return;
   }
 
-  // 3. 按键动画层
   if (isReactionActive) {
     updateKeyReaction();
     return;
   }
 
-// 3.5 堆积木持久显示层（修改为堆叠在左侧）
+  // 3.5 堆叠的永久层如果存在，就优先占据控制权
   if (reactionType == 2 && stackCount > 0) {
-    // 右边未堆积的部分置空（从 stackCount 到 末尾）
     for (int i = stackCount; i < NUM_LEDS; i++) strip.setPixelColor(i, 0); 
-    // 左边头部堆积的部分常亮（从 0 到 stackCount-1）
     for (int i = 0; i < stackCount; i++) strip.setPixelColor(i, currentReactionColor); 
     strip.show();
-    return; // 屏蔽后续基础背景
+    return; 
   }
 
-  // 4. 最底层常规背景灯效
   if (currentEffect == 0) {
     if (g_forceRedraw) { strip.clear(); strip.show(); g_forceRedraw = false; }
     return; 
@@ -764,3 +761,4 @@ void updateLightingEffect() {
       break;
   }
 }
+   
