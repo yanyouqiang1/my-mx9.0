@@ -92,7 +92,6 @@ const int numCols = 16;
 bool fnPressed = false;
 bool lastState[numRows][numCols] = { false };
 unsigned long lastDebounceTime[numRows][numCols] = { 0 };
-
 uint16_t baseMatrix[numRows][numCols] = { 0 };
 
 // 按键重映射 Diff
@@ -101,7 +100,6 @@ struct RemapRule {
   uint16_t fromKey;
   uint16_t toKey;
 };
-
 #define TOTAL_PROFILES 4
 RemapRule profileRemaps[TOTAL_PROFILES][MAX_REMAP_RULES];
 int remapCounts[TOTAL_PROFILES] = { 0 };
@@ -127,25 +125,31 @@ enum KeyboardSysMode {
 KeyboardSysMode currentSysMode = SYS_MODE_NORMAL;
 
 enum ScreenDashboardMode {
-  DISP_MODE_GEEK = 0,      // 极客全能仪表盘
-  DISP_MODE_BIG_CLOCK = 1, // 极简大时钟
-  DISP_MODE_KEY_MON = 2,   // 实时击键监控台
-  DISP_MODE_WALLPAPER = 3  // 壁纸画板相册模式
+  DISP_MODE_GEEK = 0,
+  DISP_MODE_BIG_CLOCK = 1,
+  DISP_MODE_KEY_MON = 2,
+  DISP_MODE_WALLPAPER = 3
 };
 uint8_t currentDispMode = DISP_MODE_GEEK;
+bool screenNeedsRedraw = true; // 仅在模式变更/全屏初始化时为 true
 
 uint32_t totalKeyCount = 0;
+uint32_t lastDrawnKeyCount = 0xFFFFFFFF;
 String customMarquee = "YYQ Studio - 极客机械大师";
 int marqueeScrollX = 240;
 unsigned long lastMarqueeUpdate = 0;
 unsigned long lastTimeUpdate = 0;
+char lastDrawnTimeStr[16] = "";
+
 unsigned long lastActivityTime = 0;
-const unsigned long SLEEP_TIMEOUT_MS = 60000; // 60秒无操作进入屏保
+const unsigned long SLEEP_TIMEOUT_MS = 60000;
 
 // 实时按键回显
 bool showKeystrokes = true;
 String lastKeyStrokeName = "";
 unsigned long keyStrokeDisplayTime = 0;
+bool keystrokeNeedsRedraw = false;
+bool keystrokeActiveOnScreen = false;
 
 // MR 免驱录制
 #define MAX_REC_KEYS 64
@@ -178,13 +182,7 @@ const char* effectNames[] = {
 bool g_forceOff = false;
 bool cherryLogoEnabled = false;
 
-// 系统通知报警状态 (红/绿/黄闪烁)
-enum AlertType {
-  ALERT_NONE,
-  ALERT_RED,
-  ALERT_GREEN,
-  ALERT_YELLOW
-};
+enum AlertType { ALERT_NONE, ALERT_RED, ALERT_GREEN, ALERT_YELLOW };
 AlertType activeAlert = ALERT_NONE;
 
 bool isReactionActive = false;
@@ -211,10 +209,11 @@ uint16_t effectFrame = 0;
 // HUD 浮动提示条
 struct HudMessage {
   bool active = false;
+  bool dirty = false;
   unsigned long triggerTime = 0;
   char title[24];
   char value[24];
-  int percent = -1; // 0-100，若为 -1 则不画进度条
+  int percent = -1;
   uint16_t color = ST77XX_CYAN;
 };
 HudMessage hud;
@@ -228,7 +227,8 @@ bool oldDeviceConnected = false;
 void displayStatusCN(const char* title, uint16_t color = ST77XX_GREEN);
 void switchProfile(uint8_t profIdx);
 void drawMenuUI();
-void renderCurrentDisplay();
+void renderCurrentDisplayBase();
+void updateDynamicElements();
 void renderWallpaperView(bool drawOverlayTime = true);
 void triggerHud(const char* title, const char* value, int percent, uint16_t color);
 void handleCommand(String data);
@@ -241,11 +241,9 @@ void setLedRGB(int index, uint8_t r, uint8_t g, uint8_t b) {
     frameBuffer[index][2] = b;
   }
 }
-
 void setMainLedsColor(uint8_t r, uint8_t g, uint8_t b) {
   for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, r, g, b);
 }
-
 void clearMainLeds() { setMainLedsColor(0, 0, 0); }
 
 uint32_t colorHSV(uint16_t hue, uint8_t sat, uint8_t val) {
@@ -271,7 +269,6 @@ static void usbHidKeyboardEvent(void* arg, esp_event_base_t base, int32_t id, vo
   }
 }
 
-// 毫秒级安全延迟（带看门狗重置）
 void safeDelayMs(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
@@ -339,12 +336,11 @@ uint16_t getMappedKey(uint16_t originalKey) {
   return originalKey;
 }
 
-// ================= 指令解析中心 =================
+// ================= 指令控制中心 =================
 void handleCommand(String data) {
   data.trim();
   if (data.length() == 0) return;
 
-  // 1. 系统通知报警灯指令
   if (data.startsWith("ALERT:")) {
     String cmd = data.substring(6);
     if (cmd == "RED") {
@@ -361,33 +357,29 @@ void handleCommand(String data) {
       triggerHud("警报解除", "恢复常态", -1, ST77XX_CYAN);
     }
   }
-  // 2. 屏幕风格切换
   else if (data.startsWith("DISP_MODE:")) {
     currentDispMode = (uint8_t)data.substring(10).toInt();
     if (currentDispMode > 3) currentDispMode = 0;
     preferences.putUChar("disp_mode", currentDispMode);
-    renderCurrentDisplay();
+    screenNeedsRedraw = true;
   }
-  // 3. 实时击键回显开关
   else if (data.startsWith("SET_KEYSTROKE:")) {
     showKeystrokes = (data.substring(14).toInt() == 1);
     preferences.putBool("show_keys", showKeystrokes);
     triggerHud("按键回显", showKeystrokes ? "已开启" : "已关闭", -1, ST77XX_MAGENTA);
   }
-  // 4. 精准时间同步
   else if (data.startsWith("TIME:")) {
     time_t t = data.substring(5).toInt();
     struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
     settimeofday(&tv, NULL);
     triggerHud("时间同步", "校准完成", -1, ST77XX_GREEN);
+    lastDrawnTimeStr[0] = '\0';
   }
-  // 5. 跑马灯标语
   else if (data.startsWith("MARQUEE:")) {
     customMarquee = data.substring(8);
     preferences.putString("marquee", customMarquee);
     triggerHud("标语更新", "保存成功", -1, ST77XX_CYAN);
   }
-  // 6. 按键重映射
   else if (data.startsWith("REMAP:")) {
     int p1 = data.indexOf(':', 6);
     int p2 = data.indexOf(':', p1 + 1);
@@ -412,7 +404,6 @@ void handleCommand(String data) {
       triggerHud("按键映射", "保存成功", -1, ST77XX_GREEN);
     }
   }
-  // 7. MA / MB 全局配置
   else if (data.startsWith("GSET:")) {
     int p1 = data.indexOf(':', 5);
     if (p1 > 0) {
@@ -422,7 +413,6 @@ void handleCommand(String data) {
       triggerHud("全局键分配", (gKey + " 已生效").c_str(), -1, ST77XX_MAGENTA);
     }
   }
-  // 8. 宏按键配置 (M1~M12)
   else if (data.startsWith("SET:")) {
     int firstColon = data.indexOf(':', 4);
     if (firstColon > 0) {
@@ -432,7 +422,6 @@ void handleCommand(String data) {
       triggerHud("宏定义保存", keyName.c_str(), -1, ST77XX_GREEN);
     }
   }
-  // 9. 图片上传流接收
   else if (data == "LOGO_START") {
     File f = FFat.open("/logo.bin", FILE_WRITE);
     if (f) f.close();
@@ -453,7 +442,7 @@ void handleCommand(String data) {
     }
   } else if (data == "LOGO_END") {
     triggerHud("画板更新", "传输完成", -1, ST77XX_GREEN);
-    if (currentDispMode == DISP_MODE_WALLPAPER) renderWallpaperView(false);
+    if (currentDispMode == DISP_MODE_WALLPAPER) screenNeedsRedraw = true;
   }
 }
 
@@ -469,9 +458,10 @@ class MyCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-// ================= HUD 弹窗浮层 =================
+// ================= HUD 浮层管理（彻底消除全屏刷新） =================
 void triggerHud(const char* title, const char* value, int percent, uint16_t color) {
   hud.active = true;
+  hud.dirty = true;
   hud.triggerTime = millis();
   strncpy(hud.title, title, sizeof(hud.title));
   strncpy(hud.value, value, sizeof(hud.value));
@@ -481,38 +471,43 @@ void triggerHud(const char* title, const char* value, int percent, uint16_t colo
 
 void drawHudOverlay() {
   if (!hud.active) return;
+  int x = 20, y = 70, w = 200, h = 90;
+
+  // 1.2秒超时退出，擦除 HUD 局部区域并恢复原区域底图，绝不清屏！
   if (millis() - hud.triggerTime > 1200) {
     hud.active = false;
-    renderCurrentDisplay();
+    hud.dirty = false;
+    screenNeedsRedraw = true;
     return;
   }
 
-  // 绘制居中圆角卡片
-  int x = 20, y = 70, w = 200, h = 90;
-  tft.fillRoundRect(x, y, w, h, 10, ST77XX_BLACK);
-  tft.drawRoundRect(x, y, w, h, 10, hud.color);
+  // 仅在有改动时重画 1 次
+  if (hud.dirty) {
+    hud.dirty = false;
+    tft.fillRoundRect(x, y, w, h, 10, ST77XX_BLACK);
+    tft.drawRoundRect(x, y, w, h, 10, hud.color);
 
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_WHITE);
-  int tw = u8g2.getUTF8Width(hud.title);
-  u8g2.setCursor(x + (w - tw) / 2, y + 26);
-  u8g2.print(hud.title);
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_WHITE);
+    int tw = u8g2.getUTF8Width(hud.title);
+    u8g2.setCursor(x + (w - tw) / 2, y + 26);
+    u8g2.print(hud.title);
 
-  u8g2.setForegroundColor(hud.color);
-  int vw = u8g2.getUTF8Width(hud.value);
-  u8g2.setCursor(x + (w - vw) / 2, y + 54);
-  u8g2.print(hud.value);
+    u8g2.setForegroundColor(hud.color);
+    int vw = u8g2.getUTF8Width(hud.value);
+    u8g2.setCursor(x + (w - vw) / 2, y + 54);
+    u8g2.print(hud.value);
 
-  // 进度条
-  if (hud.percent >= 0) {
-    int barW = 160, barH = 8, barX = x + 20, barY = y + 66;
-    tft.drawRoundRect(barX, barY, barW, barH, 3, ST77XX_DARKGREY);
-    int fillW = (barW - 4) * constrain(hud.percent, 0, 100) / 100;
-    tft.fillRect(barX + 2, barY + 2, fillW, barH - 4, hud.color);
+    if (hud.percent >= 0) {
+      int barW = 160, barH = 8, barX = x + 20, barY = y + 66;
+      tft.drawRoundRect(barX, barY, barW, barH, 3, ST77XX_DARKGREY);
+      int fillW = (barW - 4) * constrain(hud.percent, 0, 100) / 100;
+      tft.fillRect(barX + 2, barY + 2, fillW, barH - 4, hud.color);
+    }
   }
 }
 
-// ================= 状态锁指示灯绘制 =================
+// ================= 状态锁指示灯局部重绘 =================
 void drawLockIndicators(int startY = 32, bool forceRedraw = false) {
   if (!forceRedraw && (lastNumLock == numLockActive && lastCapsLock == capsLockActive && lastScrollLock == scrollLockActive)) {
     return;
@@ -547,7 +542,7 @@ void drawLockIndicators(int startY = 32, bool forceRedraw = false) {
   tft.print("SCRL");
 }
 
-// ================= 画板与壁纸渲染 =================
+// ================= 画板与壁纸模式 =================
 void renderWallpaperView(bool drawOverlayTime) {
   if (!FFat.exists("/logo.bin")) {
     tft.fillScreen(ST77XX_BLACK);
@@ -569,155 +564,162 @@ void renderWallpaperView(bool drawOverlayTime) {
   }
   tft.endWrite();
   f.close();
-
-  if (drawOverlayTime) {
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
-    char timeStr[16];
-    if (t && t->tm_year > 120) strftime(timeStr, sizeof(timeStr), "%H:%M", t);
-    else snprintf(timeStr, sizeof(timeStr), "--:--");
-
-    tft.fillRoundRect(130, 200, 100, 32, 6, 0x18E3);
-    tft.setTextSize(3);
-    tft.setTextColor(ST77XX_WHITE, 0x18E3);
-    tft.setCursor(140, 205);
-    tft.print(timeStr);
-  }
 }
 
-// ================= 4 大屏幕展示风格 =================
-void renderGeekDashboard() {
+// ================= 界面底框初始化（仅在切屏时执行一次） =================
+void renderCurrentDisplayBase() {
   tft.fillScreen(ST77XX_BLACK);
+  lastDrawnTimeStr[0] = '\0';
+  lastDrawnKeyCount = 0xFFFFFFFF;
+  keystrokeActiveOnScreen = false;
 
-  // 顶部方案栏
-  tft.fillRect(0, 0, 240, 26, 0x18C3);
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_WHITE);
-  u8g2.setCursor(8, 18);
-  u8g2.print("方案: ");
-  u8g2.setForegroundColor(ST77XX_YELLOW);
-  u8g2.print(profileNamesCN[currentProfile]);
-
-  drawLockIndicators(30, true);
-
-  // 中间时间
-  time_t now = time(nullptr);
-  struct tm* timeinfo = localtime(&now);
-  char timeStr[16];
-  if (timeinfo && timeinfo->tm_year > 120) strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
-  else snprintf(timeStr, sizeof(timeStr), "--:--:--");
-
-  tft.setTextSize(3);
-  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-  tft.setCursor(50, 64);
-  tft.print(timeStr);
-
-  tft.drawFastHLine(20, 100, 200, ST77XX_DARKGREY);
-
-  // 今日敲击统计
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_YELLOW);
-  u8g2.setCursor(20, 128);
-  u8g2.print("击键计数: ");
-
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
-  tft.setCursor(105, 116);
-  tft.print(totalKeyCount);
-
-  // 实时按键回显条
-  if (showKeystrokes && millis() - keyStrokeDisplayTime < 800 && lastKeyStrokeName.length() > 0) {
-    tft.fillRoundRect(15, 142, 210, 26, 4, 0x001F);
+  if (currentDispMode == DISP_MODE_GEEK) {
+    tft.fillRect(0, 0, 240, 26, 0x18C3);
     u8g2.setFont(u8g2_font_wqy14_t_gb2312);
     u8g2.setForegroundColor(ST77XX_WHITE);
-    u8g2.setCursor(25, 160);
-    u8g2.print("键入: ");
+    u8g2.setCursor(8, 18);
+    u8g2.print("方案: ");
     u8g2.setForegroundColor(ST77XX_YELLOW);
-    u8g2.print(lastKeyStrokeName);
-  }
+    u8g2.print(profileNamesCN[currentProfile]);
 
-  tft.drawRoundRect(10, 175, 220, 52, 6, ST77XX_ORANGE);
+    drawLockIndicators(30, true);
+    tft.drawFastHLine(20, 100, 200, ST77XX_DARKGREY);
+
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_YELLOW);
+    u8g2.setCursor(20, 128);
+    u8g2.print("击键计数: ");
+
+    tft.drawRoundRect(10, 175, 220, 52, 6, ST77XX_ORANGE);
+  }
+  else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
+    drawLockIndicators(10, true);
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_YELLOW);
+    int pw = u8g2.getUTF8Width(profileNamesCN[currentProfile]);
+    u8g2.setCursor((240 - pw) / 2, 210);
+    u8g2.print(profileNamesCN[currentProfile]);
+  }
+  else if (currentDispMode == DISP_MODE_KEY_MON) {
+    tft.fillRect(0, 0, 240, 28, ST77XX_NAVY);
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_WHITE);
+    u8g2.setCursor(60, 20);
+    u8g2.print("实时击键监控台");
+
+    tft.drawRoundRect(15, 45, 210, 100, 8, ST77XX_CYAN);
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+    u8g2.setCursor(25, 68);
+    u8g2.print("最近触发按键：");
+
+    u8g2.setForegroundColor(ST77XX_YELLOW);
+    u8g2.setCursor(25, 180);
+    u8g2.print("累计按键数: ");
+
+    u8g2.setCursor(25, 215);
+    u8g2.print("当前方案: ");
+    u8g2.print(profileNamesCN[currentProfile]);
+  }
+  else if (currentDispMode == DISP_MODE_WALLPAPER) {
+    renderWallpaperView(false);
+  }
 }
 
-void renderBigClock() {
-  tft.fillScreen(ST77XX_BLACK);
-  drawLockIndicators(10, true);
+// ================= 极速差量动态元素刷新（绝不全屏重绘） =================
+void updateDynamicElements() {
+  if (hud.active) return; // 弹窗激活期间暂停底层元素刷新
 
+  // 1. 刷新锁灯状态
+  drawLockIndicators((currentDispMode == DISP_MODE_BIG_CLOCK) ? 10 : 30);
+
+  // 2. 局部差量刷新时间（文本颜色带底色，无需清屏）
   time_t now = time(nullptr);
   struct tm* t = localtime(&now);
-  char timeStr[16], dateStr[32];
+  char currentTimeStr[16];
   if (t && t->tm_year > 120) {
-    strftime(timeStr, sizeof(timeStr), "%H:%M", t);
-    strftime(dateStr, sizeof(dateStr), "%Y-%m-%d  %A", t);
+    strftime(currentTimeStr, sizeof(currentTimeStr), (currentDispMode == DISP_MODE_BIG_CLOCK) ? "%H:%M" : "%H:%M:%S", t);
   } else {
-    snprintf(timeStr, sizeof(timeStr), "--:--");
-    snprintf(dateStr, sizeof(dateStr), "正在等待同步时间");
+    snprintf(currentTimeStr, sizeof(currentTimeStr), "--:--:--");
   }
 
-  tft.setTextSize(6);
-  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-  tft.setCursor(35, 75);
-  tft.print(timeStr);
+  if (strcmp(currentTimeStr, lastDrawnTimeStr) != 0) {
+    strcpy(lastDrawnTimeStr, currentTimeStr);
 
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_LIGHTGREY);
-  int dw = u8g2.getUTF8Width(dateStr);
-  u8g2.setCursor((240 - dw) / 2, 160);
-  u8g2.print(dateStr);
-
-  // 底部配置提示
-  u8g2.setForegroundColor(ST77XX_YELLOW);
-  int pw = u8g2.getUTF8Width(profileNamesCN[currentProfile]);
-  u8g2.setCursor((240 - pw) / 2, 205);
-  u8g2.print(profileNamesCN[currentProfile]);
-}
-
-void renderKeyMonitorDashboard() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.fillRect(0, 0, 240, 28, ST77XX_NAVY);
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_WHITE);
-  u8g2.setCursor(60, 20);
-  u8g2.print("实时击键监控台");
-
-  tft.drawRoundRect(15, 45, 210, 100, 8, ST77XX_CYAN);
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_LIGHTGREY);
-  u8g2.setCursor(25, 68);
-  u8g2.print("最近触发按键：");
-
-  tft.setTextSize(4);
-  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
-  tft.setCursor(35, 95);
-  if (lastKeyStrokeName.length() > 0) tft.print(lastKeyStrokeName);
-  else tft.print("--");
-
-  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_YELLOW);
-  u8g2.setCursor(25, 180);
-  u8g2.print("累计按键数: ");
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setCursor(120, 168);
-  tft.print(totalKeyCount);
-
-  u8g2.setCursor(25, 215);
-  u8g2.print("当前配置文件: ");
-  u8g2.print(profileNamesCN[currentProfile]);
-}
-
-void renderCurrentDisplay() {
-  if (currentSysMode == SYS_MODE_MENU) {
-    drawMenuUI();
-  } else if (currentSysMode == SYS_MODE_SLEEP) {
-    renderWallpaperView(true);
-  } else {
-    switch (currentDispMode) {
-      case DISP_MODE_BIG_CLOCK: renderBigClock(); break;
-      case DISP_MODE_KEY_MON: renderKeyMonitorDashboard(); break;
-      case DISP_MODE_WALLPAPER: renderWallpaperView(true); break;
-      default: renderGeekDashboard(); break;
+    if (currentDispMode == DISP_MODE_GEEK) {
+      tft.setTextSize(3);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK); // 自带黑色底色，直接重绘不闪烁
+      tft.setCursor(50, 64);
+      tft.print(currentTimeStr);
     }
+    else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
+      tft.setTextSize(6);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.setCursor(35, 75);
+      tft.print(currentTimeStr);
+
+      char dateStr[32];
+      if (t && t->tm_year > 120) strftime(dateStr, sizeof(dateStr), "%Y-%m-%d  %A", t);
+      else snprintf(dateStr, sizeof(dateStr), "等待同步时间");
+
+      tft.fillRect(0, 145, 240, 24, ST77XX_BLACK);
+      u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+      u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+      int dw = u8g2.getUTF8Width(dateStr);
+      u8g2.setCursor((240 - dw) / 2, 160);
+      u8g2.print(dateStr);
+    }
+    else if (currentDispMode == DISP_MODE_WALLPAPER) {
+      tft.fillRoundRect(130, 200, 100, 32, 6, 0x18E3);
+      tft.setTextSize(3);
+      tft.setTextColor(ST77XX_WHITE, 0x18E3);
+      tft.setCursor(140, 205);
+      tft.print(currentTimeStr);
+    }
+  }
+
+  // 3. 局部差量刷新按键计数器
+  if (totalKeyCount != lastDrawnKeyCount) {
+    lastDrawnKeyCount = totalKeyCount;
+    if (currentDispMode == DISP_MODE_GEEK) {
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+      tft.fillRect(105, 116, 120, 18, ST77XX_BLACK);
+      tft.setCursor(105, 116);
+      tft.print(totalKeyCount);
+    } else if (currentDispMode == DISP_MODE_KEY_MON) {
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+      tft.fillRect(120, 168, 110, 18, ST77XX_BLACK);
+      tft.setCursor(120, 168);
+      tft.print(totalKeyCount);
+    }
+  }
+
+  // 4. 实时按键回显局部更新与超时淡出
+  if (currentDispMode == DISP_MODE_GEEK && showKeystrokes) {
+    if (keystrokeNeedsRedraw) {
+      keystrokeNeedsRedraw = false;
+      keystrokeActiveOnScreen = true;
+      tft.fillRoundRect(15, 142, 210, 26, 4, 0x001F);
+      u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+      u8g2.setForegroundColor(ST77XX_WHITE);
+      u8g2.setCursor(25, 160);
+      u8g2.print("键入: ");
+      u8g2.setForegroundColor(ST77XX_YELLOW);
+      u8g2.print(lastKeyStrokeName);
+    } else if (keystrokeActiveOnScreen && millis() - keyStrokeDisplayTime >= 800) {
+      keystrokeActiveOnScreen = false;
+      tft.fillRect(15, 142, 210, 26, ST77XX_BLACK); // 超时只清除回显框这一小块！
+    }
+  }
+  else if (currentDispMode == DISP_MODE_KEY_MON && keystrokeNeedsRedraw) {
+    keystrokeNeedsRedraw = false;
+    tft.fillRect(25, 85, 190, 45, ST77XX_BLACK);
+    tft.setTextSize(4);
+    tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+    tft.setCursor(35, 95);
+    tft.print(lastKeyStrokeName);
   }
 }
 
@@ -756,9 +758,9 @@ void drawMenuUI() {
 }
 
 void updateMarquee() {
-  if (currentDispMode != DISP_MODE_GEEK) return;
+  if (currentDispMode != DISP_MODE_GEEK || hud.active) return;
   unsigned long now = millis();
-  if (now - lastMarqueeUpdate > 30) {
+  if (now - lastMarqueeUpdate > 35) {
     lastMarqueeUpdate = now;
     tft.fillRect(15, 185, 210, 34, ST77XX_BLACK);
 
@@ -792,7 +794,7 @@ void switchProfile(uint8_t profIdx) {
   preferences.putUChar("curr_prof", profIdx);
   displayStatusCN(profileNamesCN[profIdx], ST77XX_GREEN);
   delay(300);
-  renderCurrentDisplay();
+  screenNeedsRedraw = true;
 }
 
 // ================= 灯效与报警引擎 =================
@@ -966,7 +968,6 @@ void renderLightingEngine() {
     return;
   }
 
-  // 1. 系统通知报警爆闪模式（红/绿/黄）
   if (activeAlert != ALERT_NONE) {
     static unsigned long lastAlertFlash = 0;
     static bool alertToggle = false;
@@ -974,7 +975,6 @@ void renderLightingEngine() {
       lastAlertFlash = now;
       alertToggle = !alertToggle;
     }
-
     if (alertToggle) {
       uint8_t r = 0, g = 0, b = 0;
       if (activeAlert == ALERT_RED) r = 255;
@@ -988,7 +988,6 @@ void renderLightingEngine() {
     return;
   }
 
-  // 2. MR 录制爆闪指示
   if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
     static unsigned long lastRecFlash = 0;
     static bool recFlashState = false;
@@ -996,7 +995,6 @@ void renderLightingEngine() {
       lastRecFlash = now;
       recFlashState = !recFlashState;
     }
-
     if (recFlashState) {
       uint8_t fr = (currentSysMode == SYS_MODE_REC_SEQ) ? 255 : 220;
       uint8_t fg = (currentSysMode == SYS_MODE_REC_SEQ) ? 180 : 0;
@@ -1008,7 +1006,6 @@ void renderLightingEngine() {
     return;
   }
 
-  // 3. 按键动效避让常亮
   if (isReactionActive) {
     updateKeyReaction();
   } else if (reactionType == 2 && stackCount > 0) {
@@ -1110,7 +1107,6 @@ void recoverI2CBus() {
   }
 }
 
-// 辅助：获取键名用于实时屏幕显示
 String getKeyName(uint16_t code) {
   if (code >= 'a' && code <= 'z') return String((char)(code - 32));
   if (code >= '0' && code <= '9') return String((char)code);
@@ -1148,11 +1144,9 @@ void executeComboAction(String cmb) {
   Keyboard.releaseAll();
 }
 
-// 支持 SLEEP(ms) 与 [SLEEP:ms] 的击键流执行
 void executeSequenceAction(String seq) {
   int i = 0;
   while (i < seq.length()) {
-    // 1. 匹配 SLEEP(500) 格式
     if (seq.substring(i).startsWith("SLEEP(")) {
       int endP = seq.indexOf(')', i + 6);
       if (endP != -1) {
@@ -1162,7 +1156,6 @@ void executeSequenceAction(String seq) {
         continue;
       }
     }
-    // 2. 匹配 [SLEEP:500] 格式
     else if (seq.substring(i).startsWith("[SLEEP:")) {
       int endB = seq.indexOf(']', i + 7);
       if (endB != -1) {
@@ -1172,7 +1165,6 @@ void executeSequenceAction(String seq) {
         continue;
       }
     }
-    // 3. 匹配通用控制标签
     else if (seq[i] == '[') {
       int endB = seq.indexOf(']', i);
       if (endB != -1) {
@@ -1261,7 +1253,7 @@ void finishMacroRecording(String targetKey) {
     currentSysMode = SYS_MODE_NORMAL;
     displayStatusCN("取消录制", ST77XX_RED);
     delay(300);
-    renderCurrentDisplay();
+    screenNeedsRedraw = true;
     return;
   }
 
@@ -1291,12 +1283,12 @@ void finishMacroRecording(String targetKey) {
   currentSysMode = SYS_MODE_NORMAL;
   displayStatusCN("录制已保存", ST77XX_GREEN);
   delay(400);
-  renderCurrentDisplay();
+  screenNeedsRedraw = true;
 }
 
 void handleMenuSelect();
 
-// ================= 键盘扫描与事件处理 =================
+// ================= 键盘扫描（最高优先级） =================
 void scanKeyboardMatrix() {
   static unsigned long lastI2CCheck = 0;
   if (millis() - lastI2CCheck > 500) {
@@ -1324,22 +1316,21 @@ void scanKeyboardMatrix() {
 
           // ---------------- 按键按下 ----------------
           if (currentState) {
-            // 唤醒休眠
             lastActivityTime = millis();
             if (currentSysMode == SYS_MODE_SLEEP) {
               currentSysMode = SYS_MODE_NORMAL;
-              renderCurrentDisplay();
+              screenNeedsRedraw = true;
               return;
             }
 
             totalKeyCount++;
 
-            // 记录并显示击键名
+            // 触发局部重绘标记，绝不全屏刷新
             lastKeyStrokeName = getKeyName(baseKey);
             keyStrokeDisplayTime = millis();
-            if (currentDispMode == DISP_MODE_KEY_MON) renderKeyMonitorDashboard();
+            keystrokeNeedsRedraw = true;
 
-            // 1. 系统菜单导航接管
+            // 1. 菜单模式接管
             if (currentSysMode == SYS_MODE_MENU) {
               if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
                 menuCursor = (menuCursor == 0) ? MENU_TOTAL_ITEMS - 1 : menuCursor - 1;
@@ -1351,7 +1342,7 @@ void scanKeyboardMatrix() {
                 handleMenuSelect();
               } else if (baseKey == KEY_ESC || baseKey == K_MC) {
                 currentSysMode = SYS_MODE_NORMAL;
-                renderCurrentDisplay();
+                screenNeedsRedraw = true;
               }
               return;
             }
@@ -1371,7 +1362,7 @@ void scanKeyboardMatrix() {
                   currentSysMode = SYS_MODE_NORMAL;
                   displayStatusCN("录制已取消", ST77XX_RED);
                   delay(300);
-                  renderCurrentDisplay();
+                  screenNeedsRedraw = true;
                 }
                 return;
               }
@@ -1389,7 +1380,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 4. MA / MB 全局专用键
+            // 4. MA / MB 全局键
             if (baseKey == K_MA) {
               executeGlobalKey("MA");
               return;
@@ -1398,7 +1389,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 5. MR 免驱录制启动键
+            // 5. MR 录制键
             if (baseKey == K_MR) {
               currentSysMode = SYS_MODE_REC_SEQ;
               recKeyCount = 0;
@@ -1464,7 +1455,7 @@ void handleMenuSelect() {
   switch (menuCursor) {
     case 0:
       currentSysMode = SYS_MODE_NORMAL;
-      renderCurrentDisplay();
+      screenNeedsRedraw = true;
       break;
     case 1:
       currentDispMode = (currentDispMode + 1) % 4;
@@ -1498,7 +1489,6 @@ void handleMenuSelect() {
   }
 }
 
-// C3 旋钮与按键事件监听处理
 void handleC3Events() {
   static String serialBuffer = "";
   while (Serial1.available() > 0) {
@@ -1508,7 +1498,7 @@ void handleC3Events() {
       lastActivityTime = millis();
       if (currentSysMode == SYS_MODE_SLEEP) {
         currentSysMode = SYS_MODE_NORMAL;
-        renderCurrentDisplay();
+        screenNeedsRedraw = true;
       }
 
       if (serialBuffer == "PONG") {
@@ -1598,7 +1588,6 @@ void handleC3Events() {
   }
 }
 
-// 监听电脑 USB 串口传入的系统下发指令
 void handleUsbSerialCommands() {
   static String usbBuffer = "";
   while (Serial.available() > 0) {
@@ -1632,8 +1621,10 @@ void setup() {
   SystemControl.begin();
   USB.begin();
 
+  // 1. 初始化高速 40MHz SPI 通道，杜绝总线传输延迟
   tftSPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS);
   tft.init(240, 240);
+  tft.setSPISpeed(40000000); // 40MHz 极速通讯
   tft.setRotation(1);
 
   u8g2.begin(tft);
@@ -1666,7 +1657,7 @@ void setup() {
   for (int r = 0; r < numRows; r++) { pinMode(rowPins[r], INPUT_PULLUP); }
 
   lastActivityTime = millis();
-  renderCurrentDisplay();
+  renderCurrentDisplayBase();
 
   BLEDevice::init("YYQ-MX9.0");
   BLEDevice::setMTU(517);
@@ -1690,11 +1681,11 @@ void setup() {
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
 #endif
-  Serial.println("YYQ S3 系统就绪：多展示模式、报警通知与睡眠壁纸已就绪");
+  Serial.println("YYQ S3 系统就绪：40MHz差量局部无闪烁引擎已启动");
 }
 
 unsigned long lastScanTime = 0;
-const unsigned long SCAN_INTERVAL = 2;
+const unsigned long SCAN_INTERVAL = 2; // 2ms 键盘极速高频扫描
 
 // ================= LOOP =================
 void loop() {
@@ -1716,42 +1707,49 @@ void loop() {
   handleUsbSerialCommands();
   handleC3Events();
 
+  // 1. 键盘扫描：拥有最高优先级，保持绝对跟手
   if (millis() - lastScanTime >= SCAN_INTERVAL) {
     lastScanTime = millis();
     scanKeyboardMatrix();
   }
 
+  // 2. 灯效帧发送
   if (millis() - lastLedFrameTime >= 20) {
     lastLedFrameTime = millis();
     renderLightingEngine();
     sendLedFrameToC3();
   }
 
-  // 屏保睡眠超时判定
+  // 3. 屏幕保护超时判断
   if (currentSysMode == SYS_MODE_NORMAL && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
     currentSysMode = SYS_MODE_SLEEP;
     renderWallpaperView(true);
   }
 
-  // 常规刷新与时钟更新
+  // 4. 屏幕显示渲染（全差量，彻底消灭全屏重绘闪烁）
   if (currentSysMode == SYS_MODE_NORMAL) {
-    updateMarquee();
-    if (millis() - lastTimeUpdate > 1000) {
-      lastTimeUpdate = millis();
-      if (!hud.active) renderCurrentDisplay();
+    // 仅在首次启动或模式改变时才画一次底板
+    if (screenNeedsRedraw) {
+      screenNeedsRedraw = false;
+      renderCurrentDisplayBase();
+    }
 
-      static uint32_t lastSavedCount = 0;
-      if (totalKeyCount - lastSavedCount > 500) {
-        lastSavedCount = totalKeyCount;
-        preferences.putUInt("keyCount", totalKeyCount);
-      }
+    // 局部差量更新动态数据（时钟、击键数、按键OSD）
+    updateDynamicElements();
+    updateMarquee();
+
+    // 敲击数持久化存档
+    static uint32_t lastSavedCount = 0;
+    if (totalKeyCount - lastSavedCount > 500) {
+      lastSavedCount = totalKeyCount;
+      preferences.putUInt("keyCount", totalKeyCount);
     }
   }
 
-  // HUD 浮动层渲染覆盖
+  // 5. HUD 弹窗卡片单次渲染（绝无循环塞满 SPI 的情况）
   if (hud.active) {
     drawHudOverlay();
   }
 
-  delay(1);
+  delayMicroseconds(500);
 }
