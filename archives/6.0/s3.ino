@@ -13,12 +13,25 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include <esp_task_wdt.h>
-#include <Adafruit_NeoPixel.h> // 仅用于 S3 端颜色数学计算
+#include <Adafruit_NeoPixel.h>
+#include <time.h>
+#include <sys/time.h>
 
-// ================= TFT 屏幕相关库与引脚定义 =================
+// ================= TFT 屏幕与官方中文字体库 =================
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <U8g2_for_Adafruit_GFX.h>
+
+#ifndef ST77XX_NAVY
+#define ST77XX_NAVY       0x000F
+#endif
+#ifndef ST77XX_DARKGREY
+#define ST77XX_DARKGREY   0x39E7
+#endif
+#ifndef ST77XX_LIGHTGREY
+#define ST77XX_LIGHTGREY  0xC618
+#endif
 
 #define TFT_SCL   4
 #define TFT_SDA  16
@@ -28,21 +41,22 @@
 
 SPIClass tftSPI(FSPI);
 Adafruit_ST7789 tft = Adafruit_ST7789(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
+U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
 USBHIDSystemControl SystemControl;
 Preferences preferences;
 Adafruit_MCP23X17 mcp;
-#define WDT_TIMEOUT 3
 
+#define WDT_TIMEOUT 5
 #define I2C_SDA 14
 #define I2C_SCL 13
 #define MCP23017_ADDR 0x20
 
 #define RX_PIN 10
 #define TX_PIN 9
-#define UART_BAUD 460800  // 高速串口，单帧推流只需约 1ms
+#define UART_BAUD 460800
 
 // ================= 键盘矩阵定义 =================
 const int rowPins[] = { 1, 2, 42, 41, 40, 39, 38, 47, 21, 12 };
@@ -76,24 +90,64 @@ const int numCols = 16;
 #define K_FN (MACRO_BASE + 22)
 
 bool fnPressed = false;
-uint16_t keyMatrix[numRows][numCols] = { 0 };
-bool cherryLogoEnabled = false;
 bool lastState[numRows][numCols] = { false };
 unsigned long lastDebounceTime[numRows][numCols] = { 0 };
 
-// ================= 灯光与系统控制状态机 (由 S3 统管) =================
+uint16_t baseMatrix[numRows][numCols] = { 0 };
+
+// 按键重映射 Diff
+#define MAX_REMAP_RULES 32
+struct RemapRule {
+  uint16_t fromKey;
+  uint16_t toKey;
+};
+
+#define TOTAL_PROFILES 4
+RemapRule profileRemaps[TOTAL_PROFILES][MAX_REMAP_RULES];
+int remapCounts[TOTAL_PROFILES] = { 0 };
+uint8_t currentProfile = 0;
+const char* profileNamesCN[TOTAL_PROFILES] = { "方案1-Windows", "方案2-macOS", "方案3-游戏模式", "方案4-工作模式" };
+
+// 主机键盘锁指示灯状态
+volatile bool numLockActive = false;
+volatile bool capsLockActive = false;
+volatile bool scrollLockActive = false;
+bool lastNumLock = false;
+bool lastCapsLock = false;
+bool lastScrollLock = false;
+
+// 系统运行状态
+enum KeyboardSysMode {
+  SYS_MODE_NORMAL,
+  SYS_MODE_MENU,
+  SYS_MODE_REC_SEQ,
+  SYS_MODE_REC_CMB,
+  SYS_MODE_LOGO_VIEW
+};
+KeyboardSysMode currentSysMode = SYS_MODE_NORMAL;
+
+uint32_t totalKeyCount = 0;
+String customMarquee = "YYQ Studio - 极客机械大师";
+int marqueeScrollX = 240;
+unsigned long lastMarqueeUpdate = 0;
+unsigned long lastTimeUpdate = 0;
+
+// MR 免驱录制
+#define MAX_REC_KEYS 64
+uint16_t recKeyBuffer[MAX_REC_KEYS];
+int recKeyCount = 0;
+
+// 灯光引擎
 #define NUM_MAIN_LEDS 16
 #define NUM_IND_LEDS  3
 #define TOTAL_LEDS    19
-
-// 渲染缓冲区：0~15为主灯，16~18为指示灯
 uint8_t frameBuffer[TOTAL_LEDS][3] = { 0 };
 
 enum ControlMode {
   MODE_CPG,
   MODE_MUTE,
-  MODE_LIGHT,             // 键盘灯光亮度模式
-  MODE_SCREEN_BRIGHTNESS, // 电脑屏幕亮度调节
+  MODE_LIGHT,
+  MODE_SCREEN_BRIGHTNESS,
   MODE_KEY_COLOR
 };
 ControlMode currentMode = MODE_LIGHT;
@@ -103,13 +157,8 @@ uint8_t currentEffect = 1;
 const uint8_t MAX_EFFECTS = 14;
 bool g_forceOff = false;
 char bt_alert = '\0';
+bool cherryLogoEnabled = false;
 
-enum SystemState { SYS_NORMAL, SYS_NOTIFY_ME, SYS_REBOOT, SYS_ROOT };
-SystemState sysState = SYS_NORMAL;
-unsigned long lastSysUpdate = 0;
-int sysFrame = 0;
-
-// 按键反馈动画引擎变量
 bool isReactionActive = false;
 int reactionStep = 0;
 unsigned long lastReactionUpdate = 0;
@@ -121,76 +170,32 @@ int stackCount = 0;
 #define MAX_SHOOT_PROJECTILES 8
 int shootSteps[MAX_SHOOT_PROJECTILES] = { -1, -1, -1, -1, -1, -1, -1, -1 };
 uint32_t shootColors[MAX_SHOOT_PROJECTILES];
-
 const uint32_t keypressColors[] = {
   0x000000, 0xFF0000, 0x00FF00, 0x0000FF,
   0x00FFFF, 0xB400FF, 0xFFFF00, 0xFFFFFF
 };
 
-// 心跳与通信
 bool c3Connected = false;
 unsigned long lastPingTime = 0;
 unsigned long lastLedFrameTime = 0;
 uint16_t effectFrame = 0;
-unsigned long lastEffectUpdate = 0;
 
-// ================= BLE 配置 =================
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) { deviceConnected = true; }
-  void onDisconnect(BLEServer *pServer) { deviceConnected = false; }
-};
+void displayStatusCN(const char* title, uint16_t color = ST77XX_GREEN);
+void switchProfile(uint8_t profIdx);
+void initScreenUI();
+void drawMenuUI();
+void renderMainDashboard();
+void renderLogoFromFile();
+void executeMacro(String keyName);
+void executeGlobalKey(String gKey);
 
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pChar) {
-    String data = pChar->getValue().c_str();
-    if (data.length() == 0) return;
-
-    if (data == "ME_START") {
-      File f = FFat.open("/me_hex.txt", FILE_WRITE);
-      if (f) f.close();
-    } else if (data == "ME_END") {
-      sysState = SYS_NOTIFY_ME;
-      sysFrame = 0;
-      lastSysUpdate = millis();
-    } else if (data.startsWith("ME_DATA:")) {
-      File f = FFat.open("/me_hex.txt", FILE_APPEND);
-      if (f) {
-        f.print(data.substring(8));
-        f.close();
-      }
-    } else if (data.startsWith("SET:")) {
-      int firstColon = data.indexOf(':', 4);
-      if (firstColon > 0) {
-        String keyName = data.substring(4, firstColon);
-        String payload = data.substring(firstColon + 1);
-        preferences.putString(keyName.c_str(), payload);
-        if (keyName == "MR") {
-          sysState = SYS_NOTIFY_ME;
-          sysFrame = 0;
-          lastSysUpdate = millis();
-        }
-      }
-    } 
-    // 蓝牙控制红绿灯直接由 S3 状态机捕获
-    else if (data == "R" || data == "G" || data == "B" || data == "Y") {
-      bt_alert = data[0];
-    } else if (data == "S") {
-      bt_alert = '\0';
-    } else if (data.startsWith("ALERT:")) {
-      char c = data.charAt(6);
-      if (c == 'R' || c == 'G' || c == 'B' || c == 'Y') bt_alert = c;
-      else if (c == 'S') bt_alert = '\0';
-    }
-  }
-};
-
-// ================= 辅助函数：色彩与数学 =================
+// ================= 色彩与灯效辅助 =================
 void setLedRGB(int index, uint8_t r, uint8_t g, uint8_t b) {
   if (index >= 0 && index < TOTAL_LEDS) {
     frameBuffer[index][0] = r;
@@ -209,82 +214,341 @@ uint32_t colorHSV(uint16_t hue, uint8_t sat, uint8_t val) {
   uint8_t r, g, b;
   uint8_t base = ((255 - sat) * val) >> 8;
   switch ((hue / 10922) % 6) {
-    case 0:
-      r = val;
-      g = (((val - base) * (hue % 10922)) / 10922) + base;
-      b = base;
-      break;
-    case 1:
-      r = (((val - base) * (10922 - (hue % 10922))) / 10922) + base;
-      g = val;
-      b = base;
-      break;
-    case 2:
-      r = base;
-      g = val;
-      b = (((val - base) * (hue % 10922)) / 10922) + base;
-      break;
-    case 3:
-      r = base;
-      g = (((val - base) * (10922 - (hue % 10922))) / 10922) + base;
-      b = val;
-      break;
-    case 4:
-      r = (((val - base) * (hue % 10922)) / 10922) + base;
-      g = base;
-      b = val;
-      break;
-    default:
-      r = val;
-      g = base;
-      b = (((val - base) * (10922 - (hue % 10922))) / 10922) + base;
-      break;
+    case 0: r = val; g = (((val - base) * (hue % 10922)) / 10922) + base; b = base; break;
+    case 1: r = (((val - base) * (10922 - (hue % 10922))) / 10922) + base; g = val; b = base; break;
+    case 2: r = base; g = val; b = (((val - base) * (hue % 10922)) / 10922) + base; break;
+    case 3: r = base; g = (((val - base) * (10922 - (hue % 10922))) / 10922) + base; b = val; break;
+    case 4: r = (((val - base) * (hue % 10922)) / 10922) + base; g = base; b = val; break;
+    default: r = val; g = base; b = (((val - base) * (10922 - (hue % 10922))) / 10922) + base; break;
   }
   return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
-// ================= UI 与屏幕绘制 =================
-void initScreenUI() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setTextSize(2);
-  tft.setCursor(20, 18);
-  tft.print("YYQ Master-S3");
-  tft.drawFastHLine(10, 45, 220, ST77XX_ORANGE);
-  tft.drawRoundRect(15, 65, 210, 110, 10, ST77XX_BLUE);
-
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(35, 205);
-  tft.print("Matrix & LED Engine Sync");
-
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(75, 110);
-  tft.print("READY");
+static void usbHidKeyboardEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
+  if (id == ARDUINO_USB_HID_KEYBOARD_LED_EVENT) {
+    arduino_usb_hid_keyboard_event_data_t *led_data = (arduino_usb_hid_keyboard_event_data_t *)data;
+    numLockActive = led_data->numlock;
+    capsLockActive = led_data->capslock;
+    scrollLockActive = led_data->scrolllock;
+  }
 }
 
-void displayStatus(String title, uint16_t color = ST77XX_GREEN) {
+// ================= 重映射管理 =================
+void loadRemapsFromStorage() {
+  for (int p = 0; p < TOTAL_PROFILES; p++) {
+    char key[16];
+    snprintf(key, sizeof(key), "rmp_cnt_%d", p);
+    remapCounts[p] = preferences.getInt(key, 0);
+    if (remapCounts[p] > MAX_REMAP_RULES) remapCounts[p] = MAX_REMAP_RULES;
+
+    for (int i = 0; i < remapCounts[p]; i++) {
+      char itemKey[20];
+      snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", p, i);
+      uint32_t val = preferences.getUInt(itemKey, 0);
+      profileRemaps[p][i].fromKey = (uint16_t)(val >> 16);
+      profileRemaps[p][i].toKey = (uint16_t)(val & 0xFFFF);
+    }
+  }
+}
+
+void saveProfileRemap(uint8_t prof, uint16_t fromK, uint16_t toK) {
+  if (prof >= TOTAL_PROFILES) return;
+  for (int i = 0; i < remapCounts[prof]; i++) {
+    if (profileRemaps[prof][i].fromKey == fromK) {
+      profileRemaps[prof][i].toKey = toK;
+      char itemKey[20];
+      snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+      preferences.putUInt(itemKey, ((uint32_t)fromK << 16) | toK);
+      return;
+    }
+  }
+  if (remapCounts[prof] < MAX_REMAP_RULES) {
+    int idx = remapCounts[prof]++;
+    profileRemaps[prof][idx].fromKey = fromK;
+    profileRemaps[prof][idx].toKey = toK;
+    char itemKey[20];
+    snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, idx);
+    preferences.putUInt(itemKey, ((uint32_t)fromK << 16) | toK);
+    char cntKey[16];
+    snprintf(cntKey, sizeof(cntKey), "rmp_cnt_%d", prof);
+    preferences.putInt(cntKey, remapCounts[prof]);
+  }
+}
+
+void clearProfileRemap(uint8_t prof) {
+  if (prof >= TOTAL_PROFILES) return;
+  remapCounts[prof] = 0;
+  char cntKey[16];
+  snprintf(cntKey, sizeof(cntKey), "rmp_cnt_%d", prof);
+  preferences.putInt(cntKey, 0);
+}
+
+uint16_t getMappedKey(uint16_t originalKey) {
+  for (int i = 0; i < remapCounts[currentProfile]; i++) {
+    if (profileRemaps[currentProfile][i].fromKey == originalKey) {
+      return profileRemaps[currentProfile][i].toKey;
+    }
+  }
+  return originalKey;
+}
+
+// ================= BLE 通信 =================
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) { deviceConnected = true; }
+  void onDisconnect(BLEServer *pServer) { deviceConnected = false; }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) {
+    String data = pChar->getValue().c_str();
+    if (data.length() == 0) return;
+
+    if (data.startsWith("TIME:")) {
+      time_t t = data.substring(5).toInt();
+      struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+      settimeofday(&tv, NULL);
+      displayStatusCN("时间同步成功", ST77XX_GREEN);
+    }
+    else if (data.startsWith("MARQUEE:")) {
+      customMarquee = data.substring(8);
+      preferences.putString("marquee", customMarquee);
+      displayStatusCN("标语更新成功", ST77XX_CYAN);
+    }
+    else if (data.startsWith("REMAP:")) {
+      int p1 = data.indexOf(':', 6);
+      int p2 = data.indexOf(':', p1 + 1);
+      if (p1 > 0 && p2 > 0) {
+        uint8_t prof = data.substring(6, p1).toInt();
+        bool doClear = (data.substring(p1 + 1, p2).toInt() == 1);
+        if (doClear) clearProfileRemap(prof);
+
+        String pairs = data.substring(p2 + 1);
+        while (pairs.length() > 0) {
+          int semi = pairs.indexOf(';');
+          String pair = (semi == -1) ? pairs : pairs.substring(0, semi);
+          int comma = pair.indexOf(',');
+          if (comma > 0) {
+            uint16_t fK = pair.substring(0, comma).toInt();
+            uint16_t tK = pair.substring(comma + 1).toInt();
+            saveProfileRemap(prof, fK, tK);
+          }
+          if (semi == -1) break;
+          pairs = pairs.substring(semi + 1);
+        }
+        displayStatusCN("映射保存成功", ST77XX_GREEN);
+      }
+    }
+    else if (data.startsWith("GSET:")) {
+      // 格式: GSET:MA:SW:1+CMB:128,116 或 GSET:MB:CMB:128,99
+      int p1 = data.indexOf(':', 5);
+      if (p1 > 0) {
+        String gKey = data.substring(5, p1);
+        String payload = data.substring(p1 + 1);
+        preferences.putString(("g_" + gKey).c_str(), payload);
+        displayStatusCN("全局键已生效", ST77XX_MAGENTA);
+      }
+    }
+    else if (data.startsWith("SET:")) {
+      int firstColon = data.indexOf(':', 4);
+      if (firstColon > 0) {
+        String keyName = data.substring(4, firstColon);
+        String payload = data.substring(firstColon + 1);
+        preferences.putString(keyName.c_str(), payload);
+        displayStatusCN("宏配置已保存", ST77XX_GREEN);
+      }
+    }
+    else if (data == "LOGO_START") {
+      File f = FFat.open("/logo.bin", FILE_WRITE);
+      if (f) f.close();
+    } else if (data.startsWith("LOGO_DATA:")) {
+      File f = FFat.open("/logo.bin", FILE_APPEND);
+      if (f) {
+        String hex = data.substring(10);
+        int len = hex.length();
+        uint8_t rawBuf[128];
+        int bytes = 0;
+        for (int i = 0; i < len; i += 2) {
+          char byteString[3] = { hex[i], hex[i + 1], '\0' };
+          rawBuf[bytes++] = (uint8_t)strtol(byteString, NULL, 16);
+        }
+        f.write(rawBuf, bytes);
+        f.close();
+      }
+    } else if (data == "LOGO_END") {
+      displayStatusCN("图案接收就绪", ST77XX_YELLOW);
+    }
+  }
+};
+
+// ================= U8g2 原生中文界面渲染 =================
+int menuCursor = 0;
+const int MENU_TOTAL_ITEMS = 6;
+const char* menuListCN[] = {
+  "1. 返回主屏",
+  "2. 切换配置方案",
+  "3. 播放图案画板",
+  "4. 键盘背光灯效",
+  "5. 按键反馈动效",
+  "6. 敲击计数清零"
+};
+
+void drawMenuUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, 240, 32, ST77XX_NAVY);
+
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_WHITE);
+  u8g2.setCursor(55, 22);
+  u8g2.print("YYQ 键盘系统 OS");
+
+  for (int i = 0; i < MENU_TOTAL_ITEMS; i++) {
+    int y = 44 + i * 31;
+    if (i == menuCursor) {
+      tft.fillRoundRect(8, y, 224, 28, 6, ST77XX_BLUE);
+      u8g2.setForegroundColor(ST77XX_WHITE);
+    } else {
+      u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+    }
+    u8g2.setCursor(20, y + 20);
+    u8g2.print(menuListCN[i]);
+  }
+}
+
+void drawLockIndicators(bool forceRedraw = false) {
+  if (!forceRedraw && (lastNumLock == numLockActive && lastCapsLock == capsLockActive && lastScrollLock == scrollLockActive)) {
+    return;
+  }
+  lastNumLock = numLockActive;
+  lastCapsLock = capsLockActive;
+  lastScrollLock = scrollLockActive;
+
+  uint16_t numBg = numLockActive ? 0x0400 : 0x18E3;
+  uint16_t numFg = numLockActive ? ST77XX_GREEN : ST77XX_DARKGREY;
+  tft.fillRoundRect(10, 34, 68, 22, 4, numBg);
+  tft.drawRoundRect(10, 34, 68, 22, 4, numFg);
+  tft.setTextSize(2);
+  tft.setTextColor(numFg, numBg);
+  tft.setCursor(22, 38);
+  tft.print("NUM");
+
+  uint16_t capsBg = capsLockActive ? 0x001F : 0x18E3;
+  uint16_t capsFg = capsLockActive ? ST77XX_CYAN : ST77XX_DARKGREY;
+  tft.fillRoundRect(86, 34, 68, 22, 4, capsBg);
+  tft.drawRoundRect(86, 34, 68, 22, 4, capsFg);
+  tft.setTextColor(capsFg, capsBg);
+  tft.setCursor(95, 38);
+  tft.print("CAPS");
+
+  uint16_t scrlBg = scrollLockActive ? 0xFD20 : 0x18E3;
+  uint16_t scrlFg = scrollLockActive ? ST77XX_YELLOW : ST77XX_DARKGREY;
+  tft.fillRoundRect(162, 34, 68, 22, 4, scrlBg);
+  tft.drawRoundRect(162, 34, 68, 22, 4, scrlFg);
+  tft.setTextColor(scrlFg, scrlBg);
+  tft.setCursor(171, 38);
+  tft.print("SCRL");
+}
+
+void renderMainDashboard() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.fillRect(0, 0, 240, 28, 0x18C3);
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_WHITE);
+  u8g2.setCursor(8, 20);
+  u8g2.print("配置: ");
+  u8g2.setForegroundColor(ST77XX_YELLOW);
+  u8g2.print(profileNamesCN[currentProfile]);
+
+  drawLockIndicators(true);
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char timeStr[16];
+  if (timeinfo && timeinfo->tm_year > 120) strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+  else snprintf(timeStr, sizeof(timeStr), "--:--:--");
+
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+  tft.setCursor(50, 68);
+  tft.print(timeStr);
+
+  tft.drawFastHLine(20, 108, 200, ST77XX_DARKGREY);
+
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_YELLOW);
+  u8g2.setCursor(25, 138);
+  u8g2.print("今日敲击: ");
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(125, 124);
+  tft.print(totalKeyCount);
+
+  tft.drawRoundRect(10, 168, 220, 56, 6, ST77XX_ORANGE);
+}
+
+void updateMarquee() {
+  unsigned long now = millis();
+  if (now - lastMarqueeUpdate > 30) {
+    lastMarqueeUpdate = now;
+    tft.fillRect(15, 178, 210, 36, ST77XX_BLACK);
+
+    u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_YELLOW);
+    u8g2.setCursor(marqueeScrollX, 202);
+    u8g2.print(customMarquee);
+
+    marqueeScrollX -= 3;
+    int strPixelLen = u8g2.getUTF8Width(customMarquee.c_str());
+    if (marqueeScrollX < -strPixelLen) marqueeScrollX = 220;
+  }
+}
+
+void displayStatusCN(const char* title, uint16_t color) {
   tft.fillRoundRect(17, 67, 206, 106, 8, ST77XX_BLACK);
   tft.drawRoundRect(15, 65, 210, 110, 10, color);
 
-  int textSize = 3;
-  if (title.length() > 5) textSize = 2;
-  if (title.length() > 9) textSize = 1;
-  tft.setTextSize(textSize);
-  tft.setTextColor(color);
-
-  int16_t textWidth = title.length() * 6 * textSize;
-  int16_t textHeight = 8 * textSize;
-  int16_t x = 120 - (textWidth / 2);
-  int16_t y = 120 - (textHeight / 2);
-  if (x < 20) x = 20;
-
-  tft.setCursor(x, y);
-  tft.print(title);
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2.setForegroundColor(color);
+  int w = u8g2.getUTF8Width(title);
+  int x = 120 - w / 2;
+  if (x < 22) x = 22;
+  u8g2.setCursor(x, 128);
+  u8g2.print(title);
 }
 
-// ================= 灯效计算引擎 =================
+void renderLogoFromFile() {
+  if (!FFat.exists("/logo.bin")) {
+    displayStatusCN("未发现图案", ST77XX_RED);
+    delay(800);
+    currentSysMode = SYS_MODE_NORMAL;
+    renderMainDashboard();
+    return;
+  }
+  File f = FFat.open("/logo.bin", FILE_READ);
+  if (!f) return;
+
+  uint16_t rowBuffer[240];
+  tft.startWrite();
+  tft.setAddrWindow(0, 0, 240, 240);
+  for (int y = 0; y < 240; y++) {
+    f.read((uint8_t*)rowBuffer, 240 * sizeof(uint16_t));
+    tft.writePixels(rowBuffer, 240);
+  }
+  tft.endWrite();
+  f.close();
+}
+
+void switchProfile(uint8_t profIdx) {
+  if (profIdx >= TOTAL_PROFILES) return;
+  currentProfile = profIdx;
+  preferences.putUChar("curr_prof", profIdx);
+  displayStatusCN(profileNamesCN[profIdx], ST77XX_GREEN);
+  delay(300);
+  renderMainDashboard();
+}
+
+// ================= 灯效引擎 =================
 void triggerKeyReaction() {
   isReactionActive = true;
   lastReactionUpdate = millis();
@@ -390,22 +654,7 @@ void drawBreathing(uint8_t maxR, uint8_t maxG, uint8_t maxB) {
 }
 
 void renderMainEffects() {
-  unsigned long now = millis();
-  uint8_t displayEffect = currentEffect;
-  static unsigned long lastAutoSwitchTime = 0;
-  static uint8_t autoCycleIndex = 1;
-
-  if (currentEffect == 13) {
-    if (now - lastAutoSwitchTime > 8000) {
-      lastAutoSwitchTime = now;
-      autoCycleIndex++;
-      if (autoCycleIndex > 12) autoCycleIndex = 1;
-      effectFrame = 0;
-    }
-    displayEffect = autoCycleIndex;
-  }
-
-  switch (displayEffect) {
+  switch (currentEffect) {
     case 1: setMainLedsColor(255, 0, 0); break;
     case 2: setMainLedsColor(0, 255, 0); break;
     case 3: setMainLedsColor(0, 0, 255); break;
@@ -457,126 +706,61 @@ void renderMainEffects() {
 }
 
 void renderIndicators() {
-  // 指示灯在缓冲区下标为 16, 17, 18
-  setLedRGB(16, 0, 0, 0);
-  setLedRGB(17, 0, 0, 0);
-  setLedRGB(18, 0, 0, 0);
-
-  switch (currentMode) {
-    case MODE_CPG:
-      setLedRGB(16, 120, 0, 120); // 指示灯 0：紫色
-      break;
-    case MODE_MUTE:
-      setLedRGB(17, 120, 0, 0);   // 指示灯 1：红色
-      break;
-    case MODE_LIGHT:
-      setLedRGB(18, 0, 120, 0);   // 指示灯 2：绿色 (键盘灯光模式)
-      break;
-    case MODE_SCREEN_BRIGHTNESS:
-      setLedRGB(18, 0, 120, 120); // 指示灯 2：青色 (屏幕亮度模式)
-      break;
-    case MODE_KEY_COLOR: {
-      uint8_t colorIdx = keypressStyle % 8;
-      uint32_t c = (colorIdx == 0) ? 0x500050 : keypressColors[colorIdx];
-      uint8_t r = ((c >> 16) & 0xFF) * 30 / 100;
-      uint8_t g = ((c >> 8) & 0xFF) * 30 / 100;
-      uint8_t b = (c & 0xFF) * 30 / 100;
-      setLedRGB(16, r, g, b);
-      setLedRGB(17, r, g, b);
-      setLedRGB(18, r, g, b);
-      break;
-    }
-  }
+  setLedRGB(16, numLockActive ? 255 : 0, numLockActive ? 180 : 0, 0);
+  setLedRGB(17, 0, capsLockActive ? 150 : 0, capsLockActive ? 255 : 0);
+  setLedRGB(18, scrollLockActive ? 255 : 0, scrollLockActive ? 50 : 0, 0);
 }
 
+// 【关键增强 1】：触发按键特效时跳过常亮层渲染，清空底色，确保特效清晰可见
 void renderLightingEngine() {
   unsigned long now = millis();
 
-  // 1. 全关模式
   if (g_forceOff) {
     for (int i = 0; i < TOTAL_LEDS; i++) setLedRGB(i, 0, 0, 0);
     return;
   }
 
-  // 2. 蓝牙红绿灯报警
-  if (bt_alert != '\0') {
-    static unsigned long lastFlash = 0;
-    static bool flashOn = false;
-    if (now - lastFlash > 350) {
-      lastFlash = now;
-      flashOn = !flashOn;
+  // MR 录制爆闪指示
+  if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+    static unsigned long lastRecFlash = 0;
+    static bool recFlashState = false;
+    if (now - lastRecFlash > 200) {
+      lastRecFlash = now;
+      recFlashState = !recFlashState;
     }
-    if (flashOn) {
-      switch (bt_alert) {
-        case 'R': setMainLedsColor(255, 0, 0); break;
-        case 'G': setMainLedsColor(0, 255, 0); break;
-        case 'B': setMainLedsColor(0, 0, 255); break;
-        case 'Y': setMainLedsColor(255, 180, 0); break;
-      }
+
+    if (recFlashState) {
+      uint8_t fr = (currentSysMode == SYS_MODE_REC_SEQ) ? 255 : 220;
+      uint8_t fg = (currentSysMode == SYS_MODE_REC_SEQ) ? 180 : 0;
+      uint8_t fb = (currentSysMode == SYS_MODE_REC_SEQ) ? 0 : 255;
+      for (int i = 0; i < TOTAL_LEDS; i++) setLedRGB(i, fr, fg, fb);
     } else {
-      clearMainLeds();
+      for (int i = 0; i < TOTAL_LEDS; i++) setLedRGB(i, 0, 0, 0);
     }
-    renderIndicators();
     return;
   }
 
-  // 3. 特殊系统动画
-  if (sysState != SYS_NORMAL) {
-    if (sysState == SYS_NOTIFY_ME) {
-      if (now - lastSysUpdate > 80) {
-        lastSysUpdate = now;
-        if (sysFrame % 2 == 0) setMainLedsColor(255, 200, 0);
-        else setMainLedsColor(0, 255, 255);
-        sysFrame++;
-        if (sysFrame > 20) sysState = SYS_NORMAL;
-      }
-    } else if (sysState == SYS_REBOOT) {
-      if (now - lastSysUpdate > 400) {
-        lastSysUpdate = now;
-        if (sysFrame == 0) setMainLedsColor(255, 0, 0);
-        else if (sysFrame == 1) setMainLedsColor(0, 255, 0);
-        else if (sysFrame == 2) setMainLedsColor(0, 0, 255);
-        else setMainLedsColor(255, 255, 255);
-        sysFrame++;
-        if (sysFrame > 4) sysState = SYS_NORMAL;
-      }
-    } else if (sysState == SYS_ROOT) {
-      if (now - lastSysUpdate > 300) {
-        lastSysUpdate = now;
-        if (sysFrame % 2 == 0) setMainLedsColor(255, 120, 0);
-        else clearMainLeds();
-        sysFrame++;
-      }
-    }
-    renderIndicators();
-    return;
-  }
-
-  // 4. 正常灯效渲染
-  renderMainEffects();
-
-  // 叠加按键反馈涟漪
+  // 若处于按键动效激活中，则不渲染常亮背景，防止特效被遮盖
   if (isReactionActive) {
     updateKeyReaction();
   } else if (reactionType == 2 && stackCount > 0) {
+    clearMainLeds();
     for (int i = 0; i < stackCount; i++) {
       setLedRGB(i, (currentReactionColor >> 16) & 0xFF, (currentReactionColor >> 8) & 0xFF, currentReactionColor & 0xFF);
     }
+  } else {
+    renderMainEffects();
   }
 
-  // 渲染指示灯
   renderIndicators();
 }
 
-// ================= 高速推流协议：S3 -> C3 =================
-// 协议格式：[0xAA] [0x55] [0x01] [57字节RGB] [0xEE]
 void sendLedFrameToC3() {
   uint8_t packet[61];
   packet[0] = 0xAA;
   packet[1] = 0x55;
-  packet[2] = 0x01; // 命令码 0x01：LED Frame
+  packet[2] = 0x01;
 
-  // 应用整体亮度（前16颗为主灯应用 brightness，后3颗指示灯亮度固定）
   for (int i = 0; i < NUM_MAIN_LEDS; i++) {
     packet[3 + i * 3 + 0] = (uint8_t)((frameBuffer[i][0] * brightness) / 255);
     packet[3 + i * 3 + 1] = (uint8_t)((frameBuffer[i][1] * brightness) / 255);
@@ -588,11 +772,159 @@ void sendLedFrameToC3() {
     packet[3 + i * 3 + 2] = frameBuffer[i][2];
   }
 
-  packet[60] = 0xEE; // 尾帧校验
+  packet[60] = 0xEE;
   Serial1.write(packet, sizeof(packet));
 }
 
-// ================= 键盘矩阵与宏执行 =================
+void initBaseMatrix() {
+  memset(baseMatrix, 0, sizeof(baseMatrix));
+
+  baseMatrix[0][0] = KEY_LEFT_ALT;
+  baseMatrix[0][1] = 0xE9; baseMatrix[0][2] = 0xE8; baseMatrix[0][3] = 0xE7;
+  baseMatrix[0][4] = 0xDE; baseMatrix[0][5] = 0xDD; baseMatrix[0][6] = 0xDC;
+  baseMatrix[0][7] = 0xDB; baseMatrix[0][8] = KEY_RIGHT_ARROW; baseMatrix[0][9] = KEY_DOWN_ARROW;
+  baseMatrix[0][10] = KEY_LEFT_ARROW; baseMatrix[0][11] = KEY_RIGHT_CTRL;
+  baseMatrix[0][12] = 0xED; baseMatrix[0][13] = K_FN; baseMatrix[0][14] = KEY_RIGHT_ALT; baseMatrix[0][15] = ' ';
+
+  baseMatrix[1][0] = 0xDF; baseMatrix[1][1] = K_MB; baseMatrix[1][2] = K_MA;
+  baseMatrix[1][3] = K_NEXT; baseMatrix[1][4] = K_PLAY; baseMatrix[1][5] = K_PREV; baseMatrix[1][6] = K_LOGO;
+  baseMatrix[1][7] = 0xE0;  baseMatrix[1][8] = 0xEB;  baseMatrix[1][9] = 0xEA;
+  baseMatrix[1][10] = 0xE3; baseMatrix[1][11] = 0xE2; baseMatrix[1][12] = 0xE1;
+  baseMatrix[1][13] = 0xE6; baseMatrix[1][14] = 0xE5; baseMatrix[1][15] = 0xE4;
+
+  baseMatrix[2][0] = KEY_LEFT_SHIFT; baseMatrix[2][1] = KEY_LEFT_GUI; baseMatrix[2][2] = KEY_LEFT_CTRL;
+  baseMatrix[2][3] = KEY_UP_ARROW; baseMatrix[2][4] = KEY_RIGHT_SHIFT;
+  baseMatrix[2][5] = '/'; baseMatrix[2][6] = '.'; baseMatrix[2][7] = ',';
+  baseMatrix[2][8] = 'm'; baseMatrix[2][9] = 'n'; baseMatrix[2][10] = 'b';
+  baseMatrix[2][11] = 'v'; baseMatrix[2][12] = 'c'; baseMatrix[2][13] = 'x'; baseMatrix[2][14] = 'z';
+
+  baseMatrix[4][0] = KEY_END; baseMatrix[4][1] = KEY_RETURN; baseMatrix[4][3] = '\'';
+  baseMatrix[4][4] = ';'; baseMatrix[4][5] = 'l'; baseMatrix[4][6] = 'k'; baseMatrix[4][7] = 'j';
+  baseMatrix[4][8] = 'h'; baseMatrix[4][9] = 'g'; baseMatrix[4][10] = 'f'; baseMatrix[4][11] = 'd';
+  baseMatrix[4][12] = 's'; baseMatrix[4][13] = 'a'; baseMatrix[4][14] = KEY_CAPS_LOCK;
+  baseMatrix[4][15] = 0xD6;
+
+  baseMatrix[5][0] = KEY_PAGE_UP; baseMatrix[5][1] = KEY_DELETE; baseMatrix[5][2] = '\\';
+  baseMatrix[5][3] = ']'; baseMatrix[5][4] = '['; baseMatrix[5][5] = 'p'; baseMatrix[5][6] = 'o';
+  baseMatrix[5][7] = 'i'; baseMatrix[5][8] = 'u'; baseMatrix[5][9] = 'y'; baseMatrix[5][10] = 't';
+  baseMatrix[5][11] = 'r'; baseMatrix[5][12] = 'e'; baseMatrix[5][13] = 'w'; baseMatrix[5][14] = 'q';
+  baseMatrix[5][15] = KEY_TAB;
+
+  baseMatrix[6][0] = '`'; baseMatrix[6][1] = KEY_HOME; baseMatrix[6][2] = KEY_INSERT;
+  baseMatrix[6][3] = KEY_BACKSPACE; baseMatrix[6][4] = '='; baseMatrix[6][5] = '-';
+  baseMatrix[6][6] = '0'; baseMatrix[6][7] = '9'; baseMatrix[6][8] = '8'; baseMatrix[6][9] = '7';
+  baseMatrix[6][10] = '6'; baseMatrix[6][11] = '5'; baseMatrix[6][12] = '4'; baseMatrix[6][13] = '3';
+  baseMatrix[6][14] = '2'; baseMatrix[6][15] = '1';
+
+  baseMatrix[7][0] = KEY_ESC;
+  baseMatrix[7][1] = 0xD0; baseMatrix[7][2] = 0xCF; baseMatrix[7][3] = 0xCE;
+  baseMatrix[7][4] = KEY_F12; baseMatrix[7][5] = KEY_F11; baseMatrix[7][6] = KEY_F10; baseMatrix[7][7] = KEY_F9;
+  baseMatrix[7][8] = KEY_F8; baseMatrix[7][9] = KEY_F7; baseMatrix[7][10] = KEY_F6; baseMatrix[7][11] = KEY_F5;
+  baseMatrix[7][12] = KEY_F4; baseMatrix[7][13] = KEY_F3; baseMatrix[7][14] = KEY_F2; baseMatrix[7][15] = KEY_F1;
+
+  baseMatrix[8][0] = K_MC; baseMatrix[8][2] = K_ME; baseMatrix[8][3] = K_M12;
+  baseMatrix[8][4] = K_M11; baseMatrix[8][5] = K_M10; baseMatrix[8][6] = K_M9; baseMatrix[8][7] = K_M8;
+  baseMatrix[8][8] = K_M7; baseMatrix[8][9] = K_M6; baseMatrix[8][10] = K_M5; baseMatrix[8][11] = K_M4;
+  baseMatrix[8][12] = K_M3; baseMatrix[8][13] = K_M2; baseMatrix[8][14] = K_M1; baseMatrix[8][15] = K_MR;
+}
+
+void recoverI2CBus() {
+  Wire.end();
+  delay(10);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  Wire.setTimeOut(25);
+  if (mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
+    for (int c = 0; c < numCols; c++) {
+      mcp.pinMode(c, OUTPUT);
+      mcp.digitalWrite(c, HIGH);
+    }
+  }
+}
+
+// 辅助：执行 CMB 组合键动作
+void executeComboAction(String cmb) {
+  while (cmb.length() > 0) {
+    int comma = cmb.indexOf(',');
+    uint8_t code = (comma == -1) ? cmb.toInt() : cmb.substring(0, comma).toInt();
+    if (code > 0) Keyboard.press(code);
+    if (comma == -1) break;
+    cmb = cmb.substring(comma + 1);
+  }
+  delay(50);
+  Keyboard.releaseAll();
+}
+
+// 辅助：执行 SEQ 击键流
+void executeSequenceAction(String seq) {
+  int i = 0;
+  while (i < seq.length()) {
+    if (seq[i] == '[') {
+      int endB = seq.indexOf(']', i);
+      if (endB != -1) {
+        String tag = seq.substring(i + 1, endB);
+        bool matched = true;
+        if (tag == "ENTER") Keyboard.write(KEY_RETURN);
+        else if (tag == "TAB") Keyboard.write(KEY_TAB);
+        else if (tag == "ESC") Keyboard.write(KEY_ESC);
+        else if (tag == "BACKSPACE") Keyboard.write(KEY_BACKSPACE);
+        else matched = false;
+        if (matched) { i = endB + 1; continue; }
+      }
+    }
+    Keyboard.print(seq[i++]);
+    delay(5);
+  }
+}
+
+String getMacroNameByCode(uint16_t code) {
+  if (code >= K_M1 && code <= K_M12) return "M" + String(code - K_M1 + 1);
+  if (code == K_MA) return "MA";
+  if (code == K_MB) return "MB";
+  if (code == K_MC) return "MC";
+  if (code == K_MR) return "MR";
+  if (code == K_ME) return "ME";
+  if (code == K_LOGO) return "LOGO";
+  return "";
+}
+
+// 【关键增强 2】：支持切换方案同时触发组合键
+void executeGlobalKey(String gKey) {
+  String val = preferences.getString(("g_" + gKey).c_str(), "");
+  if (val.length() == 0) {
+    if (gKey == "MA") switchProfile(0);
+    else if (gKey == "MB") switchProfile(1);
+    return;
+  }
+
+  // 1. 处理方案切换部分
+  if (val.startsWith("SW:")) {
+    int plusIdx = val.indexOf('+');
+    String swPart = (plusIdx != -1) ? val.substring(3, plusIdx) : val.substring(3);
+    if (swPart == "NEXT") switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+    else if (swPart != "NONE") switchProfile(swPart.toInt());
+
+    // 若后面还拼接了组合键 (如 SW:0+CMB:128,130,116)
+    if (plusIdx != -1) {
+      String extra = val.substring(plusIdx + 1);
+      if (extra.startsWith("CMB:")) {
+        executeComboAction(extra.substring(4));
+      } else if (extra.startsWith("SEQ:")) {
+        executeSequenceAction(extra.substring(4));
+      }
+    }
+    return;
+  }
+
+  // 2. 纯组合按键或击键流
+  if (val.startsWith("CMB:")) {
+    executeComboAction(val.substring(4));
+  } else if (val.startsWith("SEQ:")) {
+    executeSequenceAction(val.substring(4));
+  }
+}
+
+// 【关键增强 3 & 4】：M1~M12 宏支持打字 (SEQ:) 与 任意组合键 (CMB:)
 void executeMacro(String keyName) {
   if (keyName == "ME") {
     if (FFat.exists("/me_hex.txt")) {
@@ -613,256 +945,61 @@ void executeMacro(String keyName) {
     }
   }
 
-  String macroData = preferences.getString(keyName.c_str(), "");
+  char pKey[32];
+  snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, keyName.c_str());
+  String macroData = preferences.getString(pKey, "");
   if (macroData.length() == 0) return;
 
   if (macroData.startsWith("SEQ:")) {
-    String seq = macroData.substring(4);
-    int i = 0;
-    while (i < seq.length()) {
-      if (seq[i] == '[') {
-        int endBracket = seq.indexOf(']', i);
-        if (endBracket != -1) {
-          String tag = seq.substring(i + 1, endBracket);
-          bool matched = true;
-          if (tag == "ENTER") Keyboard.write(KEY_RETURN);
-          else if (tag == "TAB") Keyboard.write(KEY_TAB);
-          else if (tag == "ESC") Keyboard.write(KEY_ESC);
-          else if (tag == "BACKSPACE") Keyboard.write(KEY_BACKSPACE);
-          else matched = false;
-          if (matched) {
-            i = endBracket + 1;
-            continue;
-          }
-        }
-      }
-      Keyboard.print(seq[i++]);
-      delay(5);
-    }
+    executeSequenceAction(macroData.substring(4));
   } else if (macroData.startsWith("CMB:")) {
-    String cmb = macroData.substring(4);
-    int commaIdx = 0;
-    while (cmb.length() > 0) {
-      commaIdx = cmb.indexOf(',');
-      uint8_t kCode = (commaIdx == -1) ? cmb.toInt() : cmb.substring(0, commaIdx).toInt();
-      if (kCode > 0) Keyboard.press(kCode);
-      if (commaIdx == -1) break;
-      cmb = cmb.substring(commaIdx + 1);
+    executeComboAction(macroData.substring(4));
+  }
+}
+
+// 【关键增强 5】：MR 现场录制在组合键模式（CMB）下，自动保存为 CMB 格式
+void finishMacroRecording(String targetKey) {
+  if (recKeyCount == 0) {
+    currentSysMode = SYS_MODE_NORMAL;
+    displayStatusCN("取消录制", ST77XX_RED);
+    delay(300);
+    renderMainDashboard();
+    return;
+  }
+
+  String payload = "";
+  if (currentSysMode == SYS_MODE_REC_SEQ) {
+    payload = "SEQ:";
+    for (int i = 0; i < recKeyCount; i++) {
+      uint16_t c = recKeyBuffer[i];
+      if (c == KEY_RETURN) payload += "[ENTER]";
+      else if (c == KEY_TAB) payload += "[TAB]";
+      else if (c == KEY_ESC) payload += "[ESC]";
+      else if (c == KEY_BACKSPACE) payload += "[BACKSPACE]";
+      else if (c >= 32 && c <= 126) payload += (char)c;
     }
-    delay(50);
-    Keyboard.releaseAll();
-  }
-}
-
-String getMacroNameByCode(uint16_t code) {
-  switch (code) {
-    case K_M1: return "M1";
-    case K_M2: return "M2";
-    case K_M3: return "M3";
-    case K_M4: return "M4";
-    case K_M5: return "M5";
-    case K_M6: return "M6";
-    case K_M7: return "M7";
-    case K_M8: return "M8";
-    case K_M9: return "M9";
-    case K_M10: return "M10";
-    case K_M11: return "M11";
-    case K_M12: return "M12";
-    case K_MA: return "MA";
-    case K_MB: return "MB";
-    case K_MC: return "MC";
-    case K_MR: return "MR";
-    case K_ME: return "ME";
-    case K_LOGO: return "LOGO";
-    default: return "";
-  }
-}
-
-String getKeyDisplayName(uint16_t code) {
-  if (code >= MACRO_BASE) {
-    if (code == K_NEXT) return "NEXT";
-    if (code == K_PLAY) return "PLAY";
-    if (code == K_PREV) return "PREV";
-    if (code == K_FN) return "FN";
-    String mName = getMacroNameByCode(code);
-    if (mName.length() > 0) return mName;
-    return "MACRO";
-  }
-  switch (code) {
-    case KEY_LEFT_CTRL:   return "L-Ctrl";
-    case KEY_LEFT_SHIFT:  return "L-Shift";
-    case KEY_LEFT_ALT:    return "L-Alt";
-    case KEY_LEFT_GUI:    return "Win";
-    case KEY_RIGHT_CTRL:  return "R-Ctrl";
-    case KEY_RIGHT_SHIFT: return "R-Shift";
-    case KEY_RIGHT_ALT:   return "R-Alt";
-    case KEY_UP_ARROW:    return "UP";
-    case KEY_DOWN_ARROW:  return "DOWN";
-    case KEY_LEFT_ARROW:  return "LEFT";
-    case KEY_RIGHT_ARROW: return "RIGHT";
-    case KEY_RETURN:      return "Enter";
-    case KEY_ESC:         return "ESC";
-    case KEY_BACKSPACE:   return "BackSp";
-    case KEY_TAB:         return "Tab";
-    case KEY_CAPS_LOCK:   return "Caps";
-    case ' ':             return "Space";
-    default: break;
-  }
-  if (code >= 33 && code <= 126) return String((char)code);
-  char hexBuf[10];
-  snprintf(hexBuf, sizeof(hexBuf), "0x%02X", code);
-  return String(hexBuf);
-}
-
-void initKeyMatrix() {
-  keyMatrix[0][0] = KEY_LEFT_ALT;
-  keyMatrix[0][1] = 0xE9;
-  keyMatrix[0][2] = 0xE8;
-  keyMatrix[0][3] = 0xE7;
-  keyMatrix[0][4] = 0xDE;
-  keyMatrix[0][5] = 0xDD;
-  keyMatrix[0][6] = 0xDC;
-  keyMatrix[0][7] = 0xDB;
-  keyMatrix[0][8] = KEY_RIGHT_ARROW;
-  keyMatrix[0][9] = KEY_DOWN_ARROW;
-  keyMatrix[0][10] = KEY_LEFT_ARROW;
-  keyMatrix[0][11] = KEY_RIGHT_CTRL;
-  keyMatrix[0][12] = 0xED;
-  keyMatrix[0][13] = K_FN;
-  keyMatrix[0][14] = KEY_RIGHT_ALT;
-  keyMatrix[0][15] = ' ';
-
-  keyMatrix[1][0] = 0xDF;
-  keyMatrix[1][1] = K_MB;
-  keyMatrix[1][2] = K_MA;
-  keyMatrix[1][3] = K_NEXT;
-  keyMatrix[1][4] = K_PLAY;
-  keyMatrix[1][5] = K_PREV;
-  keyMatrix[1][6] = K_LOGO;
-  keyMatrix[1][7] = 0xE0;
-  keyMatrix[1][8] = 0xEB;
-  keyMatrix[1][9] = 0xEA;
-  keyMatrix[1][10] = 0xE3;
-  keyMatrix[1][11] = 0xE2;
-  keyMatrix[1][12] = 0xE1;
-  keyMatrix[1][13] = 0xE6;
-  keyMatrix[1][14] = 0xE5;
-  keyMatrix[1][15] = 0xE4;
-
-  keyMatrix[2][0] = KEY_LEFT_SHIFT;
-  keyMatrix[2][1] = KEY_LEFT_GUI;
-  keyMatrix[2][2] = KEY_LEFT_CTRL;
-  keyMatrix[2][3] = KEY_UP_ARROW;
-  keyMatrix[2][4] = KEY_RIGHT_SHIFT;
-  keyMatrix[2][5] = '/';
-  keyMatrix[2][6] = '.';
-  keyMatrix[2][7] = ',';
-  keyMatrix[2][8] = 'm';
-  keyMatrix[2][9] = 'n';
-  keyMatrix[2][10] = 'b';
-  keyMatrix[2][11] = 'v';
-  keyMatrix[2][12] = 'c';
-  keyMatrix[2][13] = 'x';
-  keyMatrix[2][14] = 'z';
-
-  keyMatrix[4][0] = KEY_END;
-  keyMatrix[4][1] = KEY_RETURN;
-  keyMatrix[4][3] = '\'';
-  keyMatrix[4][4] = ';';
-  keyMatrix[4][5] = 'l';
-  keyMatrix[4][6] = 'k';
-  keyMatrix[4][7] = 'j';
-  keyMatrix[4][8] = 'h';
-  keyMatrix[4][9] = 'g';
-  keyMatrix[4][10] = 'f';
-  keyMatrix[4][11] = 'd';
-  keyMatrix[4][12] = 's';
-  keyMatrix[4][13] = 'a';
-  keyMatrix[4][14] = KEY_CAPS_LOCK;
-  keyMatrix[4][15] = 0xD6;
-
-  keyMatrix[5][0] = KEY_PAGE_UP;
-  keyMatrix[5][1] = KEY_DELETE;
-  keyMatrix[5][2] = '\\';
-  keyMatrix[5][3] = ']';
-  keyMatrix[5][4] = '[';
-  keyMatrix[5][5] = 'p';
-  keyMatrix[5][6] = 'o';
-  keyMatrix[5][7] = 'i';
-  keyMatrix[5][8] = 'u';
-  keyMatrix[5][9] = 'y';
-  keyMatrix[5][10] = 't';
-  keyMatrix[5][11] = 'r';
-  keyMatrix[5][12] = 'e';
-  keyMatrix[5][13] = 'w';
-  keyMatrix[5][14] = 'q';
-  keyMatrix[5][15] = KEY_TAB;
-
-  keyMatrix[6][0] = '`';
-  keyMatrix[6][1] = KEY_HOME;
-  keyMatrix[6][2] = KEY_INSERT;
-  keyMatrix[6][3] = KEY_BACKSPACE;
-  keyMatrix[6][4] = '=';
-  keyMatrix[6][5] = '-';
-  keyMatrix[6][6] = '0';
-  keyMatrix[6][7] = '9';
-  keyMatrix[6][8] = '8';
-  keyMatrix[6][9] = '7';
-  keyMatrix[6][10] = '6';
-  keyMatrix[6][11] = '5';
-  keyMatrix[6][12] = '4';
-  keyMatrix[6][13] = '3';
-  keyMatrix[6][14] = '2';
-  keyMatrix[6][15] = '1';
-
-  keyMatrix[7][0] = KEY_ESC;
-  keyMatrix[7][1] = 0xD0;
-  keyMatrix[7][2] = 0xCF;
-  keyMatrix[7][3] = 0xCE;
-  keyMatrix[7][4] = KEY_F12;
-  keyMatrix[7][5] = KEY_F11;
-  keyMatrix[7][6] = KEY_F10;
-  keyMatrix[7][7] = KEY_F9;
-  keyMatrix[7][8] = KEY_F8;
-  keyMatrix[7][9] = KEY_F7;
-  keyMatrix[7][10] = KEY_F6;
-  keyMatrix[7][11] = KEY_F5;
-  keyMatrix[7][12] = KEY_F4;
-  keyMatrix[7][13] = KEY_F3;
-  keyMatrix[7][14] = KEY_F2;
-  keyMatrix[7][15] = KEY_F1;
-
-  keyMatrix[8][0] = K_MC;
-  keyMatrix[8][2] = K_ME;
-  keyMatrix[8][3] = K_M12;
-  keyMatrix[8][4] = K_M11;
-  keyMatrix[8][5] = K_M10;
-  keyMatrix[8][6] = K_M9;
-  keyMatrix[8][7] = K_M8;
-  keyMatrix[8][8] = K_M7;
-  keyMatrix[8][9] = K_M6;
-  keyMatrix[8][10] = K_M5;
-  keyMatrix[8][11] = K_M4;
-  keyMatrix[8][12] = K_M3;
-  keyMatrix[8][13] = K_M2;
-  keyMatrix[8][14] = K_M1;
-  keyMatrix[8][15] = K_MR;
-}
-
-void recoverI2CBus() {
-  Wire.end();
-  delay(10);
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);
-  Wire.setTimeOut(25);
-  if (mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
-    for (int c = 0; c < numCols; c++) {
-      mcp.pinMode(c, OUTPUT);
-      mcp.digitalWrite(c, HIGH);
+  } else if (currentSysMode == SYS_MODE_REC_CMB) {
+    // 录制为组合按键，触发时所有键同时按下并释放
+    payload = "CMB:";
+    for (int i = 0; i < recKeyCount; i++) {
+      payload += String(recKeyBuffer[i]);
+      if (i < recKeyCount - 1) payload += ",";
     }
   }
+
+  char pKey[32];
+  snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, targetKey.c_str());
+  preferences.putString(pKey, payload);
+
+  currentSysMode = SYS_MODE_NORMAL;
+  displayStatusCN("录制已保存", ST77XX_GREEN);
+  delay(400);
+  renderMainDashboard();
 }
 
+void handleMenuSelect();
+
+// ================= 键盘扫描与事件处理 =================
 void scanKeyboardMatrix() {
   static unsigned long lastI2CCheck = 0;
   if (millis() - lastI2CCheck > 500) {
@@ -885,55 +1022,124 @@ void scanKeyboardMatrix() {
           lastState[r][c] = currentState;
           lastDebounceTime[r][c] = millis();
 
-          uint16_t keycode = keyMatrix[r][c];
-          if (keycode == 0) continue;
+          uint16_t baseKey = baseMatrix[r][c];
+          if (baseKey == 0) continue;
 
+          // ---------------- 按键按下 ----------------
           if (currentState) {
-            String kName = getKeyDisplayName(keycode);
-            displayStatus(kName, ST77XX_GREEN);
+            totalKeyCount++;
 
-            // 本地零延迟直接触发按键反馈灯效
+            // 1. 菜单模式接管
+            if (currentSysMode == SYS_MODE_MENU) {
+              if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
+                menuCursor = (menuCursor == 0) ? MENU_TOTAL_ITEMS - 1 : menuCursor - 1;
+                drawMenuUI();
+              } else if (baseKey == KEY_DOWN_ARROW || baseKey == KEY_RIGHT_ARROW) {
+                menuCursor = (menuCursor + 1) % MENU_TOTAL_ITEMS;
+                drawMenuUI();
+              } else if (baseKey == KEY_RETURN) {
+                handleMenuSelect();
+              } else if (baseKey == KEY_ESC || baseKey == K_MC) {
+                currentSysMode = SYS_MODE_NORMAL;
+                renderMainDashboard();
+              }
+              return;
+            }
+
+            // 2. MR 宏现场录制
+            if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+              if (baseKey >= K_M1 && baseKey <= K_M12) {
+                finishMacroRecording(getMacroNameByCode(baseKey));
+                return;
+              }
+              if (baseKey == K_MR) {
+                if (currentSysMode == SYS_MODE_REC_SEQ) {
+                  currentSysMode = SYS_MODE_REC_CMB;
+                  recKeyCount = 0;
+                  displayStatusCN("录制组合模式", ST77XX_MAGENTA);
+                } else {
+                  currentSysMode = SYS_MODE_NORMAL;
+                  displayStatusCN("录制已取消", ST77XX_RED);
+                  delay(300);
+                  renderMainDashboard();
+                }
+                return;
+              }
+              if (recKeyCount < MAX_REC_KEYS && baseKey < MACRO_BASE) {
+                recKeyBuffer[recKeyCount++] = baseKey;
+              }
+              return;
+            }
+
+            // 3. MC 系统菜单键
+            if (baseKey == K_MC) {
+              currentSysMode = SYS_MODE_MENU;
+              menuCursor = 0;
+              drawMenuUI();
+              return;
+            }
+
+            // 4. MA / MB 全局键
+            if (baseKey == K_MA) {
+              executeGlobalKey("MA");
+              return;
+            } else if (baseKey == K_MB) {
+              executeGlobalKey("MB");
+              return;
+            }
+
+            // 5. MR 录制键
+            if (baseKey == K_MR) {
+              currentSysMode = SYS_MODE_REC_SEQ;
+              recKeyCount = 0;
+              displayStatusCN("录制击键流", ST77XX_YELLOW);
+              return;
+            }
+
+            if (currentSysMode == SYS_MODE_LOGO_VIEW) {
+              currentSysMode = SYS_MODE_NORMAL;
+              renderMainDashboard();
+            }
+
             if (cherryLogoEnabled) triggerKeyReaction();
 
-            if (keycode == K_FN) {
+            // 6. 普通按键及小键盘
+            if (baseKey == K_FN) {
               fnPressed = true;
-            } else if (keycode >= MACRO_BASE) {
-              if (keycode == K_LOGO && fnPressed) {
-                sysState = SYS_REBOOT;
-                delay(100);
+            } else if (baseKey >= MACRO_BASE) {
+              if (baseKey == K_LOGO && fnPressed) {
                 esp_restart();
-              } else if (keycode == K_PLAY) {
-                if (fnPressed) {
-                  SystemControl.press(SYSTEM_CONTROL_STANDBY);
-                  SystemControl.release();
-                } else ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
-              } else if (keycode == K_NEXT) {
-                if (fnPressed) {
-                  SystemControl.press(SYSTEM_CONTROL_WAKE_HOST);
-                  SystemControl.release();
-                  Keyboard.press(' ');
-                  Keyboard.release(' ');
-                } else ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
-              } else if (keycode == K_PREV) {
-                if (fnPressed) {
-                  SystemControl.press(SYSTEM_CONTROL_POWER_OFF);
-                  SystemControl.release();
-                } else ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
-              } else if (keycode != K_LOGO) {
-                executeMacro(getMacroNameByCode(keycode));
+              } else if (baseKey == K_PLAY) {
+                if (fnPressed) { SystemControl.press(SYSTEM_CONTROL_STANDBY); SystemControl.release(); }
+                else ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
+              } else if (baseKey == K_NEXT) {
+                if (fnPressed) { SystemControl.press(SYSTEM_CONTROL_WAKE_HOST); SystemControl.release(); Keyboard.write(' '); }
+                else ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
+              } else if (baseKey == K_PREV) {
+                if (fnPressed) { SystemControl.press(SYSTEM_CONTROL_POWER_OFF); SystemControl.release(); }
+                else ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
+              } else if (baseKey != K_LOGO) {
+                executeMacro(getMacroNameByCode(baseKey));
               }
             } else {
-              Keyboard.press((uint8_t)keycode);
+              uint16_t mappedKey = getMappedKey(baseKey);
+              Keyboard.press((uint8_t)mappedKey);
             }
-          } else {
-            if (keycode == K_FN) {
+          }
+          // ---------------- 按键释放 ----------------
+          else {
+            if (currentSysMode == SYS_MODE_MENU || currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+              return;
+            }
+            if (baseKey == K_FN) {
               fnPressed = false;
-            } else if (keycode < MACRO_BASE) {
-              Keyboard.release((uint8_t)keycode);
+            } else if (baseKey < MACRO_BASE) {
+              uint16_t mappedKey = getMappedKey(baseKey);
+              Keyboard.release((uint8_t)mappedKey);
             } else {
-              if (keycode == K_PLAY || keycode == K_NEXT || keycode == K_PREV) {
+              if (baseKey == K_PLAY || baseKey == K_NEXT || baseKey == K_PREV) {
                 ConsumerControl.release();
-              } else if (keycode == K_LOGO) {
+              } else if (baseKey == K_LOGO) {
                 if (!fnPressed) {
                   cherryLogoEnabled = !cherryLogoEnabled;
                   preferences.putBool("cherryLogo", cherryLogoEnabled);
@@ -949,102 +1155,111 @@ void scanKeyboardMatrix() {
   mcp.writeGPIOAB(0xFFFF);
 }
 
-// ================= C3 事件接收与统一决策中心 =================
+void handleMenuSelect() {
+  switch (menuCursor) {
+    case 0:
+      currentSysMode = SYS_MODE_NORMAL;
+      renderMainDashboard();
+      break;
+    case 1:
+      switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+      break;
+    case 2:
+      currentSysMode = SYS_MODE_LOGO_VIEW;
+      renderLogoFromFile();
+      break;
+    case 3:
+      currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+      if (currentEffect == 0) currentEffect = 1;
+      drawMenuUI();
+      break;
+    case 4:
+      keypressStyle = (keypressStyle + 1) % 24;
+      triggerKeyReaction();
+      drawMenuUI();
+      break;
+    case 5:
+      totalKeyCount = 0;
+      preferences.putUInt("keyCount", 0);
+      displayStatusCN("计数已清零", ST77XX_GREEN);
+      delay(400);
+      drawMenuUI();
+      break;
+  }
+}
+
 void handleC3Events() {
   static String serialBuffer = "";
   while (Serial1.available() > 0) {
     char c = Serial1.read();
     if (c == '\n') {
       serialBuffer.trim();
+
       if (serialBuffer == "PONG") {
         c3Connected = true;
-      } 
-      // 1. 旋钮动作处理
+      }
       else if (serialBuffer.startsWith("ENC:")) {
         bool isRight = (serialBuffer == "ENC:+");
-        if (g_forceOff) g_forceOff = false;
-
-        if (currentMode == MODE_LIGHT) {
-          if (isRight) brightness = (brightness <= 200) ? brightness + 20 : 220;
-          else brightness = (brightness >= 20) ? brightness - 20 : 0;
-          displayStatus("LED " + String((brightness * 100) / 220) + "%", ST77XX_MAGENTA);
-        } else if (currentMode == MODE_SCREEN_BRIGHTNESS) {
-          if (isRight) {
-            ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_INCREMENT);
-            ConsumerControl.release();
-            displayStatus("SCR BRT +", ST77XX_CYAN);
-          } else {
-            ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_DECREMENT);
-            ConsumerControl.release();
-            displayStatus("SCR BRT -", ST77XX_CYAN);
+        if (currentSysMode == SYS_MODE_MENU) {
+          if (isRight) menuCursor = (menuCursor + 1) % MENU_TOTAL_ITEMS;
+          else menuCursor = (menuCursor == 0) ? MENU_TOTAL_ITEMS - 1 : menuCursor - 1;
+          drawMenuUI();
+        } else {
+          if (g_forceOff) g_forceOff = false;
+          if (currentMode == MODE_LIGHT) {
+            if (isRight) brightness = (brightness <= 200) ? brightness + 20 : 220;
+            else brightness = (brightness >= 20) ? brightness - 20 : 0;
+          } else if (currentMode == MODE_SCREEN_BRIGHTNESS) {
+            if (isRight) { ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_INCREMENT); ConsumerControl.release(); }
+            else { ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_DECREMENT); ConsumerControl.release(); }
+          } else if (currentMode == MODE_MUTE) {
+            if (isRight) { ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT); ConsumerControl.release(); }
+            else { ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT); ConsumerControl.release(); }
+          } else if (currentMode == MODE_CPG) {
+            if (isRight) currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+            else currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
+          } else if (currentMode == MODE_KEY_COLOR) {
+            if (isRight) keypressStyle = (keypressStyle + 1) % 24;
+            else keypressStyle = (keypressStyle == 0) ? 23 : keypressStyle - 1;
+            triggerKeyReaction();
           }
-        } else if (currentMode == MODE_MUTE) {
-          if (isRight) {
-            ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
-            ConsumerControl.release();
-            displayStatus("VOL +", ST77XX_RED);
-          } else {
-            ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
-            ConsumerControl.release();
-            displayStatus("VOL -", ST77XX_RED);
-          }
-        } else if (currentMode == MODE_CPG) {
-          if (isRight) currentEffect = (currentEffect + 1) % MAX_EFFECTS;
-          else currentEffect = (currentEffect == 0) ? MAX_EFFECTS - 1 : currentEffect - 1;
-          displayStatus("EFFECT " + String(currentEffect), ST77XX_ORANGE);
-        } else if (currentMode == MODE_KEY_COLOR) {
-          if (isRight) keypressStyle = (keypressStyle + 1) % 24;
-          else keypressStyle = (keypressStyle == 0) ? 23 : keypressStyle - 1;
-          displayStatus("KEY STYLE " + String(keypressStyle), ST77XX_YELLOW);
+        }
+      }
+      else if (serialBuffer == "BTN:KNOB") {
+        if (currentSysMode == SYS_MODE_MENU) {
+          handleMenuSelect();
+        } else {
+          if (g_forceOff) g_forceOff = false;
+          currentMode = MODE_KEY_COLOR;
           triggerKeyReaction();
         }
       }
-      // 2. 按键动作处理
       else if (serialBuffer == "BTN:LIGHT") {
         if (g_forceOff) {
           g_forceOff = false;
           currentMode = MODE_LIGHT;
-          displayStatus("LIGHTS ON", ST77XX_GREEN);
         } else {
-          // 单击：在键盘亮度与屏幕亮度之间循环切换
-          if (currentMode == MODE_LIGHT) {
-            currentMode = MODE_SCREEN_BRIGHTNESS;
-            displayStatus("SCR BRIGHT", ST77XX_CYAN);
-          } else {
-            currentMode = MODE_LIGHT;
-            displayStatus("LED BRIGHT", ST77XX_GREEN);
-          }
+          currentMode = (currentMode == MODE_LIGHT) ? MODE_SCREEN_BRIGHTNESS : MODE_LIGHT;
         }
       } else if (serialBuffer == "BTN:LIGHT_HOLD") {
         g_forceOff = !g_forceOff;
-        displayStatus(g_forceOff ? "ALL OFF" : "ALL ON", ST77XX_RED);
       } else if (serialBuffer == "BTN:MUTE") {
         if (g_forceOff) g_forceOff = false;
         currentMode = MODE_MUTE;
-        displayStatus("MUTE MODE", ST77XX_RED);
       } else if (serialBuffer == "BTN:MUTE_HOLD") {
-        displayStatus("REBOOT...", ST77XX_RED);
-        delay(100);
+        delay(200);
         esp_restart();
       } else if (serialBuffer == "BTN:CPG") {
         if (g_forceOff) g_forceOff = false;
-        if (currentMode != MODE_CPG) {
-          currentMode = MODE_CPG;
-        } else {
+        if (currentMode != MODE_CPG) currentMode = MODE_CPG;
+        else {
           currentEffect = (currentEffect + 1) % MAX_EFFECTS;
           if (currentEffect == 0) currentEffect = 1;
         }
-        displayStatus("CPG EFF " + String(currentEffect), ST77XX_ORANGE);
       } else if (serialBuffer == "BTN:CPG_HOLD") {
-        displayStatus("ROOT BOOT", ST77XX_RED);
-        delay(100);
+        delay(200);
         REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
         esp_restart();
-      } else if (serialBuffer == "BTN:KNOB") {
-        if (g_forceOff) g_forceOff = false;
-        currentMode = MODE_KEY_COLOR;
-        displayStatus("KEY COLOR", ST77XX_YELLOW);
-        triggerKeyReaction();
       }
 
       serialBuffer = "";
@@ -1060,11 +1275,15 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
 
+  setenv("TZ", "CST-8", 1);
+  tzset();
+
   USB.VID(0x303A);
   USB.PID(0x001F);
   USB.productName("YYQ-MX9.0");
   USB.manufacturerName("YYQ");
 
+  Keyboard.onEvent(usbHidKeyboardEvent);
   Keyboard.begin();
   ConsumerControl.begin();
   SystemControl.begin();
@@ -1073,23 +1292,34 @@ void setup() {
   tftSPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS);
   tft.init(240, 240);
   tft.setRotation(1);
-  initScreenUI();
+
+  u8g2.begin(tft);
+  u8g2.setFontMode(1);
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   Wire.setTimeOut(25);
   if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) recoverI2CBus();
 
-  preferences.begin("macros", false);
+  preferences.begin("keyboard", false);
+  currentProfile = preferences.getUChar("curr_prof", 0);
+  if (currentProfile >= TOTAL_PROFILES) currentProfile = 0;
   cherryLogoEnabled = preferences.getBool("cherryLogo", false);
+  totalKeyCount = preferences.getUInt("keyCount", 0);
+  customMarquee = preferences.getString("marquee", "YYQ Studio - 极客机械大师");
+
   FFat.begin(true);
-  initKeyMatrix();
+  initBaseMatrix();
+  loadRemapsFromStorage();
 
   for (int c = 0; c < numCols; c++) {
     mcp.pinMode(c, OUTPUT);
     mcp.digitalWrite(c, HIGH);
   }
   for (int r = 0; r < numRows; r++) { pinMode(rowPins[r], INPUT_PULLUP); }
+
+  renderMainDashboard();
 
   BLEDevice::init("YYQ-MX9.0");
   BLEDevice::setMTU(517);
@@ -1113,17 +1343,16 @@ void setup() {
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
 #endif
-  Serial.println("S3 主控全流程启动完毕");
+  Serial.println("YYQ S3 系统就绪：按键特效背景自动避让与双重动作宏已就绪");
 }
 
 unsigned long lastScanTime = 0;
-const unsigned long SCAN_INTERVAL = 3;
+const unsigned long SCAN_INTERVAL = 2;
 
 // ================= LOOP =================
 void loop() {
   esp_task_wdt_reset();
 
-  // 1. 蓝牙维护
   if (!deviceConnected && oldDeviceConnected) {
     delay(500);
     BLEDevice::startAdvertising();
@@ -1131,27 +1360,55 @@ void loop() {
   }
   if (deviceConnected && !oldDeviceConnected) oldDeviceConnected = deviceConnected;
 
-  // 2. 心跳监测
   if (millis() - lastPingTime > 2000) {
     lastPingTime = millis();
     uint8_t pingPacket[] = { 0xAA, 0x55, 0x02, 0xEE };
     Serial1.write(pingPacket, sizeof(pingPacket));
   }
 
-  // 3. 处理 C3 上报的物理事件
   handleC3Events();
 
-  // 4. 键盘矩阵扫描 (按键极速响应)
   if (millis() - lastScanTime >= SCAN_INTERVAL) {
     lastScanTime = millis();
     scanKeyboardMatrix();
   }
 
-  // 5. 50 FPS 灯光引擎计算与推流 (每 20ms 一帧)
   if (millis() - lastLedFrameTime >= 20) {
     lastLedFrameTime = millis();
     renderLightingEngine();
     sendLedFrameToC3();
+  }
+
+  if (currentSysMode == SYS_MODE_NORMAL) {
+    drawLockIndicators();
+    updateMarquee();
+    if (millis() - lastTimeUpdate > 1000) {
+      lastTimeUpdate = millis();
+
+      time_t now = time(nullptr);
+      struct tm* timeinfo = localtime(&now);
+      char timeStr[16];
+      if (timeinfo && timeinfo->tm_year > 120) strftime(timeStr, sizeof(timeStr), "%H:%M:%S", timeinfo);
+      else snprintf(timeStr, sizeof(timeStr), "--:--:--");
+
+      tft.fillRect(45, 65, 150, 30, ST77XX_BLACK);
+      tft.setTextSize(3);
+      tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+      tft.setCursor(50, 68);
+      tft.print(timeStr);
+
+      tft.fillRect(125, 122, 90, 22, ST77XX_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+      tft.setCursor(125, 124);
+      tft.print(totalKeyCount);
+
+      static uint32_t lastSavedCount = 0;
+      if (totalKeyCount - lastSavedCount > 500) {
+        lastSavedCount = totalKeyCount;
+        preferences.putUInt("keyCount", totalKeyCount);
+      }
+    }
   }
 
   delay(1);
