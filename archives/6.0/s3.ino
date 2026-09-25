@@ -118,6 +118,7 @@ bool lastScrollLock = false;
 enum KeyboardSysMode {
   SYS_MODE_NORMAL,
   SYS_MODE_MENU,
+  SYS_MODE_STYLE_PREVIEW,
   SYS_MODE_REC_SEQ,
   SYS_MODE_REC_CMB,
   SYS_MODE_SLEEP
@@ -132,6 +133,10 @@ enum ScreenDashboardMode {
 };
 uint8_t currentDispMode = DISP_MODE_GEEK;
 bool screenNeedsRedraw = true; // 仅在模式变更/全屏初始化时为 true
+
+const uint8_t TOTAL_DISP_MODES = 4;
+const char* dispModeNamesCN[TOTAL_DISP_MODES] = { "极客仪表盘", "大字时钟", "实时击键监控", "自定义壁纸" };
+uint8_t previewDispMode = DISP_MODE_GEEK; // 风格预览时临时选中的样式，确认后才写回 currentDispMode
 
 uint32_t totalKeyCount = 0;
 uint32_t lastDrawnKeyCount = 0xFFFFFFFF;
@@ -231,6 +236,9 @@ void renderCurrentDisplayBase();
 void updateDynamicElements();
 void renderWallpaperView(bool drawOverlayTime = true);
 void triggerHud(const char* title, const char* value, int percent, uint16_t color);
+void renderStylePreview();
+void applyStylePreview();
+void cancelStylePreview();
 void handleCommand(String data);
 
 // ================= 色彩与灯效辅助 =================
@@ -478,6 +486,9 @@ void drawHudOverlay() {
     hud.active = false;
     hud.dirty = false;
     screenNeedsRedraw = true;
+    // 菜单/预览下没有差量引擎兜底，直接重画一次，避免 HUD 残影留在画面上
+    if (currentSysMode == SYS_MODE_STYLE_PREVIEW) renderStylePreview();
+    else if (currentSysMode == SYS_MODE_MENU) drawMenuUI();
     return;
   }
 
@@ -755,6 +766,51 @@ void drawMenuUI() {
     u8g2.setCursor(20, y + 20);
     u8g2.print(menuListCN[i]);
   }
+}
+
+// ================= 主屏风格预览（左右切换，二次确认才生效） =================
+void renderStylePreview() {
+  uint8_t savedDispMode = currentDispMode;
+  currentDispMode = previewDispMode;
+
+  // 完整画出该风格的真实底板，再补一次动态内容，预览不会是一片空白
+  renderCurrentDisplayBase();
+  updateDynamicElements();
+
+  // 底部预览提示条
+  const int barY = 202;
+  tft.fillRect(0, barY, 240, 240 - barY, ST77XX_BLACK);
+  tft.drawFastHLine(0, barY, 240, ST77XX_CYAN);
+
+  char line1[40];
+  snprintf(line1, sizeof(line1), "预览 %d/%d: %s",
+           previewDispMode + 1, TOTAL_DISP_MODES, dispModeNamesCN[previewDispMode]);
+
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_CYAN);
+  int w1 = u8g2.getUTF8Width(line1);
+  u8g2.setCursor((240 - w1) / 2, 219);
+  u8g2.print(line1);
+
+  const char* hint = "< > 切换   回车确认   ESC取消";
+  u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+  int w2 = u8g2.getUTF8Width(hint);
+  u8g2.setCursor((240 - w2) / 2, 236);
+  u8g2.print(hint);
+
+  currentDispMode = savedDispMode;
+}
+
+void applyStylePreview() {
+  currentDispMode = previewDispMode;
+  preferences.putUChar("disp_mode", currentDispMode);
+  currentSysMode = SYS_MODE_NORMAL;
+  screenNeedsRedraw = true;
+}
+
+void cancelStylePreview() {
+  currentSysMode = SYS_MODE_MENU;
+  drawMenuUI();
 }
 
 void updateMarquee() {
@@ -1330,7 +1386,23 @@ void scanKeyboardMatrix() {
             keyStrokeDisplayTime = millis();
             keystrokeNeedsRedraw = true;
 
-            // 1. 菜单模式接管
+            // 1. 风格预览接管：左右对比，回车二次确认，ESC/MC 放弃
+            if (currentSysMode == SYS_MODE_STYLE_PREVIEW) {
+              if (baseKey == KEY_LEFT_ARROW || baseKey == KEY_UP_ARROW) {
+                previewDispMode = (previewDispMode == 0) ? TOTAL_DISP_MODES - 1 : previewDispMode - 1;
+                renderStylePreview();
+              } else if (baseKey == KEY_RIGHT_ARROW || baseKey == KEY_DOWN_ARROW) {
+                previewDispMode = (previewDispMode + 1) % TOTAL_DISP_MODES;
+                renderStylePreview();
+              } else if (baseKey == KEY_RETURN) {
+                applyStylePreview();
+              } else if (baseKey == KEY_ESC || baseKey == K_MC) {
+                cancelStylePreview();
+              }
+              return;
+            }
+
+            // 2. 菜单模式接管
             if (currentSysMode == SYS_MODE_MENU) {
               if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
                 menuCursor = (menuCursor == 0) ? MENU_TOTAL_ITEMS - 1 : menuCursor - 1;
@@ -1347,7 +1419,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 2. MR 宏现场录制
+            // 3. MR 宏现场录制
             if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
               if (baseKey >= K_M1 && baseKey <= K_M12) {
                 finishMacroRecording(getMacroNameByCode(baseKey));
@@ -1372,7 +1444,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 3. MC 系统菜单键
+            // 4. MC 系统菜单键
             if (baseKey == K_MC) {
               currentSysMode = SYS_MODE_MENU;
               menuCursor = 0;
@@ -1380,7 +1452,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 4. MA / MB 全局键
+            // 5. MA / MB 全局键
             if (baseKey == K_MA) {
               executeGlobalKey("MA");
               return;
@@ -1389,7 +1461,7 @@ void scanKeyboardMatrix() {
               return;
             }
 
-            // 5. MR 录制键
+            // 6. MR 录制键
             if (baseKey == K_MR) {
               currentSysMode = SYS_MODE_REC_SEQ;
               recKeyCount = 0;
@@ -1399,7 +1471,7 @@ void scanKeyboardMatrix() {
 
             if (cherryLogoEnabled) triggerKeyReaction();
 
-            // 6. 普通按键及媒体按键
+            // 7. 普通按键及媒体按键
             if (baseKey == K_FN) {
               fnPressed = true;
             } else if (baseKey >= MACRO_BASE) {
@@ -1424,7 +1496,7 @@ void scanKeyboardMatrix() {
           }
           // ---------------- 按键释放 ----------------
           else {
-            if (currentSysMode == SYS_MODE_MENU || currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+            if (currentSysMode == SYS_MODE_MENU || currentSysMode == SYS_MODE_STYLE_PREVIEW || currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
               return;
             }
             if (baseKey == K_FN) {
@@ -1458,11 +1530,11 @@ void handleMenuSelect() {
       screenNeedsRedraw = true;
       break;
     case 1:
-      currentDispMode = (currentDispMode + 1) % 4;
-      preferences.putUChar("disp_mode", currentDispMode);
-      displayStatusCN("风格切换完成", ST77XX_GREEN);
-      delay(300);
-      drawMenuUI();
+      // 不做直接切换，先带着当前风格进入预览，让用户左右对比后再确认
+      previewDispMode = currentDispMode;
+      hud.active = false;
+      currentSysMode = SYS_MODE_STYLE_PREVIEW;
+      renderStylePreview();
       break;
     case 2:
       switchProfile((currentProfile + 1) % TOTAL_PROFILES);
@@ -1510,6 +1582,10 @@ void handleC3Events() {
           if (isRight) menuCursor = (menuCursor + 1) % MENU_TOTAL_ITEMS;
           else menuCursor = (menuCursor == 0) ? MENU_TOTAL_ITEMS - 1 : menuCursor - 1;
           drawMenuUI();
+        } else if (currentSysMode == SYS_MODE_STYLE_PREVIEW) {
+          if (isRight) previewDispMode = (previewDispMode + 1) % TOTAL_DISP_MODES;
+          else previewDispMode = (previewDispMode == 0) ? TOTAL_DISP_MODES - 1 : previewDispMode - 1;
+          renderStylePreview();
         } else {
           if (g_forceOff) g_forceOff = false;
           if (currentMode == MODE_LIGHT) {
@@ -1539,6 +1615,8 @@ void handleC3Events() {
       else if (serialBuffer == "BTN:KNOB") {
         if (currentSysMode == SYS_MODE_MENU) {
           handleMenuSelect();
+        } else if (currentSysMode == SYS_MODE_STYLE_PREVIEW) {
+          applyStylePreview(); // 二次确认，正式切换
         } else {
           if (g_forceOff) g_forceOff = false;
           currentMode = MODE_KEY_COLOR;
