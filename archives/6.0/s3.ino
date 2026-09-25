@@ -2,6 +2,7 @@
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 #include "USBHIDSystemControl.h"
+#include "USBHIDVendor.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -46,6 +47,7 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
 USBHIDSystemControl SystemControl;
+USBHIDVendor VendorHID;   // HID 厂商通道：电脑 -> 键盘 下行发指令，免驱、不占串口
 Preferences preferences;
 Adafruit_MCP23X17 mcp;
 
@@ -282,6 +284,49 @@ void safeDelayMs(unsigned long ms) {
   while (millis() - start < ms) {
     esp_task_wdt_reset();
     delay(1);
+  }
+}
+
+// ================= HID 厂商通道：电脑 -> 键盘 的指令下行 =================
+// 主机往 Report ID 6 的 Output/Feature 报告里写文本（以 \n 结尾），
+// 中断回调只负责落进环形缓冲，真正的解析放到主循环，避免占用 USB 事件任务栈。
+#define HID_RX_BUF_SIZE 512
+static volatile uint8_t hidRxBuf[HID_RX_BUF_SIZE];
+static volatile uint16_t hidRxHead = 0;
+static volatile uint16_t hidRxTail = 0;
+
+static inline void hidRxPush(char c) {
+  uint16_t next = (uint16_t)((hidRxHead + 1) % HID_RX_BUF_SIZE);
+  if (next != hidRxTail) { // 满了就丢，不阻塞 USB
+    hidRxBuf[hidRxHead] = (uint8_t)c;
+    hidRxHead = next;
+  }
+}
+
+static void onHidVendorEvent(void *arg, esp_event_base_t base, int32_t id, void *data) {
+  if (id != ARDUINO_USB_HID_VENDOR_OUTPUT_EVENT && id != ARDUINO_USB_HID_VENDOR_SET_FEATURE_EVENT) return;
+  const arduino_usb_hid_vendor_event_data_t *p = (const arduino_usb_hid_vendor_event_data_t *)data;
+  if (p == NULL || p->buffer == NULL) return;
+  for (uint16_t i = 0; i < p->len; i++) {
+    char c = (char)p->buffer[i];
+    if (c != '\0') hidRxPush(c); // 报告尾部补的零要丢掉
+  }
+}
+
+void handleHidVendorCommands() {
+  static String buf = "";
+  while (hidRxTail != hidRxHead) {
+    char c = (char)hidRxBuf[hidRxTail];
+    hidRxTail = (uint16_t)((hidRxTail + 1) % HID_RX_BUF_SIZE);
+    if (c == '\n' || c == '\r') {
+      buf.trim();
+      if (buf.length() > 0) handleCommand(buf);
+      buf = "";
+    } else if (buf.length() < 200) {
+      buf += c;
+    } else {
+      buf = ""; // 超长直接丢弃，防止野数据撑爆内存
+    }
   }
 }
 
@@ -1697,6 +1742,8 @@ void setup() {
   Keyboard.begin();
   ConsumerControl.begin();
   SystemControl.begin();
+  VendorHID.onEvent(onHidVendorEvent);
+  VendorHID.begin();
   USB.begin();
 
   // 1. 初始化高速 40MHz SPI 通道，杜绝总线传输延迟
@@ -1783,6 +1830,7 @@ void loop() {
   }
 
   handleUsbSerialCommands();
+  handleHidVendorCommands();
   handleC3Events();
 
   // 1. 键盘扫描：拥有最高优先级，保持绝对跟手
