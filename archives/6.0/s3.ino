@@ -190,7 +190,44 @@ bool g_forceOff = false;
 bool cherryLogoEnabled = false;
 
 enum AlertType { ALERT_NONE, ALERT_RED, ALERT_GREEN, ALERT_YELLOW };
-AlertType activeAlert = ALERT_NONE;
+
+// ================= 系统通知队列 =================
+// 主机下发的通知按到达顺序入队。屏幕和灯光都只展示"最新的一条"，
+// 用户每按一次灯光键处理掉最新的一条，前一条顶上来继续展示，直到清空。
+#define MAX_NOTIFS 8
+#define NOTIF_TEXT_LEN 128
+
+struct Notification {
+  AlertType type;
+  char text[NOTIF_TEXT_LEN];
+};
+
+Notification notifQueue[MAX_NOTIFS];
+uint8_t notifCount = 0;
+bool notifDirty = true; // 通知条内容变了，下一轮重绘一次
+
+// 当前生效的报警类型永远取队尾（最新）那条，灯和屏共用一个来源，不会各说各话
+AlertType currentAlertType() {
+  return (notifCount > 0) ? notifQueue[notifCount - 1].type : ALERT_NONE;
+}
+
+uint16_t alertColor(AlertType t) {
+  switch (t) {
+    case ALERT_RED:    return ST77XX_RED;
+    case ALERT_GREEN:  return ST77XX_GREEN;
+    case ALERT_YELLOW: return ST77XX_YELLOW;
+    default:           return ST77XX_CYAN;
+  }
+}
+
+const char* notifDefaultText(AlertType t) {
+  switch (t) {
+    case ALERT_RED:    return "系统报警通知";
+    case ALERT_GREEN:  return "系统提示通知";
+    case ALERT_YELLOW: return "系统警告通知";
+    default:           return "系统通知";
+  }
+}
 
 bool isReactionActive = false;
 int reactionStep = 0;
@@ -235,13 +272,193 @@ void displayStatusCN(const char* title, uint16_t color = ST77XX_GREEN);
 void switchProfile(uint8_t profIdx);
 void drawMenuUI();
 void renderCurrentDisplayBase();
-void updateDynamicElements();
+bool updateDynamicElements();
 void renderWallpaperView(bool drawOverlayTime = true);
 void triggerHud(const char* title, const char* value, int percent, uint16_t color);
 void renderStylePreview();
 void applyStylePreview();
 void cancelStylePreview();
 void handleCommand(String data);
+
+// ================= 系统通知：入队 / 出队 / 上屏 =================
+void pushNotification(AlertType type, const String& text) {
+  if (type == ALERT_NONE) return;
+
+  if (notifCount >= MAX_NOTIFS) {
+    // 队列满了就丢掉最旧的一条，把位置让给刚到的（新的更要紧）
+    for (uint8_t i = 0; i + 1 < MAX_NOTIFS; i++) notifQueue[i] = notifQueue[i + 1];
+    notifCount = MAX_NOTIFS - 1;
+  }
+
+  Notification& n = notifQueue[notifCount];
+  n.type = type;
+
+  const char* src = (text.length() > 0) ? text.c_str() : notifDefaultText(type);
+  uint8_t len = 0;
+  while (src[len] != '\0' && len < NOTIF_TEXT_LEN - 1) len++;
+  while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80) len--; // 别把汉字截成半个
+  memcpy(n.text, src, len);
+  n.text[len] = '\0';
+
+  notifCount++;
+  notifDirty = true;
+
+  // 通知是给人看的：屏幕正在省电息屏的话，先唤醒回主屏
+  lastActivityTime = millis();
+  if (currentSysMode == SYS_MODE_SLEEP) {
+    currentSysMode = SYS_MODE_NORMAL;
+    screenNeedsRedraw = true;
+  }
+}
+
+// 队列变化后让屏幕跟上。通知条是一整块不透明的卡片，擦除时没法局部还原
+// 它盖掉的底图，所以"整条要抹掉"的场景直接标记重画底板。
+void refreshNotifScreen(bool erasePanel) {
+  notifDirty = true;
+  if (currentSysMode == SYS_MODE_MENU) drawMenuUI();          // 菜单只刷右上角角标
+  else if (currentSysMode == SYS_MODE_STYLE_PREVIEW) return;  // 预览界面不挂通知条
+  else if (erasePanel) screenNeedsRedraw = true;
+}
+
+void clearAllNotifications() {
+  if (notifCount == 0) return;
+  notifCount = 0;
+  refreshNotifScreen(true);
+  triggerHud("通知已清空", "全部清除", -1, ST77XX_CYAN);
+}
+
+// 用户"我已知晓"：单击灯光键调用。只处理掉最新的一条，前一条顶上来继续
+// 展示（灯和屏一起跟着换），全清完之后灯自然就不闪了。
+bool acknowledgeAlert() {
+  if (notifCount == 0) return false;
+
+  notifCount--;
+  refreshNotifScreen(notifCount == 0);
+
+  if (notifCount == 0) {
+    triggerHud("通知已清空", "已全部处理", -1, ST77XX_GREEN);
+  } else {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "还剩 %d 条", notifCount);
+    triggerHud("已确认", buf, -1, ST77XX_GREEN);
+  }
+  return true;
+}
+
+// UTF-8 字符占几个字节
+static int utf8CharLen(const char* s, int off) {
+  unsigned char c = (unsigned char)s[off];
+  if (c < 0x80) return 1;
+  if ((c & 0xE0) == 0xC0) return 2;
+  if ((c & 0xF0) == 0xE0) return 3;
+  if ((c & 0xF8) == 0xF0) return 4;
+  return 1; // 非法首字节，按单字节吃掉，保证不死循环
+}
+
+// 按像素宽度把一段中文折成最多两行，第二行也放不下就用 … 收尾。
+// 调用前必须先把字体设成 wqy14，否则量出来的宽度是错的。
+void layoutNotifText(const char* src, char* l1, size_t s1, char* l2, size_t s2, int maxW) {
+  l1[0] = '\0';
+  l2[0] = '\0';
+  if (src == NULL || src[0] == '\0') return;
+
+  char buf[NOTIF_TEXT_LEN + 8];
+  char probe[NOTIF_TEXT_LEN + 16];
+  int n = 0;
+  bool onSecondLine = false;
+  int total = (int)strlen(src);
+
+  for (int off = 0; off < total;) {
+    int cl = utf8CharLen(src, off);
+    if (off + cl > total) cl = total - off;
+
+    memcpy(probe, buf, n);
+    memcpy(probe + n, src + off, cl);
+    probe[n + cl] = '\0';
+
+    if (n > 0 && u8g2.getUTF8Width(probe) > maxW) {
+      if (!onSecondLine) {
+        strncpy(l1, buf, s1 - 1);
+        l1[s1 - 1] = '\0';
+        onSecondLine = true;
+        n = 0;
+        buf[0] = '\0';
+        continue; // 同一个字挪到第二行再判一次
+      }
+      strncpy(l2, buf, s2 - 1);
+      l2[s2 - 1] = '\0';
+      if (strlen(l2) + 4 <= s2) strcat(l2, "…");
+      return;
+    }
+
+    memcpy(buf + n, src + off, cl);
+    n += cl;
+    buf[n] = '\0';
+    off += cl;
+  }
+
+  if (!onSecondLine) {
+    strncpy(l1, buf, s1 - 1);
+    l1[s1 - 1] = '\0';
+  } else {
+    strncpy(l2, buf, s2 - 1);
+    l2[s2 - 1] = '\0';
+  }
+}
+
+// 主屏底部的通知条：常驻显示、不自动消失，直到用户按灯光键逐条确认
+void drawNotifPanel() {
+  notifDirty = false;
+  if (notifCount == 0) return;
+
+  const Notification& n = notifQueue[notifCount - 1];
+  uint16_t col = alertColor(n.type);
+
+  const int px = 6, py = 168, pw = 228, ph = 70;
+  tft.fillRoundRect(px, py, pw, ph, 8, ST77XX_BLACK);
+  tft.drawRoundRect(px, py, pw, ph, 8, col);
+
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+
+  char l1[72], l2[72];
+  layoutNotifText(n.text, l1, sizeof(l1), l2, sizeof(l2), pw - 26 - 16);
+
+  tft.fillCircle(px + 14, py + 17, 5, col);
+
+  u8g2.setForegroundColor(col);
+  u8g2.setCursor(px + 26, py + 22);
+  u8g2.print(l1);
+
+  if (l2[0] != '\0') {
+    u8g2.setForegroundColor(ST77XX_WHITE);
+    u8g2.setCursor(px + 26, py + 43);
+    u8g2.print(l2);
+  }
+
+  u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+  u8g2.setCursor(px + 14, py + 64);
+  u8g2.print("单击灯光键确认");
+
+  char cnt[24];
+  snprintf(cnt, sizeof(cnt), "共%d条", notifCount);
+  u8g2.setForegroundColor(ST77XX_YELLOW);
+  u8g2.setCursor(px + pw - 14 - u8g2.getUTF8Width(cnt), py + 64);
+  u8g2.print(cnt);
+}
+
+// 菜单界面不挂整条通知条（会盖住菜单项），只在标题栏右上角亮个条数
+void drawNotifBadge() {
+  if (notifCount == 0) return;
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", notifCount);
+
+  tft.fillRoundRect(192, 6, 40, 20, 6, ST77XX_RED);
+  u8g2.setFont(u8g2_font_wqy14_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_WHITE);
+  u8g2.setCursor(192 + (40 - u8g2.getUTF8Width(buf)) / 2, 22);
+  u8g2.print(buf);
+}
 
 // ================= 色彩与灯效辅助 =================
 void setLedRGB(int index, uint8_t r, uint8_t g, uint8_t b) {
@@ -394,20 +611,33 @@ void handleCommand(String data) {
   data.trim();
   if (data.length() == 0) return;
 
-  if (data.startsWith("ALERT:")) {
-    String cmd = data.substring(6);
-    if (cmd == "RED") {
-      activeAlert = ALERT_RED;
-      triggerHud("系统报警", "红灯爆闪", -1, ST77XX_RED);
-    } else if (cmd == "GREEN") {
-      activeAlert = ALERT_GREEN;
-      triggerHud("系统通知", "绿灯闪烁", -1, ST77XX_GREEN);
-    } else if (cmd == "YELLOW") {
-      activeAlert = ALERT_YELLOW;
-      triggerHud("系统警告", "黄灯闪烁", -1, ST77XX_YELLOW);
-    } else if (cmd == "OFF" || cmd == "STOP") {
-      activeAlert = ALERT_NONE;
-      triggerHud("警报解除", "恢复常态", -1, ST77XX_CYAN);
+  // 通知指令：
+  //   ALERT:RED              -> 入队一条红灯报警，正文用默认名
+  //   ALERT:RED:磁盘空间不足  -> 入队一条红灯报警，正文自定义（可含冒号）
+  //   NOTIFY:开会了           -> 快捷写法，等同 ALERT:GREEN:开会了
+  //   ALERT:OFF / CLEAR      -> 一次性清空整个队列
+  bool isNotify = data.startsWith("NOTIFY:");
+  if (data.startsWith("ALERT:") || isNotify) {
+    String rest = data.substring(isNotify ? 7 : 6);
+    rest.trim();
+
+    // 整体就是 OFF/STOP/CLEAR/NONE 才算"全清"，避免把 NOTIFY:OFFLINE 这类正文误判
+    if (rest == "OFF" || rest == "STOP" || rest == "CLEAR" || rest == "NONE") {
+      clearAllNotifications();
+    } else if (isNotify) {
+      pushNotification(ALERT_GREEN, rest);
+    } else {
+      int sep = rest.indexOf(':'); // 只切第一个冒号，正文里的冒号原样保留
+      String typeTok = (sep < 0) ? rest : rest.substring(0, sep);
+      String body = (sep < 0) ? String("") : rest.substring(sep + 1);
+      typeTok.trim();
+      body.trim();
+      typeTok.toUpperCase(); // 只对 ASCII 的类型段做，正文不碰
+
+      if (typeTok == "RED" || typeTok == "R") pushNotification(ALERT_RED, body);
+      else if (typeTok == "GREEN" || typeTok == "G") pushNotification(ALERT_GREEN, body);
+      else if (typeTok == "YELLOW" || typeTok == "Y") pushNotification(ALERT_YELLOW, body);
+      // 类型不认识就当误码忽略，别把 "ALERT:XXX" 当成正文弹出来
     }
   }
   else if (data.startsWith("DISP_MODE:")) {
@@ -564,9 +794,10 @@ void drawHudOverlay() {
 }
 
 // ================= 状态锁指示灯局部重绘 =================
-void drawLockIndicators(int startY = 32, bool forceRedraw = false) {
+// 返回 true 表示这一轮真的往屏幕上写了东西（调用方据此决定要不要重画覆盖层）
+bool drawLockIndicators(int startY = 32, bool forceRedraw = false) {
   if (!forceRedraw && (lastNumLock == numLockActive && lastCapsLock == capsLockActive && lastScrollLock == scrollLockActive)) {
-    return;
+    return false;
   }
   lastNumLock = numLockActive;
   lastCapsLock = capsLockActive;
@@ -596,6 +827,8 @@ void drawLockIndicators(int startY = 32, bool forceRedraw = false) {
   tft.setTextColor(scrlFg, scrlBg);
   tft.setCursor(174, startY + 3);
   tft.print("SCRL");
+
+  return true;
 }
 
 // ================= 画板与壁纸模式 =================
@@ -683,11 +916,15 @@ void renderCurrentDisplayBase() {
 }
 
 // ================= 极速差量动态元素刷新（绝不全屏重绘） =================
-void updateDynamicElements() {
-  if (hud.active) return; // 弹窗激活期间暂停底层元素刷新
+// 返回 true 表示这一轮往屏幕上写过东西——通知条是盖在底图上的，
+// 底图一动就可能把它冲掉，所以调用方要拿着这个标志决定是否补画一次。
+bool updateDynamicElements() {
+  if (hud.active) return false; // 弹窗激活期间暂停底层元素刷新
+
+  bool touched = false;
 
   // 1. 刷新锁灯状态
-  drawLockIndicators((currentDispMode == DISP_MODE_BIG_CLOCK) ? 10 : 30);
+  if (drawLockIndicators((currentDispMode == DISP_MODE_BIG_CLOCK) ? 10 : 30)) touched = true;
 
   // 2. 局部差量刷新时间（文本颜色带底色，无需清屏）
   time_t now = time(nullptr);
@@ -701,6 +938,7 @@ void updateDynamicElements() {
 
   if (strcmp(currentTimeStr, lastDrawnTimeStr) != 0) {
     strcpy(lastDrawnTimeStr, currentTimeStr);
+    touched = true;
 
     if (currentDispMode == DISP_MODE_GEEK) {
       tft.setTextSize(3);
@@ -737,6 +975,7 @@ void updateDynamicElements() {
   // 3. 局部差量刷新按键计数器
   if (totalKeyCount != lastDrawnKeyCount) {
     lastDrawnKeyCount = totalKeyCount;
+    touched = true;
     if (currentDispMode == DISP_MODE_GEEK) {
       tft.setTextSize(2);
       tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
@@ -757,6 +996,7 @@ void updateDynamicElements() {
     if (keystrokeNeedsRedraw) {
       keystrokeNeedsRedraw = false;
       keystrokeActiveOnScreen = true;
+      touched = true;
       tft.fillRoundRect(15, 142, 210, 26, 4, 0x001F);
       u8g2.setFont(u8g2_font_wqy14_t_gb2312);
       u8g2.setForegroundColor(ST77XX_WHITE);
@@ -766,17 +1006,21 @@ void updateDynamicElements() {
       u8g2.print(lastKeyStrokeName);
     } else if (keystrokeActiveOnScreen && millis() - keyStrokeDisplayTime >= 800) {
       keystrokeActiveOnScreen = false;
+      touched = true;
       tft.fillRect(15, 142, 210, 26, ST77XX_BLACK); // 超时只清除回显框这一小块！
     }
   }
   else if (currentDispMode == DISP_MODE_KEY_MON && keystrokeNeedsRedraw) {
     keystrokeNeedsRedraw = false;
+    touched = true;
     tft.fillRect(25, 85, 190, 45, ST77XX_BLACK);
     tft.setTextSize(4);
     tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
     tft.setCursor(35, 95);
     tft.print(lastKeyStrokeName);
   }
+
+  return touched;
 }
 
 // ================= U8g2 菜单渲染 =================
@@ -811,6 +1055,8 @@ void drawMenuUI() {
     u8g2.setCursor(20, y + 20);
     u8g2.print(menuListCN[i]);
   }
+
+  drawNotifBadge(); // 待处理通知条数
 }
 
 // ================= 主屏风格预览（左右切换，二次确认才生效） =================
@@ -1069,7 +1315,9 @@ void renderLightingEngine() {
     return;
   }
 
-  if (activeAlert != ALERT_NONE) {
+  // 灯光跟着通知队列的最新一条走：每确认掉一条，就自动换成前一条的颜色
+  AlertType alert = currentAlertType();
+  if (alert != ALERT_NONE) {
     static unsigned long lastAlertFlash = 0;
     static bool alertToggle = false;
     if (now - lastAlertFlash > 180) {
@@ -1078,9 +1326,9 @@ void renderLightingEngine() {
     }
     if (alertToggle) {
       uint8_t r = 0, g = 0, b = 0;
-      if (activeAlert == ALERT_RED) r = 255;
-      else if (activeAlert == ALERT_GREEN) g = 255;
-      else if (activeAlert == ALERT_YELLOW) { r = 255; g = 180; }
+      if (alert == ALERT_RED) r = 255;
+      else if (alert == ALERT_GREEN) g = 255;
+      else if (alert == ALERT_YELLOW) { r = 255; g = 180; }
       for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, r, g, b);
     } else {
       clearMainLeds();
@@ -1670,13 +1918,19 @@ void handleC3Events() {
         }
       }
       else if (serialBuffer == "BTN:LIGHT") {
-        if (g_forceOff) {
+        // 有通知待处理时，单击灯光键 = "我已知晓"：只处理掉最新的一条，
+        // 剩下的继续显示，全清完灯自己就灭了。这一下不切换控制目标，
+        // 免得通知刚确认完旋钮就调错东西。
+        if (acknowledgeAlert()) {
+          // 已确认，本次点击到此为止
+        } else if (g_forceOff) {
           g_forceOff = false;
           currentMode = MODE_LIGHT;
+          triggerHud("控制目标", "键盘背光", -1, ST77XX_YELLOW);
         } else {
           currentMode = (currentMode == MODE_LIGHT) ? MODE_SCREEN_BRIGHTNESS : MODE_LIGHT;
+          triggerHud("控制目标", (currentMode == MODE_LIGHT) ? "键盘背光" : "显示器亮度", -1, ST77XX_YELLOW);
         }
-        triggerHud("控制目标", (currentMode == MODE_LIGHT) ? "键盘背光" : "显示器亮度", -1, ST77XX_YELLOW);
       } else if (serialBuffer == "BTN:LIGHT_HOLD") {
         g_forceOff = !g_forceOff;
         triggerHud("背光总开关", g_forceOff ? "已关闭" : "已开启", -1, ST77XX_RED);
@@ -1858,11 +2112,17 @@ void loop() {
     if (screenNeedsRedraw) {
       screenNeedsRedraw = false;
       renderCurrentDisplayBase();
+      notifDirty = true; // 底板是整屏重画的，通知条被盖掉了，得补一次
     }
 
     // 局部差量更新动态数据（时钟、击键数、按键OSD）
-    updateDynamicElements();
-    updateMarquee();
+    bool screenTouched = updateDynamicElements();
+
+    // 有通知时把跑马灯那条位置让出来，两者不抢同一块像素
+    if (notifCount == 0) updateMarquee();
+
+    // 通知条：常驻显示，只在内容变了或底层刚动过时重画一次
+    if (notifCount > 0 && (screenTouched || notifDirty)) drawNotifPanel();
 
     // 敲击数持久化存档
     static uint32_t lastSavedCount = 0;

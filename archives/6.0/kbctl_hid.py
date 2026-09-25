@@ -13,12 +13,18 @@ YYQ-MX9.0 键盘指令控制台（HID 厂商通道版）
 用法示例：
     python kbctl_hid.py --list                 # 看看认不认得出键盘
     python kbctl_hid.py                        # 进交互模式
-    python kbctl_hid.py alert red              # 红灯爆闪
-    python kbctl_hid.py alert green            # 绿灯闪烁
-    python kbctl_hid.py alert cycle            # 红->绿->黄->解除 走一遍
+    python kbctl_hid.py alert red              # 红灯爆闪（正文用默认名）
+    python kbctl_hid.py alert red 磁盘空间不足  # 红灯爆闪 + 中文描述
+    python kbctl_hid.py notify 开会了           # 绿灯通知，快捷写法
+    python kbctl_hid.py alert off              # 清空整个通知队列
+    python kbctl_hid.py alert cycle            # 红->绿->黄->清空 走一遍
     python kbctl_hid.py marquee "YYQ 极客大师"
     python kbctl_hid.py disp 1
-    python kbctl_hid.py raw "ALERT:YELLOW"
+    python kbctl_hid.py raw "ALERT:YELLOW:服务器无响应"
+
+通知是排队的：键盘屏幕和灯光都只显示最新到的那条（屏幕底部常驻一条通知栏，
+右上角显示待处理条数）。每按一次键盘上的灯光键处理掉最新的一条，前一条顶上
+来，直到队列清空，灯也自然灭掉。主机侧 alert off 是一次性全清。
 
 注意：需要固件里已经带上 HID 厂商通道（VendorHID），旧固件收不到，会报「设备没有该通道」。
 """
@@ -405,10 +411,22 @@ def build_command(line):
             return "ALERT:RED"
         if rest.lower() == "cycle":
             return "__CYCLE__"
-        key = rest.lower()
+        # alert <颜色> [描述文字]：描述可以带空格、可以是中文，省略就用固件默认名
+        bits = rest.split(None, 1)
+        key = bits[0].lower()
+        text = bits[1].strip() if len(bits) > 1 else ""
         if key not in ALERT_COLORS:
             raise ValueError("颜色只能是 red / green / yellow / off / cycle")
-        return ALERT_COLORS[key]
+        if not text:
+            return ALERT_COLORS[key]
+        if key in ("off", "stop"):
+            raise ValueError("off 是清空整个通知队列，后面不能跟描述")
+        return f"{ALERT_COLORS[key]}:{text}"
+
+    if cmd in ("notify", "notif", "n"):
+        if not rest:
+            raise ValueError("用法：notify <描述文字>")
+        return f"NOTIFY:{rest}"
 
     if cmd in ("disp", "display", "style"):
         idx = int(rest)
@@ -442,7 +460,7 @@ def build_command(line):
 def alert_cycle(link):
     for name in ("red", "green", "yellow", "off"):
         label = {"red": "红灯爆闪", "green": "绿灯闪烁",
-                 "yellow": "黄灯闪烁", "off": "警报解除"}[name]
+                 "yellow": "黄灯闪烁", "off": "清空通知队列"}[name]
         print(f"  {label}")
         link.send(ALERT_COLORS[name], echo=False)
         time.sleep(2.0)
@@ -451,15 +469,18 @@ def alert_cycle(link):
 
 HELP_TEXT = """可用命令：
   selftest                     自检：从固件回读探针，确认通道通不通
-  alert red|green|yellow|off   触发红/绿/黄爆闪，off 解除
-  alert cycle                  红->绿->黄->解除 连续演示一遍
+  alert red|green|yellow|off   触发红/绿/黄爆闪，off 清空整个队列
+  alert red 磁盘空间不足        带中文描述下发一条通知（描述可省略）
+  notify 开会了                 快捷写法，等同 alert green 开会了
+  alert cycle                  红->绿->黄->清空 连续演示一遍
   disp 0|1|2|3                 切换主屏风格（0 极客 1 大字时钟 2 击键监控 3 壁纸）
   keys on|off                  按键回显开关
   time                         把电脑当前时间同步给键盘
   marquee <文本>                修改极客屏底部跑马灯标语
   raw <指令>                    发送原始指令，如 raw ALERT:GREEN
   help / exit                  帮助 / 退出
-也可以直接输入固件原始指令，例如 ALERT:RED、DISP_MODE:2"""
+也可以直接输入固件原始指令，例如 ALERT:RED、DISP_MODE:2
+通知是排队的：屏和灯都只显示最新一条，按键盘上的灯光键逐条确认。"""
 
 
 def interactive(link):
