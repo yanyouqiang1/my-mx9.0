@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C3 键盘灯效 - 蓝牙调试端</title>
+    <style>
+        :root {
+            --bg-color: #121214;
+            --card-bg: #1a1a1e;
+            --border-color: #2a2a30;
+            --text-color: #e1e1e6;
+            --text-muted: #a1a1aa;
+            --primary: #bb86fc;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 90vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 480px;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+
+        h2 {
+            margin-top: 0;
+            font-weight: 600;
+            text-align: center;
+            letter-spacing: 1px;
+            color: var(--primary);
+        }
+
+        .status-panel {
+            background-color: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #ff1744;
+            margin-right: 6px;
+        }
+
+        .connected .status-indicator {
+            background-color: #00e676;
+            box-shadow: 0 0 8px #00e676;
+        }
+
+        .btn-connect {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--primary);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 15px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        .btn-connect:active {
+            transform: scale(0.98);
+        }
+
+        .control-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        .btn-led {
+            padding: 20px 10px;
+            border: 1px solid transparent;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            color: #ffffff;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn-led:active {
+            transform: scale(0.95);
+        }
+
+        .btn-red { background-color: #d50000; box-shadow: 0 4px 12px rgba(213,0,0,0.3); }
+        .btn-blue { background-color: #2962ff; box-shadow: 0 4px 12px rgba(41,98,255,0.3); }
+        .btn-green { background-color: #00c853; box-shadow: 0 4px 12px rgba(0,200,83,0.3); }
+        .btn-yellow { background-color: #ffd600; color: #000; box-shadow: 0 4px 12px rgba(255,214,0,0.3); }
+        
+        .btn-stop { 
+            grid-column: span 2; 
+            background-color: #37474f; 
+            box-shadow: 0 4px 12px rgba(55,71,79,0.3); 
+        }
+
+        .console-panel {
+            margin-top: 20px;
+            border: 1px solid var(--border-color);
+            background-color: #0c0c0e;
+            border-radius: 8px;
+            padding: 10px;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 12px;
+            height: 120px;
+            overflow-y: auto;
+            color: #00e676;
+        }
+
+        .console-line {
+            margin-bottom: 4px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>ESP32-C3 蓝牙灯效测试</h2>
+    
+    <div class="status-panel" id="status-panel">
+        <div>
+            <span class="status-indicator"></span>
+            <span id="status-text">蓝牙未连接</span>
+        </div>
+        <span style="font-size: 12px; color: var(--text-muted);" id="device-info">无设备</span>
+    </div>
+
+    <button id="btn-connect" class="btn-connect">连接键盘蓝牙 (C3_Keyboard_BLE)</button>
+
+    <div class="control-grid">
+        <button class="btn-led btn-red" onclick="sendCommand('R')">
+            <span>R</span>
+            <span style="font-size:12px; font-weight:normal;">红灯闪烁</span>
+        </button>
+        <button class="btn-led btn-blue" onclick="sendCommand('B')">
+            <span>B</span>
+            <span style="font-size:12px; font-weight:normal;">蓝灯闪烁</span>
+        </button>
+        <button class="btn-led btn-green" onclick="sendCommand('G')">
+            <span>G</span>
+            <span style="font-size:12px; font-weight:normal;">绿灯闪烁</span>
+        </button>
+        <button class="btn-led btn-yellow" onclick="sendCommand('Y')">
+            <span>Y</span>
+            <span style="font-size:12px; font-weight:normal;">黄灯闪烁</span>
+        </button>
+        <button class="btn-led btn-stop" onclick="sendCommand('S')">
+            <span>S</span>
+            <span style="font-size:12px; font-weight:normal;">停止蓝牙通知 (恢复之前灯效)</span>
+        </button>
+    </div>
+
+    <div class="console-panel" id="console">
+        <div class="console-line">> 调试控制台已就绪...</div>
+    </div>
+</div>
+
+<script>
+    // 与 ESP32-C3 固件对应的 UUID
+    const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let device = null;
+    let characteristic = null;
+
+    const connectBtn = document.getElementById("btn-connect");
+    const statusPanel = document.getElementById("status-panel");
+    const statusText = document.getElementById("status-text");
+    const deviceInfo = document.getElementById("device-info");
+    const consoleBox = document.getElementById("console");
+
+    function log(msg) {
+        const time = new Date().toLocaleTimeString();
+        const line = document.createElement("div");
+        line.className = "console-line";
+        line.innerText = `[${time}] ${msg}`;
+        consoleBox.appendChild(line);
+        consoleBox.scrollTop = consoleBox.scrollHeight;
+    }
+
+    connectBtn.addEventListener("click", async () => {
+        if (device && device.gatt.connected) {
+            log("正在主动断开连接...");
+            device.gatt.disconnect();
+            return;
+        }
+
+        log("开始检索键盘蓝牙设备...");
+        try {
+            // 扫描特定广播名称或特定服务的 BLE 设备
+            device = await navigator.bluetooth.requestDevice({
+                filters: [{ name: "C3_Keyboard_BLE" }],
+                optionalServices: [SERVICE_UUID]
+            });
+
+            log(`已选择设备: ${device.name}`);
+            deviceInfo.innerText = device.name;
+
+            // 监听断开连接事件
+            device.addEventListener('gattserverdisconnected', onDisconnected);
+
+            log("正在连接 GATT 服务器...");
+            const server = await device.gatt.connect();
+
+            log("正在获取 UART 服务...");
+            const service = await server.getPrimaryService(SERVICE_UUID);
+
+            log("正在获取 RX 写入特征值...");
+            characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+            // 连接成功状态更新
+            statusPanel.classList.add("connected");
+            statusText.innerText = "已连接";
+            connectBtn.innerText = "断开蓝牙连接";
+            connectBtn.style.backgroundColor = "#ff1744";
+            connectBtn.style.color = "#ffffff";
+            log("连接成功！控制通道已就绪。");
+
+        } catch (error) {
+            log(`连接过程出错: ${error}`);
+            onDisconnected();
+        }
+    });
+
+    function onDisconnected() {
+        statusPanel.classList.remove("connected");
+        statusText.innerText = "蓝牙未连接";
+        connectBtn.innerText = "连接键盘蓝牙 (C3_Keyboard_BLE)";
+        connectBtn.style.backgroundColor = "var(--primary)";
+        connectBtn.style.color = "#000";
+        deviceInfo.innerText = "无设备";
+        characteristic = null;
+        log("设备已断开连接。");
+    }
+
+    // 发送串口指令的核心函数
+    async function sendCommand(cmdChar) {
+        if (!characteristic) {
+            log("发送失败：未连接到蓝牙特征值，请先建立连接！");
+            return;
+        }
+
+        try {
+            log(`准备写入指令: ${cmdChar}`);
+            const encoder = new TextEncoder();
+            const dataBytes = encoder.encode(cmdChar);
+
+            // 优先使用新标准支持的 writeValueWithResponse
+            if (typeof characteristic.writeValueWithResponse === "function") {
+                await characteristic.writeValueWithResponse(dataBytes);
+            } else if (typeof characteristic.writeValue === "function") {
+                // 向后兼容旧版浏览器环境
+                await characteristic.writeValue(dataBytes);
+            } else {
+                throw new Error("当前浏览器版本不支持标准的写入方法！");
+            }
+            log(`特征值写入成功 => "${cmdChar}"`);
+        } catch (error) {
+            log(`指令发送异常: ${error}`);
+        }
+    }
+</script>
+</body>
+</html>
