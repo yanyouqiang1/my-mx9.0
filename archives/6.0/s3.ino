@@ -14,6 +14,19 @@
 #include "soc/rtc_cntl_reg.h"
 #include <esp_task_wdt.h>  // 引入硬件看门狗库
 
+// ================= TFT 屏幕相关库与引脚定义 =================
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+#define TFT_SCL   4
+#define TFT_SDA  16
+#define TFT_DC   15
+#define TFT_CS    5
+#define TFT_RST  -1  // 如果屏幕有RST引脚且接了GPIO，请修改此处(如接了GPIO某脚则写对应编号)
+
+SPIClass tftSPI(FSPI);
+Adafruit_ST7789 tft = Adafruit_ST7789(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
@@ -21,6 +34,7 @@ USBHIDSystemControl SystemControl;
 Preferences preferences;
 Adafruit_MCP23X17 mcp;
 #define WDT_TIMEOUT 3  // 看门狗超时时间设置为 3 秒
+
 // ================= 引脚与通讯定义 =================
 #define I2C_SDA 14
 #define I2C_SCL 13
@@ -337,6 +351,117 @@ String getMacroNameByCode(uint16_t code) {
   }
 }
 
+// ================= 按键名称转换函数 =================
+String getKeyDisplayName(uint16_t code) {
+  if (code >= MACRO_BASE) {
+    if (code == K_NEXT) return "NEXT";
+    if (code == K_PLAY) return "PLAY";
+    if (code == K_PREV) return "PREV";
+    if (code == K_FN) return "FN";
+    String mName = getMacroNameByCode(code);
+    if (mName.length() > 0) return mName;
+    return "MACRO";
+  }
+
+  switch (code) {
+    case KEY_LEFT_CTRL:   return "L-Ctrl";
+    case KEY_LEFT_SHIFT:  return "L-Shift";
+    case KEY_LEFT_ALT:    return "L-Alt";
+    case KEY_LEFT_GUI:    return "Win";
+    case KEY_RIGHT_CTRL:  return "R-Ctrl";
+    case KEY_RIGHT_SHIFT: return "R-Shift";
+    case KEY_RIGHT_ALT:   return "R-Alt";
+    case KEY_UP_ARROW:    return "UP";
+    case KEY_DOWN_ARROW:  return "DOWN";
+    case KEY_LEFT_ARROW:  return "LEFT";
+    case KEY_RIGHT_ARROW: return "RIGHT";
+    case KEY_RETURN:      return "Enter";
+    case KEY_ESC:         return "ESC";
+    case KEY_BACKSPACE:   return "BackSp";
+    case KEY_TAB:         return "Tab";
+    case KEY_CAPS_LOCK:   return "Caps";
+    case KEY_PAGE_UP:     return "PgUp";
+    case KEY_PAGE_DOWN:   return "PgDn";
+    case KEY_DELETE:      return "Del";
+    case KEY_HOME:        return "Home";
+    case KEY_END:         return "End";
+    case KEY_INSERT:      return "Ins";
+    case KEY_F1:  return "F1";
+    case KEY_F2:  return "F2";
+    case KEY_F3:  return "F3";
+    case KEY_F4:  return "F4";
+    case KEY_F5:  return "F5";
+    case KEY_F6:  return "F6";
+    case KEY_F7:  return "F7";
+    case KEY_F8:  return "F8";
+    case KEY_F9:  return "F9";
+    case KEY_F10: return "F10";
+    case KEY_F11: return "F11";
+    case KEY_F12: return "F12";
+    case ' ':     return "Space";
+    default: break;
+  }
+
+  // 常见 ASCII 可打印字符
+  if (code >= 33 && code <= 126) {
+    return String((char)code);
+  }
+
+  // 未命名的特殊键码输出十六进制
+  char hexBuf[10];
+  snprintf(hexBuf, sizeof(hexBuf), "0x%02X", code);
+  return String(hexBuf);
+}
+
+// ================= 屏幕绘制与显示函数 =================
+void initScreenUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  
+  // 顶部标题栏
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(20, 18);
+  tft.print("YYQ Keyboard");
+  tft.drawFastHLine(10, 45, 220, ST77XX_ORANGE);
+
+  // 中间按键显示主卡片框
+  tft.drawRoundRect(15, 65, 210, 110, 10, ST77XX_BLUE);
+
+  // 底部提示
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(40, 205);
+  tft.print("Matrix: 10x16 Active");
+
+  // 默认待机显示
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(75, 110);
+  tft.print("READY");
+}
+
+void displayKeyPressed(String keyName) {
+  // 只局部清除卡片内部区域，杜绝整屏刷新带来的闪烁与性能损耗
+  tft.fillRoundRect(17, 67, 206, 106, 8, ST77XX_BLACK);
+  tft.drawRoundRect(15, 65, 210, 110, 10, ST77XX_GREEN);
+
+  // 根据文字长度动态调整字号，保持居中
+  int textSize = 3;
+  if (keyName.length() > 5) textSize = 2;
+  if (keyName.length() > 9) textSize = 1;
+  tft.setTextSize(textSize);
+  tft.setTextColor(ST77XX_GREEN);
+
+  int16_t textWidth = keyName.length() * 6 * textSize;
+  int16_t textHeight = 8 * textSize;
+  int16_t x = 120 - (textWidth / 2);
+  int16_t y = 120 - (textHeight / 2);
+  if (x < 20) x = 20;
+
+  tft.setCursor(x, y);
+  tft.print(keyName);
+}
+
 void recoverI2CBus() {
   Wire.end();
   delay(10);
@@ -378,6 +503,10 @@ void scanKeyboardMatrix() {
           if (keycode == 0) continue;
 
           if (currentState) {
+            // 【核心新增功能】：按键按下，在 1.54 寸屏幕上显示按键名称
+            String kName = getKeyDisplayName(keycode);
+            displayKeyPressed(kName);
+
             if (cherryLogoEnabled) Serial1.println("N_KEY_PRESS");
 
             if (keycode == K_FN) {
@@ -448,6 +577,12 @@ void setup() {
   SystemControl.begin();
   USB.begin();
 
+  // ================= 屏幕初始化 =================
+  tftSPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS);
+  tft.init(240, 240);  // 1.54寸 IPS 分辨率通常为 240x240
+  tft.setRotation(1);  // 若方向不正确，可调整为 1, 2 或 3
+  initScreenUI();
+
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   Wire.setTimeOut(25);
@@ -496,7 +631,7 @@ unsigned long lastScanTime = 0;
 const unsigned long SCAN_INTERVAL = 3;
 
 void loop() {
-  esp_task_wdt_reset();  // 【核心】：每次循环喂狗一次，证明程序活着！
+  esp_task_wdt_reset();  // 喂狗
 
   if (!deviceConnected && oldDeviceConnected) {
     delay(500);
@@ -505,7 +640,7 @@ void loop() {
   }
   if (deviceConnected && !oldDeviceConnected) oldDeviceConnected = deviceConnected;
 
-  // 【硬件异步心跳】：每 2 秒广播一次 PING，全程不阻塞 CPU
+  // 硬件异步心跳：每 2 秒广播一次 PING
   if (millis() - lastPingTime > 2000) {
     lastPingTime = millis();
     Serial1.println("S3_PING");
