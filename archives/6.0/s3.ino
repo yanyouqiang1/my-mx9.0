@@ -11,6 +11,7 @@
 #include <JPEGDEC.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
+#include <Adafruit_Sensor.h>
 #include <esp_system.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -56,6 +57,17 @@ Adafruit_MCP23X17 mcp;
 #define I2C_SDA 14
 #define I2C_SCL 13
 #define MCP23017_ADDR 0x20
+
+// ================= SHT31 温湿度传感器 =================
+#define SHT31_SDA 17
+#define SHT31_SCL 7
+#define SHT31_ADDR 0x44
+// 温度校准偏移：模块读数偏低时增大此值
+// 深圳 9 月底室外 ~28°C，室内略高 ~30~31°C
+// 模块原始读数 -31.8°C，偏移 +62°C 后室内约 30°C
+// 如换模块或换环境，重新跑串口打印的 [SHT31] 数据微调
+#define SHT31_TEMP_OFFSET 62.0f
+TwoWire Wire_SHT(1);
 
 #define RX_PIN 10
 #define TX_PIN 9
@@ -192,6 +204,17 @@ bool keystrokeActiveOnScreen = false;
 // 按播放/暂停时交替显示"播放""暂停"。
 bool mediaPlaying = false;
 
+// ================= SHT31 温湿度传感器状态 =================
+// 用 Wire_SHT(1) 直接走 I2C 协议读 SHT31，避开 Adafruit_SHT31 库硬编码 Wire 的限制
+float shtTemperature = 0.0f;
+float shtHumidity = 0.0f;
+unsigned long lastSHTRead = 0;
+bool shtAvailable = false;
+
+// 函数定义放到 enum AlertType 之后，避免 Arduino 自动生成原型时跑到 enum 前面
+static bool sht31_read_raw(uint16_t &rawT, uint16_t &rawH);
+static void sht31_update();
+
 // MR 免驱录制
 #define MAX_REC_KEYS 64
 uint16_t recKeyBuffer[MAX_REC_KEYS];
@@ -281,6 +304,79 @@ struct Notification {
 Notification notifQueue[MAX_NOTIFS];
 uint8_t notifCount = 0;
 bool notifDirty = true; // 通知条内容变了，下一轮重绘一次
+
+// ================= SHT31 温湿度读取实现 =================
+// 放在 enum AlertType 之后，避开 Arduino 自动生成原型插到 enum 之前的坑
+
+// SHT31 CRC-8 多项式 0x31 (x^8 + x^5 + x^4 + 1)，初始值 0xFF
+static uint8_t sht31_crc8(const uint8_t* data, int len) {
+  uint8_t crc = 0xFF;
+  for (int i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) {
+      crc = (crc & 0x80) ? (crc << 1) ^ 0x31 : (crc << 1);
+    }
+  }
+  return crc;
+}
+
+// 连发 3 次测量取中位数，单次异常自动剔除
+static bool sht31_read_raw(uint16_t &rawT, uint16_t &rawH) {
+  uint16_t tSamples[3], hSamples[3];
+  int ok = 0;
+  for (int i = 0; i < 3; i++) {
+    Wire_SHT.beginTransmission(SHT31_ADDR);
+    Wire_SHT.write(0x2C);
+    Wire_SHT.write(0x06);
+    if (Wire_SHT.endTransmission() != 0) { delay(30); continue; }
+    delay(30); // 高重复性测量需要 15ms，留余量
+    if (Wire_SHT.requestFrom((int)SHT31_ADDR, 6) != 6) { delay(10); continue; }
+    uint8_t buf[6];
+    for (int k = 0; k < 6; k++) buf[k] = Wire_SHT.read();
+    // CRC 校验：温度 2 字节 + 1 字节 CRC，湿度同理
+    if (sht31_crc8(&buf[0], 2) != buf[2]) { delay(10); continue; }
+    if (sht31_crc8(&buf[3], 2) != buf[5]) { delay(10); continue; }
+    tSamples[ok] = ((uint16_t)buf[0] << 8) | buf[1];
+    hSamples[ok] = ((uint16_t)buf[3] << 8) | buf[4];
+    ok++;
+    delay(20);
+  }
+  if (ok == 0) return false;
+  // 取中间样本（中位数），抗单次毛刺
+  if (ok >= 2) {
+    for (int i = 0; i < ok - 1; i++) {
+      for (int j = i + 1; j < ok; j++) {
+        if (tSamples[i] > tSamples[j]) { uint16_t x = tSamples[i]; tSamples[i] = tSamples[j]; tSamples[j] = x; }
+        if (hSamples[i] > hSamples[j]) { uint16_t x = hSamples[i]; hSamples[i] = hSamples[j]; hSamples[j] = x; }
+      }
+    }
+    rawT = tSamples[ok / 2];
+    rawH = hSamples[ok / 2];
+  } else {
+    rawT = tSamples[0];
+    rawH = hSamples[0];
+  }
+  return true;
+}
+
+static void sht31_update() {
+  uint16_t rawT, rawH;
+  if (!sht31_read_raw(rawT, rawH)) return;
+  float t = -45.0f + 175.0f * ((float)rawT / 65535.0f);
+  float h = 100.0f * ((float)rawH / 65535.0f);
+  // 串口输出原始数据，便于诊断模块是否真的有偏差
+  static unsigned long lastDbg = 0;
+  if (millis() - lastDbg > 10000) {
+    lastDbg = millis();
+    Serial.printf("[SHT31] rawT=0x%04X rawH=0x%04X  T=%.1fC  H=%.1f%%  (offset=%.1f)\n",
+                  rawT, rawH, t, h, SHT31_TEMP_OFFSET);
+  }
+  // 合理范围检查：温度 -40 ~ 80°C，湿度 0 ~ 100%
+  // 超出范围就丢弃，保留上一次的值
+  if (t < -40.0f || t > 80.0f || h < 0.0f || h > 100.0f) return;
+  shtTemperature = t + SHT31_TEMP_OFFSET;
+  shtHumidity    = h;
+}
 
 // 当前生效的报警类型永远取队尾（最新）那条，灯和屏共用一个来源，不会各说各话
 AlertType currentAlertType() {
@@ -1722,6 +1818,15 @@ void renderCurrentDisplayBase() {
     u8g2.setCursor(20, 128);
     u8g2.print("击键计数: ");
 
+    // 温湿度显示区域
+    tft.drawRoundRect(10, 140, 220, 30, 6, ST77XX_CYAN);
+    u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+    u8g2.setCursor(20, 158);
+    u8g2.print("温湿度: ");
+    u8g2.setForegroundColor(ST77XX_CYAN);
+    u8g2.print("--.-C  --.-%");
+
     tft.drawRoundRect(10, 175, 220, 52, 6, ST77XX_ORANGE);
   }
   else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
@@ -1773,6 +1878,12 @@ bool updateDynamicElements() {
   if (hud.active || ringingKind != RING_NONE) return false; // 弹窗/响铃卡片盖在上面期间暂停底层元素刷新
 
   bool touched = false;
+
+  // 0. 读取 SHT31 温湿度数据（每2秒更新一次）
+  if (shtAvailable && millis() - lastSHTRead > 2000) {
+    sht31_update();
+    lastSHTRead = millis();
+  }
 
   // 1. 刷新锁灯状态。两种新风格不摆那排胶囊，它们各自画（实心圆 / 窄条三块），
   //    并且自己记 lastLockMask，所以这里只负责老风格。
@@ -1882,7 +1993,25 @@ bool updateDynamicElements() {
     }
   }
 
-  // 4. 实时按键回显局部更新与超时淡出
+  // 4. 刷新温湿度显示（极客仪表盘）
+  if (currentDispMode == DISP_MODE_GEEK) {
+    static float lastDrawnTemp = -999.0f;
+    static float lastDrawnHum = -999.0f;
+    if (shtAvailable && (abs(shtTemperature - lastDrawnTemp) > 0.5f || abs(shtHumidity - lastDrawnHum) > 1.0f)) {
+      lastDrawnTemp = shtTemperature;
+      lastDrawnHum = shtHumidity;
+      touched = true;
+      tft.fillRect(85, 144, 140, 22, ST77XX_BLACK);
+      u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+      u8g2.setForegroundColor(ST77XX_CYAN);
+      u8g2.setCursor(85, 158);
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.1fC  %.1f%%", shtTemperature, shtHumidity);
+      u8g2.print(buf);
+    }
+  }
+
+  // 5. 实时按键回显局部更新与超时淡出
   if (currentDispMode == DISP_MODE_GEEK && showKeystrokes) {
     if (keystrokeNeedsRedraw) {
       keystrokeNeedsRedraw = false;
@@ -3789,6 +3918,17 @@ void setup() {
   Wire.setClock(400000);
   Wire.setTimeOut(25);
   if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) recoverI2CBus();
+
+  // 初始化 SHT31 温湿度传感器（使用独立 I2C 总线 Wire_SHT）
+  Wire_SHT.begin(SHT31_SDA, SHT31_SCL);
+  Wire_SHT.setClock(400000);
+  Wire_SHT.beginTransmission(SHT31_ADDR);
+  if (Wire_SHT.endTransmission() == 0) {
+    shtAvailable = true;
+    Serial.println("SHT31 温湿度传感器初始化成功");
+  } else {
+    Serial.println("SHT31 温湿度传感器未找到");
+  }
 
   preferences.begin("keyboard", false);
   currentProfile = preferences.getUChar("curr_prof", 0);
