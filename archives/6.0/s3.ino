@@ -62,11 +62,6 @@ Adafruit_MCP23X17 mcp;
 #define SHT31_SDA 17
 #define SHT31_SCL 7
 #define SHT31_ADDR 0x44
-// 温度校准偏移：模块读数偏低时增大此值
-// 深圳 9 月底室外 ~28°C，室内略高 ~30~31°C
-// 模块原始读数 -31.8°C，偏移 +62°C 后室内约 30°C
-// 如换模块或换环境，重新跑串口打印的 [SHT31] 数据微调
-#define SHT31_TEMP_OFFSET 62.0f
 // 读取周期：温湿度是缓变量，15 分钟一次够用了；
 // 太频繁的话单次测量要 delay 20ms，会让 USB HID 帧延迟 → 键盘发"不灵敏"
 #define SHT31_READ_INTERVAL  900000UL   // 15 分钟
@@ -144,6 +139,7 @@ enum KeyboardSysMode {
   SYS_MODE_SET_TIME,    // 设置时间（年/月/日/时/分）
   SYS_MODE_SET_ALARM,   // 闹钟设置（时/分/开关）
   SYS_MODE_SET_TIMER,   // 倒计时设置（时/分/秒 + 启停）
+  SYS_MODE_CAL_TEMP,    // 温度校准（SHT31 偏移调节 + 保存按钮）
   SYS_MODE_SLEEP
 };
 KeyboardSysMode currentSysMode = SYS_MODE_NORMAL;
@@ -159,7 +155,7 @@ KeyboardSysMode currentSysMode = SYS_MODE_NORMAL;
 // `AlertType currentAlertType();` 这种原型立刻变成
 // "'AlertType' does not name a type"，而且报错行号在文件顶部，极难定位。
 // 宏不参与那个边界判定，最稳。
-#define IS_SETTING_MODE(m) ((m) == SYS_MODE_SET_TIME || (m) == SYS_MODE_SET_ALARM || (m) == SYS_MODE_SET_TIMER)
+#define IS_SETTING_MODE(m) ((m) == SYS_MODE_SET_TIME || (m) == SYS_MODE_SET_ALARM || (m) == SYS_MODE_SET_TIMER || (m) == SYS_MODE_CAL_TEMP)
 
 // 主屏风格。编号顺序就是菜单和网页下拉框里的顺序：常见的放前面，壁纸垫底。
 // 注意：这串数字会被存进 NVS 的 disp_mode，也是网页下拉框和 kbctl*.py 的
@@ -215,6 +211,9 @@ float shtTemperature = 0.0f;
 float shtHumidity = 0.0f;
 unsigned long lastSHTRead = 0;
 bool shtAvailable = false;
+// 温度校准偏移。GY-SHT31 在这台机器上读数偏低约 62°C（原始 -31.8°C → 显示 30.2°C）。
+// 不同模块偏差不同，菜单"温度校准"可 ±0.5°C 调，存到 NVS。
+float shtTempOffset = 62.0f;
 
 // 函数定义放到 enum AlertType 之后，避免 Arduino 自动生成原型时跑到 enum 前面
 static bool sht31_read_raw(uint16_t &rawT, uint16_t &rawH);
@@ -354,12 +353,12 @@ static void sht31_update() {
   if (millis() - lastDbg > SHT31_DBG_INTERVAL) {
     lastDbg = millis();
     Serial.printf("[SHT31] rawT=0x%04X rawH=0x%04X  T=%.1fC  H=%.1f%%  (offset=%.1f)\n",
-                  rawT, rawH, t, h, SHT31_TEMP_OFFSET);
+                  rawT, rawH, t, h, shtTempOffset);
   }
   // 合理范围检查：温度 -40 ~ 80°C，湿度 0 ~ 100%
   // 超出范围就丢弃，保留上一次的值
   if (t < -40.0f || t > 80.0f || h < 0.0f || h > 100.0f) return;
-  shtTemperature = t + SHT31_TEMP_OFFSET;
+  shtTemperature = t + shtTempOffset;
   shtHumidity    = h;
 }
 
@@ -447,6 +446,7 @@ void menuMove(int delta);
 void renderTimeSetUI();
 void renderAlarmSetUI();
 void renderTimerSetUI();
+void renderCalTempUI();
 void drawRingOverlay();
 void updateTimers();
 void persistClock();
@@ -1168,6 +1168,7 @@ void drawHudOverlay() {
     else if (currentSysMode == SYS_MODE_SET_TIME) renderTimeSetUI();
     else if (currentSysMode == SYS_MODE_SET_ALARM) renderAlarmSetUI();
     else if (currentSysMode == SYS_MODE_SET_TIMER) renderTimerSetUI();
+    else if (currentSysMode == SYS_MODE_CAL_TEMP) renderCalTempUI();
     return;
   }
 
@@ -2043,7 +2044,7 @@ bool updateDynamicElements() {
 // ================= U8g2 菜单渲染 =================
 int menuCursor = 0;
 int menuScroll = 0;                        // 列表第一项在数组里的下标
-const int MENU_TOTAL_ITEMS = 11;
+const int MENU_TOTAL_ITEMS = 12;
 const int MENU_VISIBLE_ITEMS = 7;          // 240 高的屏一次最多摆得下 7 行
 const char* menuListCN[] = {
   "1. 返回主屏",
@@ -2056,7 +2057,8 @@ const char* menuListCN[] = {
   "8. 闹钟设置",
   "9. 倒计时",
   "10. 立即刷新温湿度",
-  "11. 敲击计数清零"
+  "11. 温度校准",
+  "12. 敲击计数清零"
 };
 
 // 光标移动统一走这里。菜单从 7 项涨到 10 项之后一屏摆不下，
@@ -2360,6 +2362,76 @@ void renderTimerSetUI() {
   drawSetFooter();
 }
 
+// ---------------------------------------------------------------- 温度校准
+// 字段 0 = 偏移值（旋钮上下 ±0.5°C）；字段 1 = 保存按钮（按回车或上下键都生效）
+// 这个界面是给"模块读数跟实际温度对不上"准备的：原始 t 不动，只调 offset。
+// 调整过程中屏幕上的 shtTemperature 实时跟着变，方便对照旁边温度计。
+int calTempField = 0;
+float calTempOriginal = 62.0f;          // 进入界面时记一份，取消时还原
+
+void renderCalTempUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  if (hud.active) hud.dirty = true;
+  tft.fillRect(0, 0, 240, 30, ST77XX_NAVY);
+
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_WHITE);
+  const char* title = "温度校准";
+  u8g2.setCursor((240 - u8g2.getUTF8Width(title)) / 2, 21);
+  u8g2.print(title);
+
+  // 当前显示温度（带 offset 后），用 textSize4 大字突出，让用户一眼看到调整效果
+  tft.setTextSize(4);
+  char tempBuf[16];
+  snprintf(tempBuf, sizeof(tempBuf), "%4.1f", shtTemperature);
+  int tempW = 5 * 24;   // 5 字符 = 120 宽，从 x=60 起居中
+  tft.setCursor(60, 72);
+  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+  tft.print(tempBuf);
+  tft.setTextSize(2);
+  tft.setCursor(180, 72);
+  tft.setTextColor(ST77XX_LIGHTGREY, ST77XX_BLACK);
+  tft.print("C");
+
+  // 原始 t（不带 offset），小字放下面一行，让用户能看出模块本身读到的温度
+  char rawBuf[32];
+  snprintf(rawBuf, sizeof(rawBuf), "原始: %.1fC", shtTemperature - shtTempOffset);
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2.setForegroundColor(ST77XX_LIGHTGREY);
+  u8g2.setCursor((240 - u8g2.getUTF8Width(rawBuf)) / 2, 110);
+  u8g2.print(rawBuf);
+
+  // 偏移值。两个字段：调整区（左右切字段 0/1），选中字段高亮蓝色背景。
+  // 字段 0 显示 "偏移: ±X.X°C"，字段 1 是"保存"按钮。
+  const int offY = 142;
+  char offText[24];
+  snprintf(offText, sizeof(offText), "偏移: %+.1fC", shtTempOffset);
+  uint16_t offBg = (calTempField == 0) ? ST77XX_BLUE : ST77XX_BLACK;
+  uint16_t offFg = (calTempField == 0) ? ST77XX_WHITE : ST77XX_YELLOW;
+  tft.fillRoundRect(20, offY - 4, 200, 26, 4, offBg);
+  tft.setTextSize(2);
+  tft.setTextColor(offFg, offBg);
+  tft.setCursor(28, offY);
+  tft.print(offText);
+
+  // 保存按钮（参考倒计时的"开始/停止"按钮）
+  const int btnW = 168, btnH = 32, btnX = (240 - btnW) / 2, btnY = 178;
+  bool dirty = (shtTempOffset != calTempOriginal);
+  uint16_t btnBg = dirty ? 0x0260 : 0x18E3;
+  tft.fillRoundRect(btnX, btnY, btnW, btnH, 6, btnBg);
+  tft.drawRoundRect(btnX, btnY, btnW, btnH, 6,
+                    calTempField == 1 ? ST77XX_WHITE : (dirty ? ST77XX_GREEN : ST77XX_DARKGREY));
+  if (calTempField == 1) tft.drawRoundRect(btnX - 2, btnY - 2, btnW + 4, btnH + 4, 8, ST77XX_BLUE);
+
+  const char* btnText = dirty ? "保存到 NVS" : "无变化";
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2.setForegroundColor(dirty ? ST77XX_GREEN : ST77XX_LIGHTGREY);
+  u8g2.setCursor(btnX + (btnW - u8g2.getUTF8Width(btnText)) / 2, btnY + 22);
+  u8g2.print(btnText);
+
+  drawSetFooter();
+}
+
 // 三个界面共用的字段调整。delta 是 ±1。
 static void adjustSettingField(int delta) {
   if (currentSysMode == SYS_MODE_SET_TIME) {
@@ -2395,6 +2467,21 @@ static void adjustSettingField(int delta) {
       timerEditS = (timerEditS + delta + 60) % 60;
       renderTimerSetUI();
     }
+  } else if (currentSysMode == SYS_MODE_CAL_TEMP) {
+    if (calTempField == 1) {
+      // 光标停在保存按钮上时，上下键也当"保存/还原"用，省得非要按回车
+      if (delta > 0) saveSettingScreen();
+      else            cancelSettingScreen();
+    } else {
+      // 字段 0：offset ±0.5°C。限位 [-100, +100]——正常 SHT31 偏差不会超过这范围
+      shtTempOffset += delta * 0.5f;
+      if (shtTempOffset < -100.0f) shtTempOffset = -100.0f;
+      if (shtTempOffset >  100.0f) shtTempOffset =  100.0f;
+      // shtTemperature 已经包含 shtTempOffset，所以原值不变；
+      // 屏幕上的 "shtTemperature = shtTemperature - shtTempOffset + shtTempOffset" 没意义，
+      // 实际显示公式里直接读 shtTempOffset，所以这里不需要重新计算。
+      renderCalTempUI();
+    }
   }
 }
 
@@ -2409,6 +2496,9 @@ static void moveSettingField(int delta) {
   } else if (currentSysMode == SYS_MODE_SET_TIMER) {
     timerFieldIdx = (timerFieldIdx + delta + 4) % 4;
     renderTimerSetUI();
+  } else if (currentSysMode == SYS_MODE_CAL_TEMP) {
+    calTempField = (calTempField + delta + 2) % 2;   // 0=offset, 1=保存按钮
+    renderCalTempUI();
   }
 }
 
@@ -2500,12 +2590,20 @@ void saveSettingScreen() {
     preferences.putUChar("tmr_s", (uint8_t)timerEditS);
     triggerHud("倒计时", "时长已保存", -1, ST77XX_GREEN);
   }
+  else if (currentSysMode == SYS_MODE_CAL_TEMP) {
+    preferences.putFloat("sht_offset", shtTempOffset);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "已保存 %+.1fC", shtTempOffset);
+    triggerHud("温度校准", buf, -1, ST77XX_GREEN);
+  }
 
   currentSysMode = SYS_MODE_MENU;
   drawMenuUI();
 }
 
 void cancelSettingScreen() {
+  // 温度校准取消：把 offset 还原到进入界面时的值，不落盘
+  if (currentSysMode == SYS_MODE_CAL_TEMP) shtTempOffset = calTempOriginal;
   currentSysMode = SYS_MODE_MENU;
   drawMenuUI();
 }
@@ -3704,16 +3802,10 @@ void handleMenuSelect() {
       currentSysMode = SYS_MODE_SET_TIMER;
       renderTimerSetUI();
       break;
-    case 9:
-      totalKeyCount = 0;
-      preferences.putUInt("keyCount", 0);
-      displayStatusCN("计数已清零", ST77XX_GREEN);
-      delay(400);
-      drawMenuUI();
-      break;
-    case 10: {
+    case 9: {
       // 主动拉一次温湿度，并把下次定时器起点对齐，避免读完立刻又触发一次。
       // 失败也要给用户一个状态提示，免得点了之后以为没生效。
+      // 注：菜单项编号是 "10. 立即刷新温湿度"（menuListCN[9]），case 数字对齐数组下标。
       if (!shtAvailable) {
         displayStatusCN("SHT31 未连接", ST77XX_RED);
       } else {
@@ -3728,6 +3820,23 @@ void handleMenuSelect() {
       drawMenuUI();
       break;
     }
+    case 10: {
+      // 进入温度校准界面。把当前 offset 备份一份，取消时还原（避免调到一半 ESC 留半截修改）
+      // 注：菜单项编号是 "11. 温度校准"。
+      calTempOriginal = shtTempOffset;
+      calTempField = 0;
+      hud.active = false;
+      currentSysMode = SYS_MODE_CAL_TEMP;
+      renderCalTempUI();
+      break;
+    }
+    case 11:
+      totalKeyCount = 0;
+      preferences.putUInt("keyCount", 0);
+      displayStatusCN("计数已清零", ST77XX_GREEN);
+      delay(400);
+      drawMenuUI();
+      break;
   }
 }
 
@@ -3963,6 +4072,7 @@ void setup() {
   cherryLogoEnabled = preferences.getBool("cherryLogo", false);
   totalKeyCount = preferences.getUInt("keyCount", 0);
   customMarquee = preferences.getString("marquee", "YYQ Studio - 极客机械大师");
+  shtTempOffset = preferences.getFloat("sht_offset", 62.0f);
   indLevel = preferences.getUChar("ind_level", 3);
   if (indLevel >= IND_LEVEL_COUNT) indLevel = 3;
   indBrightness = indLevelValues[indLevel];
