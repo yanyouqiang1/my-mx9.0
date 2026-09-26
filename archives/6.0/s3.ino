@@ -2043,7 +2043,7 @@ bool updateDynamicElements() {
 // ================= U8g2 菜单渲染 =================
 int menuCursor = 0;
 int menuScroll = 0;                        // 列表第一项在数组里的下标
-const int MENU_TOTAL_ITEMS = 10;
+const int MENU_TOTAL_ITEMS = 11;
 const int MENU_VISIBLE_ITEMS = 7;          // 240 高的屏一次最多摆得下 7 行
 const char* menuListCN[] = {
   "1. 返回主屏",
@@ -2055,7 +2055,8 @@ const char* menuListCN[] = {
   "7. 设置时间",
   "8. 闹钟设置",
   "9. 倒计时",
-  "10. 敲击计数清零"
+  "10. 立即刷新温湿度",
+  "11. 敲击计数清零"
 };
 
 // 光标移动统一走这里。菜单从 7 项涨到 10 项之后一屏摆不下，
@@ -3710,6 +3711,23 @@ void handleMenuSelect() {
       delay(400);
       drawMenuUI();
       break;
+    case 10: {
+      // 主动拉一次温湿度，并把下次定时器起点对齐，避免读完立刻又触发一次。
+      // 失败也要给用户一个状态提示，免得点了之后以为没生效。
+      if (!shtAvailable) {
+        displayStatusCN("SHT31 未连接", ST77XX_RED);
+      } else {
+        sht31_update();
+        lastSHTRead = millis();
+        // 屏幕上的极客仪表盘可能没在显示，这里直接弹一行温度湿度让用户看到结果
+        char th[32];
+        snprintf(th, sizeof(th), "T=%.1fC  H=%.1f%%", shtTemperature, shtHumidity);
+        displayStatusCN(th, ST77XX_CYAN);
+      }
+      delay(600);
+      drawMenuUI();
+      break;
+    }
   }
 }
 
@@ -3912,6 +3930,10 @@ void setup() {
   if (Wire_SHT.endTransmission() == 0) {
     shtAvailable = true;
     Serial.println("SHT31 温湿度传感器初始化成功");
+    // 开机主动拉一次：避免开机到第一次 15 分钟定时器触发之间的空窗
+    // 屏幕上一直显示 "0.0C 0.0%"。lastSHTRead 顺手对齐，下次自动读在 15 分钟后。
+    sht31_update();
+    lastSHTRead = millis();
   } else {
     Serial.println("SHT31 温湿度传感器未找到");
   }
