@@ -67,6 +67,11 @@ Adafruit_MCP23X17 mcp;
 // 模块原始读数 -31.8°C，偏移 +62°C 后室内约 30°C
 // 如换模块或换环境，重新跑串口打印的 [SHT31] 数据微调
 #define SHT31_TEMP_OFFSET 62.0f
+// 读取周期：温湿度是缓变量，15 分钟一次够用了；
+// 太频繁的话单次测量要 delay 20ms，会让 USB HID 帧延迟 → 键盘发"不灵敏"
+#define SHT31_READ_INTERVAL  900000UL   // 15 分钟
+#define SHT31_DBG_INTERVAL   900000UL   // 串口诊断打印也按 15 分钟一次
+#define SHT31_MEASURE_DELAY  20         // 单次测量等待 20ms（数据手册 15ms 留点余量）
 TwoWire Wire_SHT(1);
 
 #define RX_PIN 10
@@ -320,42 +325,22 @@ static uint8_t sht31_crc8(const uint8_t* data, int len) {
   return crc;
 }
 
-// 连发 3 次测量取中位数，单次异常自动剔除
+// 单次测量 + CRC 校验。每 15 分钟一次，阻塞 SHT31_MEASURE_DELAY (~20ms)，
+// 对 USB HID 帧延迟几乎不可见。CRC 不通过直接放弃，留上次有效值。
 static bool sht31_read_raw(uint16_t &rawT, uint16_t &rawH) {
-  uint16_t tSamples[3], hSamples[3];
-  int ok = 0;
-  for (int i = 0; i < 3; i++) {
-    Wire_SHT.beginTransmission(SHT31_ADDR);
-    Wire_SHT.write(0x2C);
-    Wire_SHT.write(0x06);
-    if (Wire_SHT.endTransmission() != 0) { delay(30); continue; }
-    delay(30); // 高重复性测量需要 15ms，留余量
-    if (Wire_SHT.requestFrom((int)SHT31_ADDR, 6) != 6) { delay(10); continue; }
-    uint8_t buf[6];
-    for (int k = 0; k < 6; k++) buf[k] = Wire_SHT.read();
-    // CRC 校验：温度 2 字节 + 1 字节 CRC，湿度同理
-    if (sht31_crc8(&buf[0], 2) != buf[2]) { delay(10); continue; }
-    if (sht31_crc8(&buf[3], 2) != buf[5]) { delay(10); continue; }
-    tSamples[ok] = ((uint16_t)buf[0] << 8) | buf[1];
-    hSamples[ok] = ((uint16_t)buf[3] << 8) | buf[4];
-    ok++;
-    delay(20);
-  }
-  if (ok == 0) return false;
-  // 取中间样本（中位数），抗单次毛刺
-  if (ok >= 2) {
-    for (int i = 0; i < ok - 1; i++) {
-      for (int j = i + 1; j < ok; j++) {
-        if (tSamples[i] > tSamples[j]) { uint16_t x = tSamples[i]; tSamples[i] = tSamples[j]; tSamples[j] = x; }
-        if (hSamples[i] > hSamples[j]) { uint16_t x = hSamples[i]; hSamples[i] = hSamples[j]; hSamples[j] = x; }
-      }
-    }
-    rawT = tSamples[ok / 2];
-    rawH = hSamples[ok / 2];
-  } else {
-    rawT = tSamples[0];
-    rawH = hSamples[0];
-  }
+  Wire_SHT.beginTransmission(SHT31_ADDR);
+  Wire_SHT.write(0x2C);
+  Wire_SHT.write(0x06);
+  if (Wire_SHT.endTransmission() != 0) return false;
+  delay(SHT31_MEASURE_DELAY);
+  if (Wire_SHT.requestFrom((int)SHT31_ADDR, 6) != 6) return false;
+  uint8_t buf[6];
+  for (int k = 0; k < 6; k++) buf[k] = Wire_SHT.read();
+  // CRC 校验：温度 2 字节 + 1 字节 CRC，湿度同理
+  if (sht31_crc8(&buf[0], 2) != buf[2]) return false;
+  if (sht31_crc8(&buf[3], 2) != buf[5]) return false;
+  rawT = ((uint16_t)buf[0] << 8) | buf[1];
+  rawH = ((uint16_t)buf[3] << 8) | buf[4];
   return true;
 }
 
@@ -366,7 +351,7 @@ static void sht31_update() {
   float h = 100.0f * ((float)rawH / 65535.0f);
   // 串口输出原始数据，便于诊断模块是否真的有偏差
   static unsigned long lastDbg = 0;
-  if (millis() - lastDbg > 10000) {
+  if (millis() - lastDbg > SHT31_DBG_INTERVAL) {
     lastDbg = millis();
     Serial.printf("[SHT31] rawT=0x%04X rawH=0x%04X  T=%.1fC  H=%.1f%%  (offset=%.1f)\n",
                   rawT, rawH, t, h, SHT31_TEMP_OFFSET);
@@ -1879,8 +1864,9 @@ bool updateDynamicElements() {
 
   bool touched = false;
 
-  // 0. 读取 SHT31 温湿度数据（每2秒更新一次）
-  if (shtAvailable && millis() - lastSHTRead > 2000) {
+  // 0. 读取 SHT31 温湿度数据（每 SHT31_READ_INTERVAL 毫秒一次，默认 15 分钟）。
+  //    拉这么长是因为每次读要 delay ~20ms，太密会让 USB HID 帧延迟 → 键盘发"不灵敏"。
+  if (shtAvailable && millis() - lastSHTRead > SHT31_READ_INTERVAL) {
     sht31_update();
     lastSHTRead = millis();
   }
