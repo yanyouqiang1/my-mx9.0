@@ -144,7 +144,7 @@ enum KeyboardSysMode {
 };
 KeyboardSysMode currentSysMode = SYS_MODE_NORMAL;
 
-// 三个设置子界面是不是同一个东西？是。它们共用一套字段编辑逻辑
+// 三个设置子界面是不是同一个东西？是。它们共用一套字段编辑逻辑来了，
 // （左右切字段 / 上下和旋钮改值 / 回车保存 / ESC 取消），所以判定收敛到一处，
 // 免得每加一个界面就要在 scanKeyboardMatrix、handleC3Events、drawHudOverlay
 // 里各补一遍，漏一处就是一个"按键在这个界面下莫名其妙没反应"的 bug。
