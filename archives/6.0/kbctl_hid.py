@@ -54,7 +54,10 @@ ALERT_COLORS = {
     "stop": "ALERT:OFF",
 }
 
-DISP_NAMES = {0: "极客仪表盘", 1: "大字时钟", 2: "实时击键监控", 3: "自定义壁纸"}
+DISP_NAMES = {
+    0: "大字时钟", 1: "极客仪表盘", 2: "信息面板",
+    3: "实时击键监控", 4: "律动", 5: "自定义壁纸",
+}
 
 
 # ================================================================== Win32 结构
@@ -431,7 +434,7 @@ def build_command(line):
     if cmd in ("disp", "display", "style"):
         idx = int(rest)
         if idx not in DISP_NAMES:
-            raise ValueError("风格编号只能是 0-3")
+            raise ValueError("风格编号只能是 0-5")
         return f"DISP_MODE:{idx}"
 
     if cmd in ("keys", "keystroke", "echo"):
@@ -440,6 +443,38 @@ def build_command(line):
 
     if cmd in ("time", "sync"):
         return f"TIME:{int(time.time())}"
+
+    if cmd in ("alarmset", "setalarm"):
+        if not rest:
+            raise ValueError("用法：alarmset 07:30   或   alarmset off")
+        if rest.lower() in ("off", "none", "0"):
+            return "ALARMSET:OFF"
+        hh, sep, mm = rest.partition(":")
+        if not sep or not hh.strip().isdigit() or not mm.strip().isdigit():
+            raise ValueError("闹钟时间要写成 24 小时制 HH:MM，例如 alarmset 07:30")
+        h, m = int(hh), int(mm)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError("小时要在 0-23、分钟要在 0-59")
+        return "ALARMSET:%02d:%02d" % (h, m)
+
+    if cmd in ("timer", "tmr", "countdown"):
+        if not rest:
+            raise ValueError("用法：timer 5（5 分钟） / timer 1:30（1 分 30 秒） / timer 0:10:00 / timer stop")
+        if rest.lower() in ("stop", "off", "cancel"):
+            return "TIMERSET:STOP"
+        parts = [p.strip() for p in rest.split(":")]
+        if len(parts) > 3 or not all(p.isdigit() for p in parts):
+            raise ValueError("倒计时时长写成 分钟 / 分:秒 / 时:分:秒，例如 timer 5、timer 1:30、timer 0:10:00")
+        nums = [int(p) for p in parts]
+        if len(nums) == 1:
+            total = nums[0] * 60
+        elif len(nums) == 2:
+            total = nums[0] * 60 + nums[1]
+        else:
+            total = nums[0] * 3600 + nums[1] * 60 + nums[2]
+        if total <= 0:
+            raise ValueError("倒计时时长必须大于 0")
+        return "TIMERSET:%d" % total
 
     if cmd in ("marquee", "banner"):
         if not rest:
@@ -473,9 +508,12 @@ HELP_TEXT = """可用命令：
   alert red 磁盘空间不足        带中文描述下发一条通知（描述可省略）
   notify 开会了                 快捷写法，等同 alert green 开会了
   alert cycle                  红->绿->黄->清空 连续演示一遍
-  disp 0|1|2|3                 切换主屏风格（0 极客 1 大字时钟 2 击键监控 3 壁纸）
+  disp 0-5                     切换主屏风格（0 大字时钟 1 极客仪表盘 2 信息面板
+                               3 击键监控 4 律动 5 壁纸）
   keys on|off                  按键回显开关
   time                         把电脑当前时间同步给键盘
+  alarmset 07:30 | off         设置/关闭闹钟（到点全屏卡片 + 全灯红闪，灯光键确认）
+  timer 5 | 1:30 | 0:10:00     启动倒计时（单位见写法），timer stop 停止
   marquee <文本>                修改极客屏底部跑马灯标语
   raw <指令>                    发送原始指令，如 raw ALERT:GREEN
   help / exit                  帮助 / 退出

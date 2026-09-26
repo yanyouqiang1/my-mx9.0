@@ -52,6 +52,39 @@
         </div>
     </div>
 
+    <!-- 1.5 时钟 / 闹钟 / 倒计时 -->
+    <div class="card">
+        <h2>1.5 时钟 / 闹钟 / 倒计时</h2>
+        <div class="hint">
+            这三样在键盘上按 <b>MC</b> 键进菜单也能设（7 设置时间 / 8 闹钟设置 / 9 倒计时），
+            这里只是图个方便。到点时键盘会弹出常驻卡片 + 19 颗灯全红快闪，
+            按键盘上的<b>灯光键</b>确认；60 秒没人理会就自动停铃，并留一条红色通知。
+        </div>
+        <div class="grid-2" style="margin-top: 12px;">
+            <div style="background: #334155; padding: 15px; border-radius: 8px;">
+                <h3 style="margin-top:0; color:#38bdf8;">闹钟</h3>
+                <label>响铃时间（24 小时制）：</label>
+                <input type="time" id="alarmTime" value="07:30">
+                <div style="display: flex; gap: 8px; margin-top: 8px;">
+                    <button class="btn btn-green" id="alarmOnBtn" style="flex: 1;">开启闹钟</button>
+                    <button class="btn btn-tag" id="alarmOffBtn" style="flex: 1;">关闭闹钟</button>
+                </div>
+            </div>
+            <div style="background: #334155; padding: 15px; border-radius: 8px;">
+                <h3 style="margin-top:0; color:#38bdf8;">倒计时</h3>
+                <div style="display: flex; gap: 8px;">
+                    <input type="number" id="tmrH" min="0" max="23" value="0" placeholder="时">
+                    <input type="number" id="tmrM" min="0" max="59" value="5" placeholder="分">
+                    <input type="number" id="tmrS" min="0" max="59" value="0" placeholder="秒">
+                </div>
+                <div style="display: flex; gap: 8px; margin-top: 8px;">
+                    <button class="btn btn-orange" id="tmrStartBtn" style="flex: 1;">开始倒计时</button>
+                    <button class="btn btn-tag" id="tmrStopBtn" style="flex: 1;">停止</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- 2. 屏幕展示模式与按键回显控制 -->
     <div class="card">
         <h2>2. 屏幕多主题展示模式 & 按键回显</h2>
@@ -59,10 +92,12 @@
             <div>
                 <label>主屏幕显示风格切换：</label>
                 <select id="dispModeSelect" onchange="changeDispMode()">
-                    <option value="0">风格 1：极客全能仪表盘 (时钟+计数+跑马灯)</option>
-                    <option value="1">风格 2：极简大数字时钟与日期</option>
-                    <option value="2">风格 3：实时击键监控台 (OSD状态)</option>
-                    <option value="3">风格 4：全屏壁纸相册模式</option>
+                    <option value="0">风格 1：极简大数字时钟与日期</option>
+                    <option value="1">风格 2：极客全能仪表盘 (时钟+计数+跑马灯)</option>
+                    <option value="2">风格 3：信息面板 (时钟/日期 + 三个锁状态圆 + 方案图标/实时按键)</option>
+                    <option value="3">风格 4：实时击键监控台 (OSD状态)</option>
+                    <option value="4">风格 5：律动 (音乐起伏 + 键帽掉落 + 底部锁状态条)</option>
+                    <option value="5">风格 6：全屏壁纸相册模式</option>
                 </select>
             </div>
             <div>
@@ -192,12 +227,15 @@
 
     <!-- 5. 自定义图片画板与睡眠壁纸上传 -->
     <div class="card">
-        <h2>5. 屏幕自定义壁纸 / LOGO 画板上传 (240x240 RGB565)</h2>
-        <div class="hint">选取任意电脑图片，系统将自动等比例缩放并裁剪转码写入键盘闪存，可用于画板模式及 60 秒无操作睡眠屏保：</div>
+        <h2>5. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
+        <div class="hint">
+            随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
+            <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
+        </div>
         <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
             <input type="file" id="imageInput" accept="image/*" style="width: auto;">
             <canvas id="previewCanvas" width="240" height="240" style="border: 1px solid #475569; width: 120px; height: 120px; border-radius: 6px;"></canvas>
-            <button class="btn btn-orange" id="uploadImageBtn">转码并上传到键盘壁纸</button>
+            <button class="btn btn-orange" id="uploadImageBtn">压缩并上传到键盘壁纸</button>
         </div>
         <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
     </div>
@@ -291,6 +329,36 @@
         await sendBLE("ALERT:" + color);
     }
 
+    // 2.5 闹钟 / 倒计时
+    // 注意闹钟用的是 ALARMSET ，不是 ALERT 的别名 alarm —— 两个是完全不同的东西：
+    // ALERT 是"现在闪一下灯"，ALARMSET 是"到点了叫我"。
+    document.getElementById('alarmOnBtn').addEventListener('click', async () => {
+        const t = document.getElementById('alarmTime').value;   // 原生 time 控件给的就是 HH:MM
+        if (!t) return alert("请先选一个响铃时间！");
+        await sendBLE("ALARMSET:" + t);
+        alert(`闹钟已开启：每天 ${t} 提醒（到点在键盘上按灯光键确认）`);
+    });
+
+    document.getElementById('alarmOffBtn').addEventListener('click', async () => {
+        await sendBLE("ALARMSET:OFF");
+        alert("闹钟已关闭");
+    });
+
+    document.getElementById('tmrStartBtn').addEventListener('click', async () => {
+        const h = parseInt(document.getElementById('tmrH').value) || 0;
+        const m = parseInt(document.getElementById('tmrM').value) || 0;
+        const s = parseInt(document.getElementById('tmrS').value) || 0;
+        const total = h * 3600 + m * 60 + s;
+        if (total <= 0) return alert("倒计时时长必须大于 0！");
+        await sendBLE("TIMERSET:" + total);
+        alert(`倒计时已启动：${h} 时 ${m} 分 ${s} 秒（最后 1 分钟屏幕会每秒报数）`);
+    });
+
+    document.getElementById('tmrStopBtn').addEventListener('click', async () => {
+        await sendBLE("TIMERSET:STOP");
+        alert("倒计时已停止");
+    });
+
     // 3. 屏幕风格切换
     async function changeDispMode() {
         let mode = document.getElementById('dispModeSelect').value;
@@ -347,63 +415,99 @@
         textarea.focus();
     }
 
-    // 7. 图片本地缩放、转码并上传为 RGB565
-    let rawImageData = null;
+    // 7. 图片本地缩放 + JPEG 压缩后上传
+    // 出网的永远只有压缩后那十几 KB，原图多大都留在浏览器里。
+    let uploadBlob = null;
+
     document.getElementById('imageInput').addEventListener('change', (e) => {
         let file = e.target.files[0];
         if (!file) return;
+
+        let pBox = document.getElementById('uploadProgress');
+        pBox.innerText = "正在读取并压缩图片...";
+
+        let url = URL.createObjectURL(file);
         let img = new Image();
         img.onload = () => {
             let canvas = document.getElementById('previewCanvas');
             let ctx = canvas.getContext('2d');
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, 240, 240);
-            
-            // 保持比例居中绘制
+
+            // 保持比例居中绘制（四周留黑边）
             let scale = Math.min(240 / img.width, 240 / img.height);
             let w = img.width * scale;
             let h = img.height * scale;
-            let x = (240 - w) / 2;
-            let y = (240 - h) / 2;
-            ctx.drawImage(img, x, y, w, h);
+            ctx.drawImage(img, (240 - w) / 2, (240 - h) / 2, w, h);
 
-            let imgData = ctx.getImageData(0, 0, 240, 240).data;
-            rawImageData = new Uint8Array(240 * 240 * 2);
-            let ptr = 0;
-            for (let i = 0; i < imgData.length; i += 4) {
-                let r = imgData[i] >> 3;
-                let g = imgData[i + 1] >> 2;
-                let b = imgData[i + 2] >> 3;
-                let rgb565 = (r << 11) | (g << 5) | b;
-                rawImageData[ptr++] = (rgb565 >> 8) & 0xFF; // 大端优先
-                rawImageData[ptr++] = rgb565 & 0xFF;
-            }
-            document.getElementById('uploadProgress').innerText = "图片已转码就绪，大小: 115,200 字节";
+            // 关键一步：压缩在浏览器本地完成
+            canvas.toBlob((blob) => {
+                if (!blob) { pBox.innerText = "❌ 转码失败"; return; }
+                uploadBlob = blob;
+                pBox.innerText = `原图 ${(file.size / 1048576).toFixed(2)} MB → 本地压到 `
+                               + `${(blob.size / 1024).toFixed(1)} KB，出网就这么多`;
+            }, 'image/jpeg', 0.82);
+
+            URL.revokeObjectURL(url);
         };
-        img.src = URL.createObjectURL(file);
+        img.onerror = () => {
+            pBox.innerText = "❌ 这个文件不是浏览器能识别的图片";
+            URL.revokeObjectURL(url);
+        };
+        img.src = url;
     });
 
+    // 固件那边 setMTU(517)，减去 ATT 头 3 字节 = 514 的上限。
+    // 万一实际协商到的 MTU 更小，写会报错，就照着这个阶梯降档重来。
+    const CHUNK_STEPS = [500, 244, 180, 120, 20];
+
+    async function pushWallpaper(bytes, chunkSize, pBox) {
+        // 先声明总长度：固件据此分配缓冲并切进二进制接收模式，收满自动收尾
+        await sendBLE("LOGO_JPEG_START:" + bytes.length);
+
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            let end = Math.min(i + chunkSize, bytes.length);
+            await myCharacteristic.writeValue(bytes.subarray(i, end)); // 二进制直传，不再转十六进制
+            pBox.innerText = `正在传输: ${Math.round(end / bytes.length * 100)}%  `
+                           + `(${(end / 1024).toFixed(1)} / ${(bytes.length / 1024).toFixed(1)} KB)`;
+        }
+    }
+
     document.getElementById('uploadImageBtn').addEventListener('click', async () => {
-        if (!rawImageData) return alert("请先选择图片文件！");
+        let pBox = document.getElementById('uploadProgress');
+        if (!uploadBlob) return alert("请先选择图片文件！");
         if (!myCharacteristic) return alert("请先连接蓝牙！");
 
-        let pBox = document.getElementById('uploadProgress');
-        pBox.innerText = "准备上传...";
-        await sendBLE("LOGO_START");
+        let btn = document.getElementById('uploadImageBtn');
+        let fileInput = document.getElementById('imageInput');
+        btn.disabled = true;
+        fileInput.disabled = true;   // 传输期间别让用户误触别的按钮，会撞进二进制通道
 
-        const chunkSize = 200; // 每包200字节 (100个RGB565像素)
-        let total = rawImageData.length;
-        for (let i = 0; i < total; i += chunkSize) {
-            let chunk = rawImageData.slice(i, i + chunkSize);
-            let hexStr = "";
-            for (let b of chunk) hexStr += b.toString(16).padStart(2, '0');
-            await sendBLE("LOGO_DATA:" + hexStr);
-            pBox.innerText = `正在写入闪存: ${Math.round((i / total) * 100)}%`;
+        try {
+            let bytes = new Uint8Array(await uploadBlob.arrayBuffer());
+
+            let lastErr = null;
+            for (let k = 0; k < CHUNK_STEPS.length; k++) {
+                try {
+                    await pushWallpaper(bytes, CHUNK_STEPS[k], pBox);
+                    lastErr = null;
+                    break;
+                } catch (err) {
+                    // 多半是协商到的 MTU 比预期小。重新发 START 会重置固件侧缓冲，可以直接重来。
+                    lastErr = err;
+                    await new Promise(r => setTimeout(r, 300));
+                }
+            }
+            if (lastErr) throw lastErr;
+
+            pBox.innerText = `🎉 上传完成！${(bytes.length / 1024).toFixed(1)} KB 已写入键盘`;
+            alert(`壁纸已上传成功！共 ${(bytes.length / 1024).toFixed(1)} KB`);
+        } catch (err) {
+            pBox.innerText = "❌ 上传失败: " + err.message;
+        } finally {
+            btn.disabled = false;
+            fileInput.disabled = false;
         }
-
-        await sendBLE("LOGO_END");
-        pBox.innerText = "🎉 图片画板上传成功！键盘已就绪！";
-        alert("图片画板已上传成功并写入闪存！");
     });
 </script>
 </body>
