@@ -8,6 +8,7 @@
         .card { background: #1e293b; padding: 22px; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); margin-bottom: 20px; border: 1px solid #334155; }
         h1 { color: #38bdf8; display: flex; align-items: center; gap: 10px; }
         h2 { border-left: 5px solid #38bdf8; padding-left: 10px; font-size: 1.2rem; margin-top: 0; color: #f1f5f9; }
+        h3 { color: #38bdf8; }
         .btn { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: all 0.2s; }
         .btn:hover { background: #1d4ed8; }
         .btn-green { background: #10b981; } .btn-green:hover { background: #059669; }
@@ -15,10 +16,12 @@
         .btn-red { background: #ef4444; } .btn-red:hover { background: #dc2626; }
         .btn-yellow { background: #eab308; color: black; } .btn-yellow:hover { background: #ca8a04; }
         .btn-tag { background: #475569; padding: 6px 10px; font-size: 0.85rem; margin: 3px; border-radius: 4px; color: white; border: none; cursor: pointer; }
+        .btn-tag:hover { background: #64748b; }
         select, input, textarea { padding: 9px; margin: 6px 0; border: 1px solid #475569; border-radius: 6px; width: 100%; box-sizing: border-box; background: #0f172a; color: white; }
         .item-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; background: #334155; padding: 10px; border-radius: 6px; }
         .remove-btn { color: #f87171; cursor: pointer; font-weight: bold; margin-left: auto; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
         .hint { font-size: 0.85rem; color: #94a3b8; }
         .chk-group { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0; }
         .chk-group label { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 0.9rem; }
@@ -27,220 +30,331 @@
         .mode-tabs label { display: flex; align-items: center; gap: 5px; cursor: pointer; font-weight: bold; }
         .mode-tabs input[type="radio"] { width: auto; margin: 0; }
         .alert-bar { display: flex; gap: 10px; margin-top: 10px; }
+
+        /* 顶部 Tab 切换 */
+        .top-tabs { display: flex; gap: 6px; margin-bottom: 20px; border-bottom: 2px solid #334155; padding-bottom: 0; }
+        .top-tabs button { background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-bottom: none; padding: 12px 24px; font-size: 1rem; font-weight: bold; border-radius: 6px 6px 0 0; cursor: pointer; }
+        .top-tabs button.active { background: #0f172a; color: #38bdf8; border-color: #38bdf8; border-bottom: 2px solid #0f172a; margin-bottom: -2px; }
+        .top-tabs button:hover { color: #f1f5f9; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        /* 紧凑列表样式 */
+        .rule-row { display: flex; gap: 8px; align-items: center; padding: 8px; background: #334155; border-radius: 4px; margin-bottom: 6px; }
+        .rule-row .arrow { color: #38bdf8; font-weight: bold; }
     </style>
 </head>
 <body>
 
     <h1>⌨️ YYQ-MX9.0 极客主控配置台 Ultimate</h1>
 
-    <!-- 1. 蓝牙连接、时间校准与系统通知灯 -->
-    <div class="card">
-        <h2>1. 蓝牙连接、精准校时与系统通知灯</h2>
-        <div style="display: flex; gap: 15px; align-items: center;">
-            <button class="btn" id="connectBtn">连接键盘蓝牙</button>
-            <span id="status" style="font-weight: bold; color: #f87171;">未连接</span>
-            <button class="btn btn-green" id="syncTimeBtn" style="margin-left: auto;">同步电脑时间</button>
-        </div>
-        <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
-            <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
-            <div class="alert-bar">
-                <button class="btn btn-red" onclick="sendAlert('RED')">🚨 触发红灯闪烁</button>
-                <button class="btn btn-green" onclick="sendAlert('GREEN')">🟢 触发绿灯闪烁</button>
-                <button class="btn btn-yellow" onclick="sendAlert('YELLOW')">⚠️ 触发黄灯闪烁</button>
-                <button class="btn btn-tag" onclick="sendAlert('OFF')">⏹️ 停止报警闪烁</button>
-            </div>
-        </div>
+    <!-- 顶部 Tab -->
+    <div class="top-tabs">
+        <button id="tab-profile-btn" class="active" onclick="switchTab('profile')">📋 方案配置</button>
+        <button id="tab-system-btn" onclick="switchTab('system')">⚙️ 系统设置</button>
     </div>
 
-    <!-- 1.5 时钟 / 闹钟 / 倒计时 -->
-    <div class="card">
-        <h2>1.5 时钟 / 闹钟 / 倒计时</h2>
-        <div class="hint">
-            这三样在键盘上按 <b>MC</b> 键进菜单也能设（7 设置时间 / 8 闹钟设置 / 9 倒计时），
-            这里只是图个方便。到点时键盘会弹出常驻卡片 + 19 颗灯全红快闪，
-            按键盘上的<b>灯光键</b>确认；60 秒没人理会就自动停铃，并留一条红色通知。
-        </div>
-        <div class="grid-2" style="margin-top: 12px;">
-            <div style="background: #334155; padding: 15px; border-radius: 8px;">
-                <h3 style="margin-top:0; color:#38bdf8;">闹钟</h3>
-                <label>响铃时间（24 小时制）：</label>
-                <input type="time" id="alarmTime" value="07:30">
-                <div style="display: flex; gap: 8px; margin-top: 8px;">
-                    <button class="btn btn-green" id="alarmOnBtn" style="flex: 1;">开启闹钟</button>
-                    <button class="btn btn-tag" id="alarmOffBtn" style="flex: 1;">关闭闹钟</button>
-                </div>
-            </div>
-            <div style="background: #334155; padding: 15px; border-radius: 8px;">
-                <h3 style="margin-top:0; color:#38bdf8;">倒计时</h3>
-                <div style="display: flex; gap: 8px;">
-                    <input type="number" id="tmrH" min="0" max="23" value="0" placeholder="时">
-                    <input type="number" id="tmrM" min="0" max="59" value="5" placeholder="分">
-                    <input type="number" id="tmrS" min="0" max="59" value="0" placeholder="秒">
-                </div>
-                <div style="display: flex; gap: 8px; margin-top: 8px;">
-                    <button class="btn btn-orange" id="tmrStartBtn" style="flex: 1;">开始倒计时</button>
-                    <button class="btn btn-tag" id="tmrStopBtn" style="flex: 1;">停止</button>
-                </div>
-            </div>
-        </div>
-    </div>
+    <!-- =================== 方案配置 Tab =================== -->
+    <div id="tab-profile" class="tab-panel active">
 
-    <!-- 2. 屏幕展示模式与按键回显控制 -->
-    <div class="card">
-        <h2>2. 屏幕多主题展示模式 & 按键回显</h2>
-        <div class="grid-2">
+        <!-- 1. ME 蓝牙发送文本 -->
+        <div class="card">
+            <h2>1. ME 蓝牙发送文本</h2>
+            <div class="hint">
+                按一下键盘上的 ME 键，键值会被拦截不发，文本会通过蓝牙立刻打给主机光标位置。
+                不会写到固件里——关掉网页就丢了，想存为"ME 默认文本"得用 MR 录制或 FFat 写入。
+            </div>
+            <div style="margin-top: 10px;">
+                <button class="btn-tag" onclick="insertMeTag('[ENTER]')">回车 [ENTER]</button>
+                <button class="btn-tag" onclick="insertMeTag('[TAB]')">Tab [TAB]</button>
+                <button class="btn-tag" onclick="insertMeTag('[ESC]')">Esc [ESC]</button>
+                <button class="btn-tag" onclick="insertMeTag('[BACKSPACE]')">退格 [BACKSPACE]</button>
+                <button class="btn-tag" onclick="insertMeTag('SLEEP(100)')">⏱️ 延时 100ms</button>
+                <button class="btn-tag" onclick="insertMeTag('SLEEP(500)')">⏱️ 延时 500ms</button>
+                <button class="btn-tag" onclick="insertMeTag('SLEEP(1000)')">⏱️ 延时 1s</button>
+            </div>
+            <textarea id="meTextInput" rows="3" placeholder="例：hello world[ENTER]SLEEP(200)second line"></textarea>
+            <button class="btn btn-green" id="meSendBtn" style="width: 100%; margin-top: 8px;">📡 通过蓝牙发送给 ME</button>
+        </div>
+
+        <!-- 2. 按方案按键映射 REMAP -->
+        <div class="card">
+            <h2>2. 按方案按键映射 (REMAP) — 例：把 Win 映射为 Ctrl</h2>
+            <div class="hint">
+                映射按方案独立保存，互不影响。底层用的是键盘 HID 键码（HID Usage ID），
+                常见修饰键：Ctrl=128, Shift=129, Alt=130, Win/Cmd=131。
+                按下 MR 录制时进入 NORMAL 模式的键也会走映射，方便游戏改键。
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 10px; align-items: center;">
+                <label style="white-space: nowrap;">目标方案：</label>
+                <select id="remapProfile" style="flex: 1;">
+                    <option value="0">方案 1 (Windows)</option>
+                    <option value="1">方案 2 (macOS)</option>
+                    <option value="2">方案 3 (游戏模式)</option>
+                    <option value="3">方案 4 (工作模式)</option>
+                </select>
+                <button class="btn btn-tag" id="remapLoadBtn">📥 从键盘读取</button>
+                <button class="btn btn-red" id="remapClearBtn">🗑️ 清空此方案</button>
+            </div>
+
+            <div class="grid-3" style="margin-top: 12px;">
+                <div>
+                    <label>从按键 (被替换的键)：</label>
+                    <select id="remapFromSel"></select>
+                </div>
+                <div>
+                    <label>到按键 (替换成)：</label>
+                    <select id="remapToSel"></select>
+                </div>
+                <div style="display: flex; align-items: flex-end;">
+                    <button class="btn btn-green" id="remapAddBtn" style="width: 100%;">➕ 添加映射</button>
+                </div>
+            </div>
+
+            <div style="margin-top: 16px;">
+                <label>当前方案的映射规则（保存到键盘后生效）：</label>
+                <div id="remapRuleList" style="margin-top: 6px;"></div>
+            </div>
+
+            <button class="btn btn-green" id="remapSaveBtn" style="width: 100%; margin-top: 12px;">💾 保存到键盘</button>
+        </div>
+
+        <!-- 3. MA / MB / M1-M12 全局动作合并 -->
+        <div class="card">
+            <h2>3. 全局独立功能键 (MA / MB / M1~M12)</h2>
+            <div class="hint">
+                这里配的是"按下这一颗键，除了按方案宏（M1-M12 才有）外，还会做什么"。
+                例如 M1 设成"切到方案 2 + Ctrl+Alt+T"，按 M1 会先切方案再发热键。
+                MA / MB 是纯全局键（没按方案宏），M1-M12 是按方案宏 + 全局动作双层叠加。
+            </div>
+
+            <div class="grid-2" style="margin-top: 10px;">
+                <div>
+                    <label>编辑目标键：</label>
+                    <select id="globalkKeySel" onchange="onGlobalkKeyChange()">
+                        <option value="MA">MA</option>
+                        <option value="MB">MB</option>
+                        <option value="M1">M1</option>
+                        <option value="M2">M2</option>
+                        <option value="M3">M3</option>
+                        <option value="M4">M4</option>
+                        <option value="M5">M5</option>
+                        <option value="M6">M6</option>
+                        <option value="M7">M7</option>
+                        <option value="M8">M8</option>
+                        <option value="M9">M9</option>
+                        <option value="M10">M10</option>
+                        <option value="M11">M11</option>
+                        <option value="M12">M12</option>
+                    </select>
+
+                    <label style="margin-top: 6px; display:block;">① 切换配置方案：</label>
+                    <select id="globalkSwAction">
+                        <option value="NONE">不切换方案 (无动作)</option>
+                        <option value="0">方案 1 (Windows 默认)</option>
+                        <option value="1">方案 2 (macOS 默认)</option>
+                        <option value="2">方案 3 (游戏定制)</option>
+                        <option value="3">方案 4 (工作定制)</option>
+                        <option value="NEXT">循环切换到下一个方案</option>
+                    </select>
+
+                    <label style="margin-top: 6px; display:block;">② 附加组合键 / 打字效果：</label>
+                    <div class="chk-group">
+                        <label><input type="checkbox" id="globalkCtrl"> Ctrl</label>
+                        <label><input type="checkbox" id="globalkAlt"> Alt</label>
+                        <label><input type="checkbox" id="globalkShift"> Shift</label>
+                        <label><input type="checkbox" id="globalkWin"> Win/Cmd</label>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <select id="globalkKeySelect" style="flex: 2;"></select>
+                        <input type="text" id="globalkCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
+                    </div>
+                    <div style="margin-top: 6px;">
+                        <button class="btn-tag" onclick="setGlobalkMode('CMB')">⚡ 组合快捷键 (同时按下)</button>
+                        <button class="btn-tag" onclick="setGlobalkMode('SEQ')">🔤 打字效果 (连续击键)</button>
+                    </div>
+                    <textarea id="globalkSeqInput" rows="2" placeholder="打字模式在此填字符序列（与上方组合键互斥）：例：ls -la[ENTER]"></textarea>
+
+                    <button class="btn btn-green" id="saveGlobalkBtn" style="width: 100%; margin-top: 10px;">保存全局动作</button>
+                    <button class="btn btn-tag" id="clearGlobalkBtn" style="width: 100%; margin-top: 6px;">🗑️ 清除此键全局配置</button>
+                </div>
+
+                <div style="background: #334155; padding: 15px; border-radius: 8px;">
+                    <h3 style="margin-top:0; color:#38bdf8;">📝 用法说明</h3>
+                    <div class="hint" style="line-height: 1.7;">
+                        <b>协议：</b>GSET:&lt;KEY&gt;:&lt;payload&gt;<br>
+                        payload = "SW:&lt;id&gt;+CMB:&lt;codes&gt;" 或 "SW:&lt;id&gt;+SEQ:&lt;text&gt;"<br>
+                        <br>
+                        <b>按键规则：</b><br>
+                        • MA / MB：纯全局键，按下只跑全局配置<br>
+                        • M1~M12：先跑全局配置，再播按方案宏<br>
+                        • 不配全局动作 → M1-M12 行为与旧版一致（仅按方案宏）<br>
+                        <br>
+                        <b>组合键码值：</b>Ctrl=128, Shift=129, Alt=130, Win=131，键位见下方 KEY_OPTIONS
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. 方案专属宏 M1-M12 -->
+        <div class="card">
+            <h2>4. 方案专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
+            <div class="hint">这里编辑的是按方案宏：每个方案下的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
+
             <div>
-                <label>主屏幕显示风格切换：</label>
-                <select id="dispModeSelect" onchange="changeDispMode()">
-                    <option value="0">风格 1：极简大数字时钟与日期</option>
-                    <option value="1">风格 2：极客全能仪表盘 (时钟+计数+跑马灯)</option>
-                    <option value="2">风格 3：信息面板 (时钟/日期 + 三个锁状态圆 + 方案图标/实时按键)</option>
-                    <option value="3">风格 4：实时击键监控台 (OSD状态)</option>
-                    <option value="4">风格 5：律动 (音乐起伏 + 键帽掉落 + 底部锁状态条)</option>
-                    <option value="5">风格 6：全屏壁纸相册模式</option>
+                <label style="font-weight: bold; color: #38bdf8;">编辑目标方案 (Profile)：</label>
+                <select id="activeProfile">
+                    <option value="0">方案 1 (Windows)</option>
+                    <option value="1">方案 2 (macOS)</option>
+                    <option value="2">方案 3 (游戏模式)</option>
+                    <option value="3">方案 4 (工作模式)</option>
                 </select>
             </div>
-            <div>
-                <label>实时按键键名回显 (Keystroke OSD)：</label>
-                <select id="keystrokeSelect" onchange="toggleKeystroke()">
-                    <option value="1">开启实时按键回显</option>
-                    <option value="0">关闭实时按键回显</option>
+
+            <div style="margin-top: 10px;">
+                <label>目标宏按键：</label>
+                <select id="macroKey">
+                    <option value="M1">M1</option><option value="M2">M2</option><option value="M3">M3</option>
+                    <option value="M4">M4</option><option value="M5">M5</option><option value="M6">M6</option>
+                    <option value="M7">M7</option><option value="M8">M8</option><option value="M9">M9</option>
+                    <option value="M10">M10</option><option value="M11">M11</option><option value="M12">M12</option>
                 </select>
+
+                <div class="mode-tabs">
+                    <label><input type="radio" name="macroMode" value="SEQ" checked onchange="toggleMacroMode()"> 🔤 打字效果 (连续击键流，支持延时)</label>
+                    <label><input type="radio" name="macroMode" value="CMB" onchange="toggleMacroMode()"> ⚡ 组合快捷键 (同时按下并释放)</label>
+                </div>
+
+                <div id="seqPanel">
+                    <div style="margin: 5px 0;">
+                        <button class="btn-tag" onclick="insertMacroTag('[ENTER]')">回车 [ENTER]</button>
+                        <button class="btn-tag" onclick="insertMacroTag('[TAB]')">Tab [TAB]</button>
+                        <button class="btn-tag" onclick="insertMacroTag('[ESC]')">Esc [ESC]</button>
+                        <button class="btn-tag" onclick="insertMacroTag('[BACKSPACE]')">退格</button>
+                        <button class="btn-tag" onclick="insertMacroTag('SLEEP(100)')">⏱️ 延时 100ms</button>
+                        <button class="btn-tag" onclick="insertMacroTag('SLEEP(500)')">⏱️ 延时 500ms</button>
+                    </div>
+                    <textarea id="seqInput" rows="3" placeholder="例：sudo apt update[ENTER]SLEEP(500)sudo apt upgrade -y[ENTER]"></textarea>
+                </div>
+
+                <div id="cmbPanel" style="display: none; background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
+                    <div class="hint">选择修饰键与按键，按下时将同时按下并释放（如 Ctrl + Shift + Esc）：</div>
+                    <div class="chk-group" style="margin-top: 8px;">
+                        <label><input type="checkbox" id="macroCtrl"> Ctrl</label>
+                        <label><input type="checkbox" id="macroAlt"> Alt</label>
+                        <label><input type="checkbox" id="macroShift"> Shift</label>
+                        <label><input type="checkbox" id="macroWin"> Win/Cmd</label>
+                    </div>
+                    <div style="display: flex; gap: 8px; margin-top: 6px;">
+                        <select id="macroKeySelect" style="flex: 2;"></select>
+                        <input type="text" id="macroCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
+                    </div>
+                </div>
+
+                <button class="btn btn-green" id="saveMacroBtn" style="width: 100%; margin-top: 8px;">保存宏配置到当前方案</button>
             </div>
         </div>
     </div>
 
-    <!-- 3. MA / MB 全局键 (支持方案切换与组合键并行) -->
-    <div class="card">
-        <h2>3. 全局独立功能键 (MA / MB)</h2>
-        <div class="hint">MA、MB 通用生效；支持方案切换与快捷组合键同时联动下发。</div>
-        <div class="grid-2" style="margin-top: 10px;">
-            <div style="background: #334155; padding: 15px; border-radius: 8px;">
-                <h3 style="margin-top:0; color:#38bdf8;">MA 功能分配</h3>
-                <label>① 切换配置方案：</label>
-                <select id="maSwAction">
-                    <option value="NONE">不切换方案 (无动作)</option>
-                    <option value="0" selected>方案 1 (Windows 默认)</option>
-                    <option value="1">方案 2 (macOS 默认)</option>
-                    <option value="2">方案 3 (游戏定制)</option>
-                    <option value="3">方案 4 (工作定制)</option>
-                    <option value="NEXT">循环切换到下一个方案</option>
-                </select>
-                <label style="margin-top: 6px; display:block;">② 附加组合键 (如 Ctrl+Alt+T)：</label>
-                <div class="chk-group">
-                    <label><input type="checkbox" id="maCtrl"> Ctrl</label>
-                    <label><input type="checkbox" id="maAlt"> Alt</label>
-                    <label><input type="checkbox" id="maShift"> Shift</label>
-                    <label><input type="checkbox" id="maWin"> Win/Cmd</label>
-                </div>
-                <div style="display: flex; gap: 8px;">
-                    <select id="maKeySelect" style="flex: 2;"></select>
-                    <input type="text" id="maCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
-                </div>
-                <button class="btn btn-green" id="saveMaBtn" style="width: 100%; margin-top: 10px;">保存 MA 全局设置</button>
-            </div>
+    <!-- =================== 系统设置 Tab =================== -->
+    <div id="tab-system" class="tab-panel">
 
-            <div style="background: #334155; padding: 15px; border-radius: 8px;">
-                <h3 style="margin-top:0; color:#38bdf8;">MB 功能分配</h3>
-                <label>① 切换配置方案：</label>
-                <select id="mbSwAction">
-                    <option value="NONE">不切换方案 (无动作)</option>
-                    <option value="1" selected>方案 2 (macOS 默认)</option>
-                    <option value="0">方案 1 (Windows 默认)</option>
-                    <option value="2">方案 3 (游戏定制)</option>
-                    <option value="3">方案 4 (工作定制)</option>
-                    <option value="NEXT">循环切换到下一个方案</option>
-                </select>
-                <label style="margin-top: 6px; display:block;">② 附加组合键：</label>
-                <div class="chk-group">
-                    <label><input type="checkbox" id="mbCtrl"> Ctrl</label>
-                    <label><input type="checkbox" id="mbAlt"> Alt</label>
-                    <label><input type="checkbox" id="mbShift"> Shift</label>
-                    <label><input type="checkbox" id="mbWin"> Win/Cmd</label>
+        <!-- 1. 蓝牙连接、时间校准、系统通知灯 -->
+        <div class="card">
+            <h2>1. 蓝牙连接、精准校时与系统通知灯</h2>
+            <div style="display: flex; gap: 15px; align-items: center;">
+                <button class="btn" id="connectBtn">连接键盘蓝牙</button>
+                <span id="status" style="font-weight: bold; color: #f87171;">未连接</span>
+                <button class="btn btn-green" id="syncTimeBtn" style="margin-left: auto;">同步电脑时间</button>
+            </div>
+            <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
+                <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
+                <div class="alert-bar">
+                    <button class="btn btn-red" onclick="sendAlert('RED')">🚨 触发红灯闪烁</button>
+                    <button class="btn btn-green" onclick="sendAlert('GREEN')">🟢 触发绿灯闪烁</button>
+                    <button class="btn btn-yellow" onclick="sendAlert('YELLOW')">⚠️ 触发黄灯闪烁</button>
+                    <button class="btn btn-tag" onclick="sendAlert('OFF')">⏹️ 停止报警闪烁</button>
                 </div>
-                <div style="display: flex; gap: 8px;">
-                    <select id="mbKeySelect" style="flex: 2;"></select>
-                    <input type="text" id="mbCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
-                </div>
-                <button class="btn btn-green" id="saveMbBtn" style="width: 100%; margin-top: 10px;">保存 MB 全局设置</button>
             </div>
         </div>
-    </div>
 
-    <!-- 4. 方案专属宏 (M1~M12) 支持 SLEEP(ms) 与 组合键 -->
-    <div class="card">
-        <h2>4. 方案专属宏 (M1 ~ M12) - 支持 SLEEP(ms) 与组合键</h2>
-        <div>
-            <label style="font-weight: bold; color: #38bdf8;">编辑目标方案 (Profile):</label>
-            <select id="activeProfile">
-                <option value="0">方案 1 (Windows)</option>
-                <option value="1">方案 2 (macOS)</option>
-                <option value="2">方案 3 (游戏模式)</option>
-                <option value="3">方案 4 (工作模式)</option>
-            </select>
-        </div>
-
-        <div style="margin-top: 10px;">
-            <label>目标宏按键:</label>
-            <select id="macroKey">
-                <option value="M1">M1</option><option value="M2">M2</option><option value="M3">M3</option>
-                <option value="M4">M4</option><option value="M5">M5</option><option value="M6">M6</option>
-                <option value="M7">M7</option><option value="M8">M8</option><option value="M9">M9</option>
-                <option value="M10">M10</option><option value="M11">M11</option><option value="M12">M12</option>
-            </select>
-
-            <div class="mode-tabs">
-                <label><input type="radio" name="macroMode" value="SEQ" checked onchange="toggleMacroMode()"> 🔤 打字效果 (连续击键流，支持延时)</label>
-                <label><input type="radio" name="macroMode" value="CMB" onchange="toggleMacroMode()"> ⚡ 组合快捷键 (同时按下并释放)</label>
+        <!-- 2. 时钟 / 闹钟 / 倒计时 -->
+        <div class="card">
+            <h2>2. 时钟 / 闹钟 / 倒计时</h2>
+            <div class="hint">
+                这三样在键盘上按 <b>MC</b> 键进菜单也能设（7 设置时间 / 8 闹钟设置 / 9 倒计时），
+                这里只是图个方便。到点时键盘会弹出常驻卡片 + 19 颗灯全红快闪，
+                按键盘上的<b>灯光键</b>确认；60 秒没人理会就自动停铃，并留一条红色通知。
             </div>
-
-            <!-- 打字模式 -->
-            <div id="seqPanel">
-                <div style="margin: 5px 0;">
-                    <button class="btn-tag" onclick="insertTag('[ENTER]')">回车 [ENTER]</button>
-                    <button class="btn-tag" onclick="insertTag('[TAB]')">Tab [TAB]</button>
-                    <button class="btn-tag" onclick="insertTag('[ESC]')">Esc [ESC]</button>
-                    <button class="btn-tag" onclick="insertTag('SLEEP(100)')">⏱️ 延时 100ms SLEEP(100)</button>
-                    <button class="btn-tag" onclick="insertTag('SLEEP(500)')">⏱️ 延时 500ms SLEEP(500)</button>
+            <div class="grid-2" style="margin-top: 12px;">
+                <div style="background: #334155; padding: 15px; border-radius: 8px;">
+                    <h3 style="margin-top:0; color:#38bdf8;">闹钟</h3>
+                    <label>响铃时间（24 小时制）：</label>
+                    <input type="time" id="alarmTime" value="07:30">
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <button class="btn btn-green" id="alarmOnBtn" style="flex: 1;">开启闹钟</button>
+                        <button class="btn btn-tag" id="alarmOffBtn" style="flex: 1;">关闭闹钟</button>
+                    </div>
                 </div>
-                <textarea id="seqInput" rows="3" placeholder="例如: sudo apt update[ENTER]SLEEP(500)sudo apt upgrade -y[ENTER]"></textarea>
-            </div>
-
-            <!-- 组合键模式 -->
-            <div id="cmbPanel" style="display: none; background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
-                <div class="hint">选择修饰键与按键，按下时将同时按下并释放（如 Ctrl + Shift + Esc）：</div>
-                <div class="chk-group" style="margin-top: 8px;">
-                    <label><input type="checkbox" id="macroCtrl"> Ctrl</label>
-                    <label><input type="checkbox" id="macroAlt"> Alt</label>
-                    <label><input type="checkbox" id="macroShift"> Shift</label>
-                    <label><input type="checkbox" id="macroWin"> Win/Cmd</label>
-                </div>
-                <div style="display: flex; gap: 8px; margin-top: 6px;">
-                    <select id="macroKeySelect" style="flex: 2;"></select>
-                    <input type="text" id="macroCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
+                <div style="background: #334155; padding: 15px; border-radius: 8px;">
+                    <h3 style="margin-top:0; color:#38bdf8;">倒计时</h3>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="number" id="tmrH" min="0" max="23" value="0" placeholder="时">
+                        <input type="number" id="tmrM" min="0" max="59" value="5" placeholder="分">
+                        <input type="number" id="tmrS" min="0" max="59" value="0" placeholder="秒">
+                    </div>
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <button class="btn btn-orange" id="tmrStartBtn" style="flex: 1;">开始倒计时</button>
+                        <button class="btn btn-tag" id="tmrStopBtn" style="flex: 1;">停止</button>
+                    </div>
                 </div>
             </div>
+        </div>
 
-            <button class="btn btn-green" id="saveMacroBtn" style="width: 100%; margin-top: 8px;">保存宏配置到当前方案</button>
+        <!-- 3. 屏幕显示模式 & 按键回显 -->
+        <div class="card">
+            <h2>3. 屏幕多主题展示模式 & 按键回显</h2>
+            <div class="grid-2">
+                <div>
+                    <label>主屏幕显示风格切换：</label>
+                    <select id="dispModeSelect" onchange="changeDispMode()">
+                        <option value="0">风格 1：极简大数字时钟与日期</option>
+                        <option value="1">风格 2：极客全能仪表盘 (时钟+计数+跑马灯)</option>
+                        <option value="2">风格 3：信息面板 (时钟/日期 + 三个锁状态圆 + 方案图标/实时按键)</option>
+                        <option value="3">风格 4：实时击键监控台 (OSD状态)</option>
+                        <option value="4">风格 5：律动 (音乐起伏 + 键帽掉落 + 底部锁状态条)</option>
+                        <option value="5">风格 6：全屏壁纸相册模式</option>
+                    </select>
+                </div>
+                <div>
+                    <label>实时按键键名回显 (Keystroke OSD)：</label>
+                    <select id="keystrokeSelect" onchange="toggleKeystroke()">
+                        <option value="1">开启实时按键回显</option>
+                        <option value="0">关闭实时按键回显</option>
+                    </select>
+                </div>
+            </div>
         </div>
-    </div>
 
-    <!-- 5. 自定义图片画板与睡眠壁纸上传 -->
-    <div class="card">
-        <h2>5. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
-        <div class="hint">
-            随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
-            <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
+        <!-- 4. 壁纸 / LOGO 画板上传 -->
+        <div class="card">
+            <h2>4. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
+            <div class="hint">
+                随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
+                <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
+            </div>
+            <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
+                <input type="file" id="imageInput" accept="image/*" style="width: auto;">
+                <canvas id="previewCanvas" width="240" height="240" style="border: 1px solid #475569; width: 120px; height: 120px; border-radius: 6px;"></canvas>
+                <button class="btn btn-orange" id="uploadImageBtn">压缩并上传到键盘壁纸</button>
+            </div>
+            <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
         </div>
-        <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
-            <input type="file" id="imageInput" accept="image/*" style="width: auto;">
-            <canvas id="previewCanvas" width="240" height="240" style="border: 1px solid #475569; width: 120px; height: 120px; border-radius: 6px;"></canvas>
-            <button class="btn btn-orange" id="uploadImageBtn">压缩并上传到键盘壁纸</button>
-        </div>
-        <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
     </div>
 
 <script>
+    // 键码字典：数字 = HID Usage ID，与固件 getKeyName() 的标准值一致。
     const KEY_OPTIONS = {
         "无按键": 0,
         "A": 97, "B": 98, "C": 99, "D": 100, "E": 101, "F": 102, "G": 103,
@@ -252,48 +366,46 @@
         "F7": 200, "F8": 201, "F9": 202, "F10": 203, "F11": 204, "F12": 205,
         "Enter 回车": 176, "Esc": 177, "Backspace 退格": 178, "Tab": 179, "Space 空格": 32,
         "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
-        "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215
+        "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
+        // REMAP 专用修饰键（HID 标准）
+        "🔹 Left Ctrl": 224, "🔹 Left Shift": 225, "🔹 Left Alt": 226, "🔹 Left GUI/Win": 227,
+        "🔹 Right Ctrl": 228, "🔹 Right Shift": 229, "🔹 Right Alt": 230, "🔹 Right GUI/Win": 231
     };
 
-    function populateSelects() {
-        let maKeySel = document.getElementById('maKeySelect');
-        let mbKeySel = document.getElementById('mbKeySelect');
-        let macroKeySel = document.getElementById('macroKeySelect');
+    // 全局动作里的主键下拉不需要修饰键项（修饰键用复选框）。
+    const KEY_OPTIONS_NO_MODS = (() => {
+        const out = {};
+        for (const k in KEY_OPTIONS) {
+            if (!k.startsWith("🔹")) out[k] = KEY_OPTIONS[k];
+        }
+        return out;
+    })();
 
-        for (let name in KEY_OPTIONS) {
-            let val = KEY_OPTIONS[name];
-            let opt = `<option value="${val}">${name}</option>`;
-            maKeySel.innerHTML += opt;
-            mbKeySel.innerHTML += opt;
-            macroKeySel.innerHTML += opt;
+    function populateSelect(sel, dict) {
+        for (let name in dict) {
+            sel.innerHTML += `<option value="${dict[name]}">${name}</option>`;
         }
     }
-    populateSelects();
 
-    function toggleMacroMode() {
-        let mode = document.querySelector('input[name="macroMode"]:checked').value;
-        document.getElementById('seqPanel').style.display = (mode === 'SEQ') ? 'block' : 'none';
-        document.getElementById('cmbPanel').style.display = (mode === 'CMB') ? 'block' : 'none';
+    function populateAll() {
+        populateSelect(document.getElementById('globalkKeySelect'), KEY_OPTIONS_NO_MODS);
+        populateSelect(document.getElementById('macroKeySelect'), KEY_OPTIONS_NO_MODS);
+        populateSelect(document.getElementById('remapFromSel'), KEY_OPTIONS);
+        populateSelect(document.getElementById('remapToSel'), KEY_OPTIONS);
+    }
+    populateAll();
+
+    // ========== Tab 切换 ==========
+    function switchTab(name) {
+        document.getElementById('tab-profile').classList.toggle('active', name === 'profile');
+        document.getElementById('tab-system').classList.toggle('active', name === 'system');
+        document.getElementById('tab-profile-btn').classList.toggle('active', name === 'profile');
+        document.getElementById('tab-system-btn').classList.toggle('active', name === 'system');
     }
 
-    function buildComboCodes(ctrlId, altId, shiftId, winId, selectId, customCharId) {
-        let codes = [];
-        if (document.getElementById(ctrlId).checked) codes.push(128);
-        if (document.getElementById(altId).checked) codes.push(130);
-        if (document.getElementById(shiftId).checked) codes.push(129);
-        if (document.getElementById(winId).checked) codes.push(131);
-
-        let customChar = document.getElementById(customCharId).value.trim();
-        if (customChar.length > 0) {
-            codes.push(customChar.toLowerCase().charCodeAt(0));
-        } else {
-            let keyVal = parseInt(document.getElementById(selectId).value);
-            if (keyVal > 0) codes.push(keyVal);
-        }
-        return codes;
-    }
-
+    // ========== BLE 连接与发送 ==========
     let myCharacteristic;
+
     document.getElementById('connectBtn').addEventListener('click', async () => {
         try {
             const device = await navigator.bluetooth.requestDevice({
@@ -311,32 +423,239 @@
     });
 
     async function sendBLE(str) {
-        if (!myCharacteristic) { alert("请先连接蓝牙！"); return; }
+        if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
         const encoder = new TextEncoder();
         await myCharacteristic.writeValue(encoder.encode(str));
         await new Promise(r => setTimeout(r, 50));
+        return true;
     }
 
-    // 1. 同步时间
+    // ========== 1. ME 蓝牙发送文本 ==========
+    function insertMeTag(tag) {
+        const t = document.getElementById('meTextInput');
+        const s = t.selectionStart, e = t.selectionEnd;
+        t.value = t.value.substring(0, s) + tag + t.value.substring(e);
+        t.focus();
+    }
+
+    document.getElementById('meSendBtn').addEventListener('click', async () => {
+        const text = document.getElementById('meTextInput').value;
+        if (!text) return alert("请输入要发送的文本！");
+        const ok = await sendBLE("ME_TEXT:" + text);
+        if (ok) alert(`已发送 ${text.length} 字符给键盘，主机光标位置会立刻收到。`);
+    });
+
+    // ========== 2. 按方案按键映射 REMAP ==========
+    // 内存中累积的当前方案规则数组：[{from:128, to:129}, ...]
+    let remapRules = [];
+
+    function remapRefreshList() {
+        const box = document.getElementById('remapRuleList');
+        if (remapRules.length === 0) {
+            box.innerHTML = '<div class="hint">当前方案无映射规则</div>';
+            return;
+        }
+        box.innerHTML = '';
+        remapRules.forEach((r, idx) => {
+            const fromName = codeToKeyName(r.from) || `#${r.from}`;
+            const toName = codeToKeyName(r.to) || `#${r.to}`;
+            const row = document.createElement('div');
+            row.className = 'rule-row';
+            row.innerHTML = `<span style="color:#f87171;">${fromName}</span>
+                             <span class="arrow">→</span>
+                             <span style="color:#4ade80;">${toName}</span>
+                             <span class="remove-btn" onclick="remapRemoveAt(${idx})">✕ 删除</span>`;
+            box.appendChild(row);
+        });
+    }
+
+    function codeToKeyName(code) {
+        for (const k in KEY_OPTIONS) if (KEY_OPTIONS[k] === code) return k;
+        return null;
+    }
+
+    function remapRemoveAt(idx) {
+        remapRules.splice(idx, 1);
+        remapRefreshList();
+    }
+
+    document.getElementById('remapAddBtn').addEventListener('click', () => {
+        const from = parseInt(document.getElementById('remapFromSel').value);
+        const to = parseInt(document.getElementById('remapToSel').value);
+        if (from === 0 || to === 0) return alert("请选择有效的键（不能是'无按键'）");
+        if (from === to) return alert("从按键和到按键不能相同");
+        // 同一 from 已存在则覆盖
+        const existing = remapRules.findIndex(r => r.from === from);
+        if (existing >= 0) remapRules[existing].to = to;
+        else remapRules.push({ from, to });
+        remapRefreshList();
+    });
+
+    document.getElementById('remapClearBtn').addEventListener('click', async () => {
+        if (!confirm("确定要清空当前方案的所有按键映射？")) return;
+        remapRules = [];
+        remapRefreshList();
+        const prof = document.getElementById('remapProfile').value;
+        await sendBLE(`REMAP:${prof}:1:`);   // 清空信号
+        alert("已清空！");
+    });
+
+    document.getElementById('remapSaveBtn').addEventListener('click', async () => {
+        const prof = document.getElementById('remapProfile').value;
+        if (remapRules.length === 0) {
+            // 没规则就发清空指令，避免误保留旧规则
+            await sendBLE(`REMAP:${prof}:1:`);
+            alert("已清空此方案的按键映射。");
+            return;
+        }
+        const pairs = remapRules.map(r => `${r.from},${r.to}`).join(';');
+        await sendBLE(`REMAP:${prof}:1:${pairs}`);
+        alert(`已保存 ${remapRules.length} 条映射到方案 ${Number(prof) + 1}！`);
+    });
+
+    document.getElementById('remapProfile').addEventListener('change', () => {
+        // 切方案时清空内存里的列表，避免误把方案 A 的规则当方案 B 保存
+        remapRules = [];
+        remapRefreshList();
+    });
+
+    document.getElementById('remapLoadBtn').addEventListener('click', () => {
+        alert("当前 BLE 协议不提供读回接口。请在添加规则时自己记录——保存到键盘会覆盖同名规则的 from 端。");
+    });
+
+    // ========== 3. 全局动作 MA / MB / M1-M12 合并 ==========
+    let globalkMode = 'CMB';  // 'CMB' 或 'SEQ'
+
+    function buildGlobalkPayload() {
+        const sw = document.getElementById('globalkSwAction').value;
+        const seqText = document.getElementById('globalkSeqInput').value;
+
+        // 优先用 SEQ 模式（如果用户填了非空文本）
+        let useMode = globalkMode;
+        if (useMode === 'SEQ' && !seqText) {
+            // SEQ 但文本空，回退看 CMB 复选框
+            useMode = 'CMB';
+        }
+
+        let extra = '';
+        if (useMode === 'SEQ') {
+            extra = 'SEQ:' + seqText;
+        } else {
+            const codes = [];
+            if (document.getElementById('globalkCtrl').checked) codes.push(128);
+            if (document.getElementById('globalkAlt').checked) codes.push(130);
+            if (document.getElementById('globalkShift').checked) codes.push(129);
+            if (document.getElementById('globalkWin').checked) codes.push(131);
+            const customChar = document.getElementById('globalkCustomChar').value.trim();
+            if (customChar.length > 0) {
+                codes.push(customChar.toLowerCase().charCodeAt(0));
+            } else {
+                const keyVal = parseInt(document.getElementById('globalkKeySelect').value);
+                if (keyVal > 0) codes.push(keyVal);
+            }
+            if (codes.length > 0) extra = 'CMB:' + codes.join(',');
+        }
+
+        if (sw !== 'NONE') {
+            return extra ? `SW:${sw}+${extra}` : `SW:${sw}`;
+        }
+        return extra || 'NONE';
+    }
+
+    function setGlobalkMode(mode) {
+        globalkMode = mode;
+        document.getElementById('globalkSeqInput').style.display = (mode === 'SEQ') ? 'block' : 'none';
+    }
+
+    function onGlobalkKeyChange() {
+        // 切换键名时清空所有输入（避免误操作）
+        document.getElementById('globalkSwAction').value = 'NONE';
+        document.getElementById('globalkCtrl').checked = false;
+        document.getElementById('globalkAlt').checked = false;
+        document.getElementById('globalkShift').checked = false;
+        document.getElementById('globalkWin').checked = false;
+        document.getElementById('globalkCustomChar').value = '';
+        document.getElementById('globalkSeqInput').value = '';
+    }
+
+    document.getElementById('saveGlobalkBtn').addEventListener('click', async () => {
+        const key = document.getElementById('globalkKeySel').value;
+        const payload = buildGlobalkPayload();
+        await sendBLE(`GSET:${key}:${payload}`);
+        alert(`${key} 全局动作已生效！\n协议: GSET:${key}:${payload}`);
+    });
+
+    document.getElementById('clearGlobalkBtn').addEventListener('click', async () => {
+        const key = document.getElementById('globalkKeySel').value;
+        if (!confirm(`确定要清除 ${key} 的全局配置？`)) return;
+        await sendBLE(`GSET:${key}:NONE`);
+        alert(`${key} 已清空全局配置。`);
+    });
+
+    // ========== 4. 方案专属宏 M1-M12 ==========
+    function toggleMacroMode() {
+        let mode = document.querySelector('input[name="macroMode"]:checked').value;
+        document.getElementById('seqPanel').style.display = (mode === 'SEQ') ? 'block' : 'none';
+        document.getElementById('cmbPanel').style.display = (mode === 'CMB') ? 'block' : 'none';
+    }
+
+    function buildComboCodes(ctrlId, altId, shiftId, winId, selectId, customCharId) {
+        const codes = [];
+        if (document.getElementById(ctrlId).checked) codes.push(128);
+        if (document.getElementById(altId).checked) codes.push(130);
+        if (document.getElementById(shiftId).checked) codes.push(129);
+        if (document.getElementById(winId).checked) codes.push(131);
+        const customChar = document.getElementById(customCharId).value.trim();
+        if (customChar.length > 0) {
+            codes.push(customChar.toLowerCase().charCodeAt(0));
+        } else {
+            const keyVal = parseInt(document.getElementById(selectId).value);
+            if (keyVal > 0) codes.push(keyVal);
+        }
+        return codes;
+    }
+
+    function insertMacroTag(tag) {
+        const t = document.getElementById('seqInput');
+        const s = t.selectionStart, e = t.selectionEnd;
+        t.value = t.value.substring(0, s) + tag + t.value.substring(e);
+        t.focus();
+    }
+
+    document.getElementById('saveMacroBtn').addEventListener('click', async () => {
+        const prof = document.getElementById('activeProfile').value;
+        const mKey = document.getElementById('macroKey').value;
+        const mode = document.querySelector('input[name="macroMode"]:checked').value;
+
+        if (mode === "SEQ") {
+            const txt = document.getElementById('seqInput').value;
+            if (!txt) return alert("请输入宏击键流内容！");
+            await sendBLE(`SET:p${prof}_${mKey}:SEQ:${txt}`);
+            alert(`已保存打字/延时宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
+        } else {
+            const codes = buildComboCodes('macroCtrl', 'macroAlt', 'macroShift', 'macroWin', 'macroKeySelect', 'macroCustomChar');
+            if (codes.length === 0) return alert("请至少指定一个按键！");
+            await sendBLE(`SET:p${prof}_${mKey}:CMB:${codes.join(',')}`);
+            alert(`已保存组合键宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
+        }
+    });
+
+    // ========== 系统设置：时间 / 闹钟 / 倒计时 / 显示 / 回显 / 灯光 ==========
     document.getElementById('syncTimeBtn').addEventListener('click', async () => {
         const sec = Math.floor(Date.now() / 1000);
         await sendBLE("TIME:" + sec);
         alert("已将当前时间同步给键盘！");
     });
 
-    // 2. 系统报警灯光下发
     async function sendAlert(color) {
         await sendBLE("ALERT:" + color);
     }
 
-    // 2.5 闹钟 / 倒计时
-    // 注意闹钟用的是 ALARMSET ，不是 ALERT 的别名 alarm —— 两个是完全不同的东西：
-    // ALERT 是"现在闪一下灯"，ALARMSET 是"到点了叫我"。
     document.getElementById('alarmOnBtn').addEventListener('click', async () => {
-        const t = document.getElementById('alarmTime').value;   // 原生 time 控件给的就是 HH:MM
+        const t = document.getElementById('alarmTime').value;
         if (!t) return alert("请先选一个响铃时间！");
         await sendBLE("ALARMSET:" + t);
-        alert(`闹钟已开启：每天 ${t} 提醒（到点在键盘上按灯光键确认）`);
+        alert(`闹钟已开启：每天 ${t} 提醒`);
     });
 
     document.getElementById('alarmOffBtn').addEventListener('click', async () => {
@@ -351,7 +670,7 @@
         const total = h * 3600 + m * 60 + s;
         if (total <= 0) return alert("倒计时时长必须大于 0！");
         await sendBLE("TIMERSET:" + total);
-        alert(`倒计时已启动：${h} 时 ${m} 分 ${s} 秒（最后 1 分钟屏幕会每秒报数）`);
+        alert(`倒计时已启动：${h} 时 ${m} 分 ${s} 秒`);
     });
 
     document.getElementById('tmrStopBtn').addEventListener('click', async () => {
@@ -359,133 +678,68 @@
         alert("倒计时已停止");
     });
 
-    // 3. 屏幕风格切换
     async function changeDispMode() {
-        let mode = document.getElementById('dispModeSelect').value;
+        const mode = document.getElementById('dispModeSelect').value;
         await sendBLE("DISP_MODE:" + mode);
     }
 
-    // 4. 实时按键回显开关
     async function toggleKeystroke() {
-        let val = document.getElementById('keystrokeSelect').value;
+        const val = document.getElementById('keystrokeSelect').value;
         await sendBLE("SET_KEYSTROKE:" + val);
     }
 
-    // 5. MA / MB 保存
-    document.getElementById('saveMaBtn').addEventListener('click', async () => {
-        let sw = document.getElementById('maSwAction').value;
-        let cmbCodes = buildComboCodes('maCtrl', 'maAlt', 'maShift', 'maWin', 'maKeySelect', 'maCustomChar');
-        let payload = (sw !== "NONE") ? ("SW:" + sw + (cmbCodes.length > 0 ? "+CMB:" + cmbCodes.join(',') : "")) : (cmbCodes.length > 0 ? "CMB:" + cmbCodes.join(',') : "NONE");
-        await sendBLE(`GSET:MA:${payload}`);
-        alert("MA 全局设置已生效！");
-    });
-
-    document.getElementById('saveMbBtn').addEventListener('click', async () => {
-        let sw = document.getElementById('mbSwAction').value;
-        let cmbCodes = buildComboCodes('mbCtrl', 'mbAlt', 'mbShift', 'mbWin', 'mbKeySelect', 'mbCustomChar');
-        let payload = (sw !== "NONE") ? ("SW:" + sw + (cmbCodes.length > 0 ? "+CMB:" + cmbCodes.join(',') : "")) : (cmbCodes.length > 0 ? "CMB:" + cmbCodes.join(',') : "NONE");
-        await sendBLE(`GSET:MB:${payload}`);
-        alert("MB 全局设置已生效！");
-    });
-
-    // 6. 宏定义保存
-    document.getElementById('saveMacroBtn').addEventListener('click', async () => {
-        let prof = document.getElementById('activeProfile').value;
-        let mKey = document.getElementById('macroKey').value;
-        let mode = document.querySelector('input[name="macroMode"]:checked').value;
-
-        if (mode === "SEQ") {
-            let txt = document.getElementById('seqInput').value;
-            if (!txt) return alert("请输入宏击键流内容！");
-            await sendBLE(`SET:p${prof}_${mKey}:SEQ:${txt}`);
-            alert(`已保存打字/延时宏到方案 ${Number(prof)+1} 的 ${mKey}！`);
-        } else {
-            let codes = buildComboCodes('macroCtrl', 'macroAlt', 'macroShift', 'macroWin', 'macroKeySelect', 'macroCustomChar');
-            if (codes.length === 0) return alert("请至少指定一个按键！");
-            await sendBLE(`SET:p${prof}_${mKey}:CMB:${codes.join(',')}`);
-            alert(`已保存组合键宏到方案 ${Number(prof)+1} 的 ${mKey}！`);
-        }
-    });
-
-    function insertTag(tag) {
-        const textarea = document.getElementById('seqInput');
-        const start = textarea.selectionStart;
-        const end = textarea.selectionEnd;
-        textarea.value = textarea.value.substring(0, start) + tag + textarea.value.substring(end);
-        textarea.focus();
-    }
-
-    // 7. 图片本地缩放 + JPEG 压缩后上传
-    // 出网的永远只有压缩后那十几 KB，原图多大都留在浏览器里。
+    // ========== 壁纸上传（与原版一致，单独保留） ==========
     let uploadBlob = null;
 
     document.getElementById('imageInput').addEventListener('change', (e) => {
-        let file = e.target.files[0];
+        const file = e.target.files[0];
         if (!file) return;
-
-        let pBox = document.getElementById('uploadProgress');
+        const pBox = document.getElementById('uploadProgress');
         pBox.innerText = "正在读取并压缩图片...";
-
-        let url = URL.createObjectURL(file);
-        let img = new Image();
+        const url = URL.createObjectURL(file);
+        const img = new Image();
         img.onload = () => {
-            let canvas = document.getElementById('previewCanvas');
-            let ctx = canvas.getContext('2d');
+            const canvas = document.getElementById('previewCanvas');
+            const ctx = canvas.getContext('2d');
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, 240, 240);
-
-            // 保持比例居中绘制（四周留黑边）
-            let scale = Math.min(240 / img.width, 240 / img.height);
-            let w = img.width * scale;
-            let h = img.height * scale;
+            const scale = Math.min(240 / img.width, 240 / img.height);
+            const w = img.width * scale, h = img.height * scale;
             ctx.drawImage(img, (240 - w) / 2, (240 - h) / 2, w, h);
-
-            // 关键一步：压缩在浏览器本地完成
             canvas.toBlob((blob) => {
                 if (!blob) { pBox.innerText = "❌ 转码失败"; return; }
                 uploadBlob = blob;
                 pBox.innerText = `原图 ${(file.size / 1048576).toFixed(2)} MB → 本地压到 `
-                               + `${(blob.size / 1024).toFixed(1)} KB，出网就这么多`;
+                    + `${(blob.size / 1024).toFixed(1)} KB，出网就这么多`;
             }, 'image/jpeg', 0.82);
-
             URL.revokeObjectURL(url);
         };
-        img.onerror = () => {
-            pBox.innerText = "❌ 这个文件不是浏览器能识别的图片";
-            URL.revokeObjectURL(url);
-        };
+        img.onerror = () => { pBox.innerText = "❌ 不是图片"; URL.revokeObjectURL(url); };
         img.src = url;
     });
 
-    // 固件那边 setMTU(517)，减去 ATT 头 3 字节 = 514 的上限。
-    // 万一实际协商到的 MTU 更小，写会报错，就照着这个阶梯降档重来。
     const CHUNK_STEPS = [500, 244, 180, 120, 20];
 
     async function pushWallpaper(bytes, chunkSize, pBox) {
-        // 先声明总长度：固件据此分配缓冲并切进二进制接收模式，收满自动收尾
         await sendBLE("LOGO_JPEG_START:" + bytes.length);
-
         for (let i = 0; i < bytes.length; i += chunkSize) {
-            let end = Math.min(i + chunkSize, bytes.length);
-            await myCharacteristic.writeValue(bytes.subarray(i, end)); // 二进制直传，不再转十六进制
+            const end = Math.min(i + chunkSize, bytes.length);
+            await myCharacteristic.writeValue(bytes.subarray(i, end));
             pBox.innerText = `正在传输: ${Math.round(end / bytes.length * 100)}%  `
-                           + `(${(end / 1024).toFixed(1)} / ${(bytes.length / 1024).toFixed(1)} KB)`;
+                + `(${(end / 1024).toFixed(1)} / ${(bytes.length / 1024).toFixed(1)} KB)`;
         }
     }
 
     document.getElementById('uploadImageBtn').addEventListener('click', async () => {
-        let pBox = document.getElementById('uploadProgress');
+        const pBox = document.getElementById('uploadProgress');
         if (!uploadBlob) return alert("请先选择图片文件！");
         if (!myCharacteristic) return alert("请先连接蓝牙！");
-
-        let btn = document.getElementById('uploadImageBtn');
-        let fileInput = document.getElementById('imageInput');
+        const btn = document.getElementById('uploadImageBtn');
+        const fileInput = document.getElementById('imageInput');
         btn.disabled = true;
-        fileInput.disabled = true;   // 传输期间别让用户误触别的按钮，会撞进二进制通道
-
+        fileInput.disabled = true;
         try {
-            let bytes = new Uint8Array(await uploadBlob.arrayBuffer());
-
+            const bytes = new Uint8Array(await uploadBlob.arrayBuffer());
             let lastErr = null;
             for (let k = 0; k < CHUNK_STEPS.length; k++) {
                 try {
@@ -493,13 +747,11 @@
                     lastErr = null;
                     break;
                 } catch (err) {
-                    // 多半是协商到的 MTU 比预期小。重新发 START 会重置固件侧缓冲，可以直接重来。
                     lastErr = err;
                     await new Promise(r => setTimeout(r, 300));
                 }
             }
             if (lastErr) throw lastErr;
-
             pBox.innerText = `🎉 上传完成！${(bytes.length / 1024).toFixed(1)} KB 已写入键盘`;
             alert(`壁纸已上传成功！共 ${(bytes.length / 1024).toFixed(1)} KB`);
         } catch (err) {

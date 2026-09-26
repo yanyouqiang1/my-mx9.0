@@ -196,6 +196,9 @@ bool mediaPlaying = false;
 #define MAX_REC_KEYS 64
 uint16_t recKeyBuffer[MAX_REC_KEYS];
 int recKeyCount = 0;
+// 录制界面整体重画标记。每收一颗键置 true，drawRecUI() 画完置 false。
+// 退出录制回到 NORMAL 时也要 false，避免刚回到主屏再被闪一下。
+bool recNeedsRedraw = true;
 
 // 灯光引擎
 #define NUM_MAIN_LEDS 16
@@ -344,6 +347,7 @@ bool oldDeviceConnected = false;
 void displayStatusCN(const char* title, uint16_t color = ST77XX_GREEN);
 void switchProfile(uint8_t profIdx);
 void drawMenuUI();
+void drawRecUI();
 void renderCurrentDisplayBase();
 bool updateDynamicElements();
 void renderWallpaperView(bool drawOverlayTime = true);
@@ -987,6 +991,16 @@ void handleCommand(String data) {
       String payload = data.substring(firstColon + 1);
       preferences.putString(keyName.c_str(), payload);
       triggerHud("宏定义保存", keyName.c_str(), -1, ST77XX_GREEN);
+    }
+  }
+  // 网页端一次性下发文本：直接走 executeSequenceAction() 播放给主机。
+  // 不写 FFat /me_hex.txt——用户要的是"临时蓝牙发送"，不是"持久化 ME 默认文本"。
+  // MTU=517 + Web Bluetooth writeValue 自带的链路层分段，一包够撑日常长度。
+  else if (data.startsWith("ME_TEXT:")) {
+    String text = data.substring(8);
+    if (text.length() > 0) {
+      triggerHud("ME 发送文本", (String(text.length()) + " 字").c_str(), -1, ST77XX_CYAN);
+      executeSequenceAction(text);
     }
   }
   else if (data.startsWith("LOGO_JPEG_START:")) {
@@ -2602,6 +2616,97 @@ void displayStatusCN(const char* title, uint16_t color) {
   u8g2.print(title);
 }
 
+// 录制模式专属 UI：顶部状态条 + 中部键流 + 底部提示。
+// 调用者保证进入函数时只有 recNeedsRedraw==true 才会真正写屏。
+// 240×240 屏的可用高度：标题 y10~30，中部 y40~200，底部 y210~230。
+void drawRecUI() {
+  if (!recNeedsRedraw) return;
+  recNeedsRedraw = false;
+
+  tft.fillScreen(ST77XX_BLACK);
+
+  // 1. 顶部状态条
+  uint16_t titleColor = (currentSysMode == SYS_MODE_REC_SEQ) ? ST77XX_YELLOW : ST77XX_MAGENTA;
+  const char* titleStr = (currentSysMode == SYS_MODE_REC_SEQ) ? "录制击键流" : "录制组合模式";
+
+  tft.fillRoundRect(4, 6, 232, 28, 6, 0x0000);
+  tft.drawRoundRect(4, 6, 232, 28, 6, titleColor);
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2.setForegroundColor(titleColor);
+  u8g2.setCursor(14, 26);
+  u8g2.print(titleStr);
+
+  // 右上角：已录/上限
+  char cntBuf[16];
+  snprintf(cntBuf, sizeof(cntBuf), "%d/%d", recKeyCount, MAX_REC_KEYS);
+  u8g2.setForegroundColor(ST77XX_CYAN);
+  u8g2.setCursor(190, 26);
+  u8g2.print(cntBuf);
+
+  // 2. 分隔线
+  tft.drawFastHLine(8, 40, 224, 0x39E7);
+
+  // 3. 中部键流。把 recKeyBuffer[] 拼成一行按键名（SEQ 模式）或数字（CMB 模式），
+  //    用 u8g2 的 UTF8 测量宽度，超过一行的部分折到下一行；行/列超出可视区就截断。
+  u8g2.setForegroundColor(ST77XX_WHITE);
+  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
+
+  const int TEXT_LEFT = 10;
+  const int TEXT_TOP  = 60;     // 第一行基线 y
+  const int LINE_H    = 22;     // 每行像素高（wqy16 + 行距）
+  const int VISIBLE_LINES = 6;  // y60..y192 容纳 6 行
+  const int LINE_MAX_W = 230;
+
+  String line = "";
+  int lines = 0;
+  bool hasMore = false;   // recKeyCount 比可见区能装下的还多
+
+  // 先把已录键全部序列化成字符串。SEQ 走人类可读，CMB 走纯数字列表。
+  for (int i = 0; i < recKeyCount && lines < VISIBLE_LINES; i++) {
+    String piece;
+    if (currentSysMode == SYS_MODE_REC_SEQ) {
+      piece = getKeyName(recKeyBuffer[i]);
+    } else {
+      piece = String(recKeyBuffer[i]);
+    }
+    if (i > 0) piece = "+" + piece;
+
+    if (u8g2.getUTF8Width((line + piece).c_str()) > LINE_MAX_W) {
+      // 当前行装不下 → 先画这一行，开新行
+      u8g2.setCursor(TEXT_LEFT, TEXT_TOP + lines * LINE_H);
+      u8g2.print(line);
+      line = "";
+      lines++;
+      if (lines >= VISIBLE_LINES) { hasMore = (i + 1 < recKeyCount); break; }
+      // 新行如果首片就超长，就直接放进去，下一行再继续
+    }
+    line += piece;
+  }
+  // 收尾的最后一行（如果循环没满）
+  if (lines < VISIBLE_LINES && line.length() > 0) {
+    u8g2.setCursor(TEXT_LEFT, TEXT_TOP + lines * LINE_H);
+    u8g2.print(line);
+    lines++;
+  }
+  // 看看是不是还有键没画上
+  if (lines >= VISIBLE_LINES && !hasMore) {
+    hasMore = (recKeyCount > 0);  // 兜底：主循环用 lines 提前 break 时已置位
+  }
+
+  // 还有没显示的键，底部加个省略号提示
+  if (hasMore) {
+    u8g2.setForegroundColor(ST77XX_DARKGREY);
+    u8g2.setCursor(TEXT_LEFT, TEXT_TOP + (VISIBLE_LINES - 1) * LINE_H);
+    u8g2.print("…");
+  }
+
+  // 4. 底部固定提示
+  tft.drawFastHLine(8, 200, 224, 0x39E7);
+  u8g2.setForegroundColor(ST77XX_GREEN);
+  u8g2.setCursor(10, 220);
+  u8g2.print("MR切模式/取消 M1-M12收尾");
+}
+
 void switchProfile(uint8_t profIdx) {
   if (profIdx >= TOTAL_PROFILES) return;
   currentProfile = profIdx;
@@ -3121,6 +3226,7 @@ void executeMacro(String keyName) {
 void finishMacroRecording(String targetKey) {
   if (recKeyCount == 0) {
     currentSysMode = SYS_MODE_NORMAL;
+    recNeedsRedraw = false;            // 退出录制，UI 不再刷
     displayStatusCN("取消录制", ST77XX_RED);
     delay(300);
     screenNeedsRedraw = true;
@@ -3151,6 +3257,7 @@ void finishMacroRecording(String targetKey) {
   preferences.putString(pKey, payload);
 
   currentSysMode = SYS_MODE_NORMAL;
+  recNeedsRedraw = false;              // 退出录制，UI 不再刷
   displayStatusCN("录制已保存", ST77XX_GREEN);
   delay(400);
   screenNeedsRedraw = true;
@@ -3272,9 +3379,11 @@ void scanKeyboardMatrix() {
                 if (currentSysMode == SYS_MODE_REC_SEQ) {
                   currentSysMode = SYS_MODE_REC_CMB;
                   recKeyCount = 0;
+                  recNeedsRedraw = true;             // 模式切换 + 清空 → 重画
                   displayStatusCN("录制组合模式", ST77XX_MAGENTA);
                 } else {
                   currentSysMode = SYS_MODE_NORMAL;
+                  recNeedsRedraw = false;            // 取消录制 → 不再刷
                   displayStatusCN("录制已取消", ST77XX_RED);
                   delay(300);
                   screenNeedsRedraw = true;
@@ -3283,6 +3392,7 @@ void scanKeyboardMatrix() {
               }
               if (recKeyCount < MAX_REC_KEYS && baseKey < MACRO_BASE) {
                 recKeyBuffer[recKeyCount++] = baseKey;
+                recNeedsRedraw = true;               // 每收一颗键就追加键流
               }
               return;
             }
@@ -3309,6 +3419,7 @@ void scanKeyboardMatrix() {
             if (baseKey == K_MR) {
               currentSysMode = SYS_MODE_REC_SEQ;
               recKeyCount = 0;
+              recNeedsRedraw = true;                 // 进入录制 → 重画键流屏
               displayStatusCN("录制击键流", ST77XX_YELLOW);
               return;
             }
@@ -3350,7 +3461,14 @@ void scanKeyboardMatrix() {
                   triggerHud("媒体播放", "上一曲", -1, ST77XX_CYAN);
                 }
               } else if (baseKey != K_LOGO) {
-                executeMacro(getMacroNameByCode(baseKey));
+                // M1-M12 走两层：先按 g_<KEY> 配置执行全局动作（切方案+发组合/打字），
+                // 再按方案宏 p<prof>_<KEY> 播放用户录的击键流/组合键。
+                // 两层都靠 preferences 空串 fallback：无配置即跳过，互不打架。
+                String macroName = getMacroNameByCode(baseKey);
+                if (baseKey >= K_M1 && baseKey <= K_M12) {
+                  executeGlobalKey(macroName);
+                }
+                executeMacro(macroName);
               }
             } else {
               uint16_t mappedKey = getMappedKey(baseKey);
@@ -3866,6 +3984,10 @@ void loop() {
       lastSavedCount = totalKeyCount;
       preferences.putUInt("keyCount", totalKeyCount);
     }
+  }
+  // 4.5 录制界面：MR 进入 SEQ/CMB 后接管整个屏幕（dashboard 暂停更新）
+  else if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+    drawRecUI();
   }
 
   // 5. 浮层：响铃卡片常驻（不自动消失，等用户按），没在响铃时才轮到 HUD 弹窗。
