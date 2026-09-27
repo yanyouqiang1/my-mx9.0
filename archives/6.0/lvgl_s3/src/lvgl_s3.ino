@@ -18,6 +18,18 @@
 #include <driver/timer.h>
 #include <esp_task_wdt.h>
 #include <FFat.h>
+#include <JPEGDEC.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+// 诊断日志走 UART0（板载 USB-TTL，烧录用的那个口，PC 上是 COM4）。
+//
+// 为什么不直接用 Serial：platformio.ini 里设了 ARDUINO_USB_CDC_ON_BOOT=1，
+// 这时 Serial 指的是芯片**原生 USB** 的虚拟串口。原生 USB 只有在
+// USB-CDC 的第一个描述符握手完成之后才会枚举出来，Windows 往往要十几秒
+// 才认这个口，而这期间所有日志都丢了 —— 表现为"监听 90 秒一行都没有"。
+// UART0 是烧录口，一直在线，插上就能抓。
+#define LOG_PORT Serial0
 
 // USB HID
 #include "USB.h"
@@ -105,6 +117,9 @@ TwoWire Wire_SHT(1);
 #define KEY_KP_9        0x61
 #define KEY_KP_0        0x62
 #define KEY_KP_DOT      0x63
+// 静音键：矩阵里写的原始值。它属于 HID **Consumer** Usage Page（0x0C），
+// 不是 Keyboard 页，所以不能走 Keyboard.press()，要走 ConsumerControl。
+#define KEY_MUTE_USAGE  0xE2
 #define K_M1   (MACRO_BASE + 1)
 #define K_M2   (MACRO_BASE + 2)
 #define K_M3   (MACRO_BASE + 3)
@@ -160,10 +175,20 @@ static const char* dispModeNames[TOTAL_DISP_MODES] = {
 
 static uint8_t currentDispMode = DISP_MODE_GEEK;
 
-// 控制模式
-#define MODE_LIGHT  0
-#define MODE_CPG     1
+// ===========================
+// 控制模式（C3 灯光键 / 旋钮的作用目标）
+// ===========================
+// 旋钮本身只会发"转了 +1 / -1"，转到什么上由这个模式决定：
+// 背光亮度是本机自己算的，屏幕亮度 / 音量 / 静音都是 Consumer 页丢给主机的。
+// 这套是 s3.ino 原版就有的交互，LVGL 重写时整段漏掉了 ——
+// 结果 C3 上的灯光键、旋钮、CPG 键全部无反应（只往 Serial1 发，没往回读）。
+#define MODE_LIGHT               0   // 键盘背光亮度（本机）
+#define MODE_SCREEN_BRIGHTNESS   1   // 主机屏幕亮度（Consumer）
+#define MODE_MUTE                2   // 主机系统音量（Consumer）
+#define MODE_CPG                 3   // 灯效切换（本机）
+#define MODE_COUNT               4
 static uint8_t currentMode = MODE_LIGHT;
+static const char* modeNamesCN[MODE_COUNT] = { "键盘背光", "屏幕亮度", "系统音量", "灯效" };
 
 // ===========================
 // 通知系统
@@ -230,7 +255,7 @@ static unsigned long pendingRestartMs = 0;
 
 // 菜单
 static uint8_t menuSel = 0;
-#define MENU_ITEMS 11
+#define MENU_ITEMS 12
 
 // 宏录制
 #define MAX_REC_KEYS 64
@@ -258,12 +283,32 @@ static const char* menuItemsCN[MENU_ITEMS] = {
     "8. 倒计时",
     "9. 刷新温湿度",
     "10. 温度校准",
-    "11. 计数清零"
+    "11. 计数清零",
+    "12. 屏保风格"
 };
 
 // 辅助变量
 static bool showKeystrokes = true;
 static char lastKeyPressed[8] = "-";
+
+// ===========================
+// 息屏 / 屏保风格
+// ===========================
+// 原来 SLEEP_TIMEOUT_MS 到了就 destroyMainScreen() 把主屏整个拆掉，屏幕全黑。
+// 现在多给两种屏保：SAVER_WALL 纯壁纸、SAVER_INFO 时间 + 温湿度。
+// 屏保是一块独立屏幕（scr_saver），和主屏并存，唤醒时直接切回主屏即可。
+#define SAVER_OFF   0
+#define SAVER_WALL  1
+#define SAVER_INFO  2
+#define TOTAL_SAVER_MODES 3
+static const char* saverModeNames[] = { "黑屏", "壁纸", "时间温湿度" };
+static uint8_t saverMode = SAVER_OFF;
+static lv_obj_t* scr_saver = nullptr;
+static lv_obj_t* sv_img = nullptr;
+static lv_obj_t* sv_lbl_time = nullptr;
+static lv_obj_t* sv_lbl_date = nullptr;
+static lv_obj_t* sv_lbl_temp = nullptr;
+static lv_obj_t* sv_lbl_hum = nullptr;
 
 // 灯效相关
 static const char* effectNames[] = {
@@ -385,6 +430,146 @@ static bool deviceConnected = false;
 static bool oldDeviceConnected = false;
 static unsigned long lastPingTime = 0;
 
+// 主机指令队列（生产者 = NimBLE 主机任务，消费者 = loop()）。
+// onWrite 只负责入队，绝不碰 LVGL —— 原因见 MyCallbacks::onWrite 的注释。
+#define BLE_CMD_QUEUE_LEN 8
+#define BLE_CMD_BUF_SIZE   256
+static QueueHandle_t bleCmdQueue = nullptr;
+static void handleCommand(const String& cmd);   // 真正定义在文件后段的命令解析入口
+
+// ===========================
+// BLE 文本通道的行缓冲
+// ===========================
+//
+// 为什么必须按行拼：BLE 的一"条指令"是逻辑概念，实际是若干个 ATT 包。
+// 固件里 BLEDevice::setMTU(517) 只是**请求**协商，MTU 没协商成功时
+// （Windows 端很常见，实际落到 23~185 字节）网页的 writeValue 会被浏览器
+// 拆成多包。而原来的 onWrite 是"一个包 = 一条完整命令"，于是
+//   `SET:p0_M1:CMB:224,48` 这种 20 多字节的宏
+//   `GSET:M1:PROFILE:1`      这种全局动作
+// 会被切成两半分别进队，handleCommand 拿到的都是残缺指令，什么也不匹配 ——
+// 表现就是"M1 相关的下发一律失败 / 不生效"，而短的（ALERT:RED）反而好使。
+//
+// 这里改成和 USB HID 那条通道一样的纪律：先把字节攒成一行，遇到 \n 提交；
+// 没带 \n 的老客户端（以及网页上零散的单包指令）靠"包间静默 15ms"兜底提交。
+// 这块缓冲只在 NimBLE 主机任务里被读写，不跨任务，不需要加锁。
+#define BLE_LINE_IDLE_MS 15
+static char          bleLine[BLE_CMD_BUF_SIZE];
+static uint16_t      bleLineLen  = 0;
+static unsigned long bleLineLastMs = 0;
+
+// 把攒到的一行塞进队列。队列满时丢最老的一条，保证新指令一定能进去（宁旧不新）。
+static void bleLineSubmit(void) {
+    if (bleLineLen == 0 || bleCmdQueue == nullptr) { bleLineLen = 0; return; }
+    bleLine[bleLineLen] = '\0';
+    bleLineLen = 0;
+    if (xQueueSend(bleCmdQueue, bleLine, 0) != pdTRUE) {
+        char drop[BLE_CMD_BUF_SIZE];
+        if (xQueueReceive(bleCmdQueue, drop, 0) == pdTRUE) {
+            xQueueSend(bleCmdQueue, bleLine, 0);
+        }
+    }
+}
+
+// 在 loop() 里把队列排空，逐条喂给 handleCommand()。
+// 一轮最多处理 4 条：BLE 灌进来的指令量很小，卡住主循环反而会让屏幕和键盘
+// 一起变卡；而 4 条的量足以在两轮 loop 内把 8 深的队列清空。
+static void drainBleCommands(void) {
+    if (bleCmdQueue == nullptr) return;
+    static char buf[BLE_CMD_BUF_SIZE];
+    for (int i = 0; i < 4; i++) {
+        if (xQueueReceive(bleCmdQueue, buf, 0) != pdTRUE) return;
+        buf[BLE_CMD_BUF_SIZE - 1] = '\0';
+        handleCommand(String(buf));
+    }
+}
+
+// ===========================
+// C3 串口通道（灯光键 / 静音键 / CPG 键 / 旋钮）
+// ===========================
+// C3 是同一块板上管灯和那几个侧键的小 MCU，它和本机的对话全走 Serial1：
+// 本机 -> C3 是 0xAA 0x55 包（灯帧 + 2 秒一次的 ping），
+// C3 -> 本机 是以 \n 结尾的文本行（PONG / ENC:+ / ENC:- / BTN:LIGHT / BTN:MUTE ...）。
+//
+// LVGL 重写时只保留了"发"的那一半，**从来没读过 Serial1**，
+// 于是 C3 上的灯光键、静音键、CPG 键、旋钮全部无反应 ——
+// 表现就是"告警面板关不掉"和"亮度/音量/灯效都调不动"。
+//
+// 解析放在 loop() 里逐行做，和 BLE / USB HID 通道同一个纪律：
+// 串口缓冲、LVGL 调用都在主任务，函数本身不做任何阻塞读。
+static bool c3Connected = false;
+static void handleC3Command(const String& cmd);   // 定义在文件后段
+static void knobAdjust(int dir);                  // 定义在文件后段
+static void handleC3Events(void) {
+    static String serialBuffer = "";
+    while (Serial1.available() > 0) {
+        char c = (char)Serial1.read();
+        if (c == '\n') {
+            serialBuffer.trim();
+            if (serialBuffer.length() > 0) {
+                handleC3Command(serialBuffer);
+                serialBuffer = "";
+            }
+        } else if (c != '\r') {
+            if (serialBuffer.length() < 48) serialBuffer += c;   // 掐断超长行，别被灌爆
+        }
+    }
+}
+
+// ===========================
+// USB HID 厂商通道：电脑 -> 键盘 的下行指令
+// ===========================
+// 主机往 Report ID 6 的 Output / Feature 报告里写一段以 \n 结尾的文本，
+// 语法和 BLE 那条通道完全一样：ALERT:RED、ALERT:GREEN:磁盘空间不足、
+// NOTIFY:开会了、ALERT:OFF、DISP_MODE:n …，PC 端脚本是同目录的 kbctl_hid.py。
+//
+// 这条路在 s3.ino 里是通的，搬进 LVGL 版时漏了：setup() 只写了 VendorHID.begin()，
+// 没注册 onHidVendorEvent，主机写过来的报告根本没人收 —— 表现就是"HID 发红绿灯没反应"。
+// 蓝牙能弹通知、HID 不能，两条通道的指令文本却一模一样，差的就是这个回调。
+//
+// 纪律和 BLE 的 onWrite 完全一样：USB 中断回调只把字节丢进环形缓冲，
+// 解析放在 loop()（handleHidVendorCommands），绝不在回调里碰 LVGL。
+#define HID_RX_BUF_SIZE 512
+static volatile uint8_t  hidRxBuf[HID_RX_BUF_SIZE];
+static volatile uint16_t hidRxHead = 0;
+static volatile uint16_t hidRxTail = 0;
+
+static inline void hidRxPush(char c) {
+    uint16_t next = (uint16_t)((hidRxHead + 1) % HID_RX_BUF_SIZE);
+    if (next != hidRxTail) {   // 满了就丢最新的，绝不阻塞 USB 事件任务
+        hidRxBuf[hidRxHead] = (uint8_t)c;
+        hidRxHead = next;
+    }
+}
+
+static void onHidVendorEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
+    if (id != ARDUINO_USB_HID_VENDOR_OUTPUT_EVENT && id != ARDUINO_USB_HID_VENDOR_SET_FEATURE_EVENT) return;
+    const arduino_usb_hid_vendor_event_data_t* p =
+        (const arduino_usb_hid_vendor_event_data_t*)data;
+    if (p == NULL || p->buffer == NULL) return;
+    for (uint16_t i = 0; i < p->len; i++) {
+        char c = (char)p->buffer[i];
+        if (c != '\0') hidRxPush(c);   // 报告尾部补的 0 是凑长度的，不是结束符
+    }
+}
+
+static void handleHidVendorCommands(void) {
+    static String buf = "";
+    while (hidRxTail != hidRxHead) {
+        char c = (char)hidRxBuf[hidRxTail];
+        hidRxTail = (uint16_t)((hidRxTail + 1) % HID_RX_BUF_SIZE);
+        if (c == '\n' || c == '\r') {
+            buf.trim();
+            if (buf.length() > 0) handleCommand(buf);
+            buf = "";
+        } else if (buf.length() < 200) {
+            buf += c;
+        } else {
+            buf = "";   // 超长直接丢弃，防止野数据把内存撑爆
+        }
+    }
+}
+
 // ===========================
 // LVGL Screen 管理
 // ===========================
@@ -482,6 +667,46 @@ static lv_obj_t* wp_bg = nullptr;
 static lv_obj_t* wp_img = nullptr;
 static lv_obj_t* wp_lbl_time = nullptr;
 
+// ===========================
+// 壁纸：JPEG 上传 + 解码缓冲
+// ===========================
+// 网页端本地已经把原图缩到 240x240 并压成 JPEG（十几 KB），BLE 写的是
+// LOGO_JPEG_START:<长度> + 一串裸字节。固件收齐后用 JPEGDEC 解成 RGB565，
+// 落到 PSRAM 里的一张常驻缓冲，同时再写一份 /logo.bin 到 FFat —— 重启后
+// 直接从盘上读回，不用再传一遍。
+//
+// 缓冲是 PSRAM 而不是内部 DRAM：240*240*2 = 115KB，内部 DRAM 装不下。
+#define WP_W 240
+#define WP_H 240
+#define WP_PIXELS (WP_W * WP_H)
+
+static uint16_t*    wpPixels  = nullptr;   // 解码后的 RGB565，LVGL 的图片源
+static lv_img_dsc_t wpImgDsc;              // 喂给 lv_img_set_src 的描述符
+static bool         wpReady   = false;     // wpPixels 里有有效像素
+
+// 上传中的 JPEG 原始字节。logoRxBuf 非空 == 正处于二进制接收模式，
+// 此时 BLE 写进来的东西一律当 JPEG 数据，不当文本指令。
+#define LOGO_RX_MAX        (256 * 1024)
+#define LOGO_RX_TIMEOUT_MS 5000
+
+static uint8_t*     logoRxBuf   = nullptr;
+static uint32_t     logoRxTotal = 0;
+static uint32_t     logoRxGot   = 0;
+static bool         logoRxDone  = false;
+static bool         logoRxActive = false;    // 只有这个为 true 才处于二进制接收模式
+static unsigned long logoRxLastMs = 0;
+static uint16_t*    logoOutBuf  = nullptr;  // JPEGDEC 的绘制目标（解码期间有效）
+static uint32_t     meHexBytes  = 0;         // ME_DATA 累计写进去的十六进制字符数（诊断用）
+
+// 实现都在"构建：壁纸模式"那一段；onWrite 跑在 BLE 主机任务里、位置更靠前，
+// 这里先声明，壁纸上传的分流才能在那儿用上。
+static int  logoJpegDraw(JPEGDRAW* d);
+static void handleLogoChunk(const uint8_t* data, size_t len);
+static void finishLogoUpload(void);
+static void abortLogoUpload(const char* reason);
+static void loadWallpaperFromDisk(void);
+static uint8_t* logoRxAlloc(uint32_t total);
+
 // 主屏通用顶部条（6 种风格共用）
 static lv_obj_t* topLockDot[3] = { nullptr, nullptr, nullptr };
 static uint32_t   topLockOn[3] = { 0, 0, 0 };
@@ -490,6 +715,7 @@ static lv_obj_t* topProfileLbl = nullptr;
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
 static lv_obj_t* menu_items[MENU_ITEMS];
+static lv_obj_t* menu_items_val[MENU_ITEMS];
 static lv_obj_t* menu_title = nullptr;
 static lv_obj_t* menu_position = nullptr;
 
@@ -554,9 +780,22 @@ static const uint32_t lockLedColor[3] = { CLR_GREEN, CLR_ACCENT, CLR_AMBER };
 // 所以这里统一由 ensureMainScreen() 负责建/取主屏，风格一律往它上面建。
 static bool mainContentValid = false;
 
-// 临时诊断开关：true = 主屏只保留一块空白底色，不建任何风格内容（见 renderCurrentDisplayBase）。
-// 置 false 立即恢复原来的 6 种主屏风格。
-static const bool MAIN_STYLE_DISABLED = true;
+// 诊断开关：哪些主屏风格允许构建（见 renderCurrentDisplayBase）。
+// 整组停用后整机恢复正常 -> 卡死来自风格渲染，这里改成位掩码逐个试，
+// 一次只放开一两种就能定位到具体是哪个 build_style_* 把机器拖死。
+// 六个位全打开 = 完全恢复原来的 6 种主屏风格。
+#define STYLE_BIT_GEEK        (1u << DISP_MODE_GEEK)
+#define STYLE_BIT_BIG_CLOCK   (1u << DISP_MODE_BIG_CLOCK)
+#define STYLE_BIT_INFO_PANEL  (1u << DISP_MODE_INFO_PANEL)
+#define STYLE_BIT_KEY_MON     (1u << DISP_MODE_KEY_MON)
+#define STYLE_BIT_RHYTHM      (1u << DISP_MODE_RHYTHM)
+#define STYLE_BIT_WALLPAPER   (1u << DISP_MODE_WALLPAPER)
+#define STYLE_BIT_ALL         (STYLE_BIT_GEEK | STYLE_BIT_BIG_CLOCK | STYLE_BIT_INFO_PANEL | \
+                               STYLE_BIT_KEY_MON | STYLE_BIT_RHYTHM | STYLE_BIT_WALLPAPER)
+// 六种风格全开。之前的"全开就整机卡死"不是风格本身重，是 topLockDot[] 这组
+// 共用指针在切换时没清干净，updateDynamicElements() 一直在写已释放的内存
+// （详见 resetStylePointers 里的注释）。这个坑填掉之后掩码就不再是必需品了。
+static const uint32_t MAIN_STYLE_MASK = STYLE_BIT_ALL;
 static void renderCurrentDisplayBase(void);   // 定义在文件后段，这里先声明
 
 static lv_obj_t* ensureMainScreen(void) {
@@ -573,34 +812,44 @@ static lv_obj_t* ensureMainScreen(void) {
 // lv_obj_del(scr_main) 会连带释放全部子控件，所以 gk_bg / bc_bg / ... 这些
 // 全局指针必须同时置空。否则下一次 renderCurrentDisplayBase() 里那六行
 // `lv_obj_del(gk_bg)` 就是在对已释放的内存调用析构，直接踩坏堆。
-static void destroyMainScreen(void) {
-    gk_bg = nullptr;
+static void resetStylePointers(void) {
     gk_lbl_clock = nullptr; gk_lbl_date = nullptr; gk_lbl_temp = nullptr;
     gk_lbl_hum = nullptr; gk_lbl_keys = nullptr; gk_lbl_profile = nullptr;
     gk_led_num = nullptr; gk_led_caps = nullptr; gk_led_scr = nullptr;
 
-    bc_bg = nullptr;
     bc_lbl_time = nullptr; bc_lbl_date = nullptr;
 
-    ip_bg = nullptr;
     ip_lbl_clock = nullptr; ip_lbl_date = nullptr;
     ip_circle_num = nullptr; ip_circle_caps = nullptr; ip_circle_scr = nullptr;
     ip_lbl_profile = nullptr; ip_lbl_lastkey = nullptr; ip_lbl_keys = nullptr;
     for (int i = 0; i < 3; i++) { ipLockChip[i] = nullptr; ipLockDot[i] = nullptr; ipLockLbl[i] = nullptr; }
 
-    km_bg = nullptr;
     km_lbl_title = nullptr; km_lbl_lastkey = nullptr;
     km_lbl_keys = nullptr; km_lbl_profile = nullptr;
 
-    rh_bg = nullptr;
     rh_lbl_keys = nullptr; rh_lbl_profile = nullptr;
     for (int i = 0; i < 24; i++) rh_bars[i] = nullptr;
 
-    wp_bg = nullptr;
     wp_img = nullptr; wp_lbl_time = nullptr;
 
+    // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
+    // 之前漏在这里清理，就踩了和 ipLockDot[] 一模一样的坑，而且这次更隐蔽：
+    //
+    //   从"已启用的风格"切到"被掩码关掉的风格"时，上面刚把 gk_bg 之类的容器删了，
+    //   这里却把 topLockDot[] 留在已释放的地址上；紧接着 renderCurrentDisplayBase()
+    //   因为掩码命中而提前 return，dashTopBar() 不会再来覆盖它们。于是
+    //   updateDynamicElements() 每 100ms 就往 4 个野指针上写 —— 必崩。
+    //
+    // 这正是"切到律动就崩"（以及之前"切到击键监控就崩"）的真凶：崩的不是新风格，
+    // 是切过去之后仍在刷新上一风格的顶部条。setBgColor 的 nullptr 检查拦不住，
+    // 因为它不是 nullptr，是被释放后又被复用的地址。
     for (int i = 0; i < 3; i++) topLockDot[i] = nullptr;
     topProfileLbl = nullptr;
+}
+static void destroyMainScreen(void) {
+    gk_bg = nullptr; bc_bg = nullptr; ip_bg = nullptr;
+    km_bg = nullptr; rh_bg = nullptr; wp_bg = nullptr;
+    resetStylePointers();   // 顶部条指针在这里一并清掉
 
     if (scr_main != nullptr) {
         // **删活动屏之前必须先切走**。
@@ -631,6 +880,9 @@ static void destroyMainScreen(void) {
     mainContentValid = false;
 }
 
+// 屏保的实现在文件后段，这里先声明（gotoMainScreen() 要用）
+static void destroyScreensaver(void);
+
 // 回到主屏的统一出口：保证主屏和主屏内容都还在，然后真正切过去。
 static void gotoMainScreen(void) {
     currentSysMode = SYS_MODE_NORMAL;
@@ -641,7 +893,10 @@ static void gotoMainScreen(void) {
 
     // 息屏把主屏拆过的话，这里要把内容一并重建，否则切过去是一片黑
     if (!mainContentValid) renderCurrentDisplayBase();
+    // 顺序有讲究：先真的把主屏切上去，屏保才不再是活动屏，
+    // 下面销毁它才安全（LVGL 8.4 删掉活动屏会把 disp->act_scr 置 NULL）。
     showScreen(ensureMainScreen());
+    destroyScreensaver();
 }
 
 // ===========================
@@ -653,6 +908,8 @@ static void recoverI2CBus(void);
 void bootDetailTick(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
+static void tickRhythm(void);
+static void pulseRhythm(void);
 static void triggerHud(const char* title, const char* value, lv_color_t color);
 static void pushNotification(AlertType type, const String& text);
 static void drawNotifPanel(void);
@@ -664,6 +921,11 @@ static void mkCard(lv_obj_t* o, uint32_t bg, uint8_t radius);
 static void mkChip(lv_obj_t* o, uint32_t bg, uint32_t fg, uint8_t radius);
 static void mkLabel(lv_obj_t* l, const lv_font_t* f, uint32_t color);
 static void setText(lv_obj_t* lbl, const char* txt);
+static void destroyMainScreen(void);
+static void destroyScreensaver(void);
+static void enterScreensaver(void);
+static void cycleScreensaverMode(void);
+static void updateScreensaver(void);
 static void handleMenuSelect(void);
 static const char* getKeyName(uint16_t code);
 static void build_settings_time(void);
@@ -736,9 +998,55 @@ class MyServerCallbacks : public BLEServerCallbacks {
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
+    // **这里绝不能直接调 handleCommand()**
+    //
+    // onWrite 跑在 NimBLE 的主机任务里，而 LVGL 的全部对象都归 loop() 那个
+    // Arduino 任务所有。handleCommand() 一进去就是 triggerHud() /
+    // drawNotifPanel() / renderCurrentDisplayBase()，全都直接 lv_obj_create /
+    // lv_obj_del，既没拿 lvgl_port_lock，又和 loop() 里的
+    // updateDynamicElements() / lvgl_driver_loop() 并发操作同一堆对象 ——
+    // 两个任务同时改 LVGL 堆，坏掉的内存布局直接变成 panic 重启。
+    //
+    // 症状：主机发 ALERT:RED / ALERT:GREEN（或者 DISP_MODE:n 切风格）在弹通知的
+    // 瞬间整机死机，而单独用键盘切风格一切正常 —— 差别就在"谁发起的"。
+    //
+    // 正确做法：回调里只把原始字节丢进队列，真正的解析和 LVGL 操作留给
+    // loop()（见 drainBleCommands()），那条路径和按键触发的路径在同一个任务里。
     void onWrite(BLECharacteristic* pCharacteristic) {
-        String cmd = pCharacteristic->getValue().c_str();
-        handleCommand(cmd);
+        std::string raw = pCharacteristic->getValue();
+        if (bleCmdQueue == nullptr || raw.empty()) return;
+
+        // 壁纸二进制模式：这一包是 JPEG 原始字节，里面有 0x00，
+        // 走下面的 memcpy + 队列会被在第一个 0 处截断，所以在这里就分流掉。
+        // 唯一要放回命令通道的是网页端重传时补发的 LOGO_JPEG_START —— 此时
+        // 固件还卡在上一轮的接收模式里，得让它先看见这条命令才复位。
+        // 用 "LOGO_" 做暗号是安全的：JPEG 首字节必然是 0xFF，撞不上 ASCII。
+        //
+        // 判断条件必须用 logoRxActive，不能用 "logoRxBuf != nullptr"：
+        // 接收缓冲现在是常驻的（传完也不释放），用指针判断会导致传完之后
+        // 蓝牙进来的**所有文本指令**都被当成 JPEG 字节吃掉 —— 表现为
+        // 上传一次壁纸之后，ME 键和其它蓝牙配置全部失灵。
+        if (logoRxActive && !logoRxDone &&
+            !(raw.size() >= 5 && memcmp(raw.data(), "LOGO_", 5) == 0)) {
+            handleLogoChunk((const uint8_t*)raw.data(), raw.size());
+            return;
+        }
+
+        // 文本通道：先按行拼，攒满一整行（\n 结尾，或包间静默 15ms）再入队。
+        // 一个包 = 一条命令的老做法会把长指令（宏、全局动作）切成两半，
+        // 详见 bleLineSubmit() 上面的说明。
+        unsigned long now = millis();
+        if (bleLineLen > 0 && (unsigned long)(now - bleLineLastMs) > BLE_LINE_IDLE_MS) {
+            bleLineSubmit();
+        }
+        for (size_t i = 0; i < raw.size(); i++) {
+            char c = (char)raw[i];
+            if (c == '\0') continue;                       // 补长度的 0，不是内容
+            if (c == '\n' || c == '\r') { bleLineSubmit(); continue; }
+            if (bleLineLen >= BLE_CMD_BUF_SIZE - 1) bleLineSubmit();   // 超长行，断掉重来
+            bleLine[bleLineLen++] = c;
+        }
+        bleLineLastMs = now;
     }
 };
 
@@ -1209,6 +1517,220 @@ static void build_style_rhythm(void) {
 }
 
 // ===========================
+// 壁纸：上传接收 + JPEG 解码 + 落盘 / 回读
+// ===========================
+// JPEGDEC 是"边解码边往 logoOutBuf 画"的：每解出一块像素就回调一次。
+// 目标固定是 240x240 的 RGB565，网页端已经按这个尺寸缩过了。
+static int logoJpegDraw(JPEGDRAW* d) {
+    if (logoOutBuf == nullptr) return 1;
+    // pPixels 指向的是"当前这一块"自己的像素起点，不是整张图的左上角，
+    // 所以每一行都得自己加偏移。宽度要用 iWidthUsed（被边界裁剪后的实际
+    // 宽度），边缘那几块 iWidthUsed < iWidth，用 iWidth 会读到块外的数据。
+    for (int y = 0; y < d->iHeight; y++) {
+        int py = d->y + y;
+        if (py < 0 || py >= WP_H) continue;
+        uint16_t* row = logoOutBuf + (uint32_t)py * WP_W;
+        for (int x = 0; x < d->iWidthUsed; x++) {
+            int px = d->x + x;
+            if (px < 0 || px >= WP_W) continue;
+            row[px] = d->pPixels[y * d->iWidth + x];
+        }
+    }
+    return 1;
+}
+
+// 接收缓冲只分配一次，之后永不释放。
+//
+// 之前是每轮 LOGO_JPEG_START 都 malloc、每次收尾/超时都 free。而收数据的
+// handleLogoChunk() 跑在 NimBLE 的**主机任务**里，free() 跑在 loop 任务里 ——
+// 两者没有任何同步。网页端 5 次重传之间只隔 300ms，BLE 任务完全可能在
+// loop 已经 free 掉之后才处理到上一轮尾巴上那一包，接着往已释放的地址里 memcpy：
+// 踩坏堆，表现为"一上传壁纸键盘就重启"。常驻一块 PSRAM 缓冲把这个整类问题消掉。
+// 重传时不清空内容，只把 logoRxGot 归零重新覆盖。
+static uint8_t* logoRxAlloc(uint32_t total) {
+    if (logoRxBuf != nullptr) return logoRxBuf;
+    logoRxBuf = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (logoRxBuf == nullptr) logoRxBuf = (uint8_t*)malloc(total);   // PSRAM 不可用时回落
+    if (logoRxBuf != nullptr) memset(logoRxBuf, 0, total);
+    return logoRxBuf;
+}
+
+static void abortLogoUpload(const char* reason) {
+    // 故意不 free(logoRxBuf)：见 logoRxAlloc() 上面的说明，释放会和 BLE 主机任务
+    // 里的 handleLogoChunk() 抢同一块内存，释放出去的地址还会被 memcpy 进去。
+    logoRxTotal = 0;
+    logoRxGot   = 0;
+    logoRxDone  = false;
+    logoRxActive = false;
+    LOG_PORT.printf("[WALLPAPER] abort: %s\n", reason);
+    triggerHud("壁纸传输", reason, lv_color_hex(CLR_RED));
+    // 失败也要回报，否则网页只能干等到超时
+    if (pCharacteristic) {
+        char out[80];
+        snprintf(out, sizeof(out), "LOGOSTATUS:FAIL:%.40s", reason);
+        pCharacteristic->setValue((uint8_t*)out, strlen(out));
+        pCharacteristic->notify();
+    }
+}
+
+// 二进制接收：这段是 JPEG 原始字节，里面必然有 0x00，
+// 只能按长度整段取，绝不能走 c_str()（会在第一个 0 处截断）。
+static void handleLogoChunk(const uint8_t* data, size_t len) {
+    if (logoRxBuf == nullptr) return;
+    logoRxLastMs = millis();
+
+    uint32_t room = logoRxTotal - logoRxGot;
+    if (len > room) len = room;      // 多出来的丢掉，只认网页声明过的长度
+    if (len == 0) return;
+
+    memcpy(logoRxBuf + logoRxGot, data, len);
+    logoRxGot += len;
+    if (logoRxGot >= logoRxTotal) logoRxDone = true;
+}
+
+// 把 wpPixels 这张缓冲注册成 LVGL 图片源。解码完、开机从盘读回后都要走这里，
+// 两处共用一份描述符，免得字段填漏了画成一片黑。
+static void bindWallpaperSource(void) {
+    if (wpPixels == nullptr) return;
+    wpImgDsc.header.always_zero = 0;
+    wpImgDsc.header.w          = WP_W;
+    wpImgDsc.header.h          = WP_H;
+    wpImgDsc.data_size         = WP_PIXELS * 2;
+    wpImgDsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
+    wpImgDsc.data              = (const uint8_t*)wpPixels;
+    wpReady = true;
+}
+
+// 解码收齐的 JPEG -> wpPixels -> 落盘。解码 + 写盘要几百毫秒，
+// 所以放 loop 里跑，不占着 NimBLE 的主机任务。
+static void finishLogoUpload(void) {
+    logoRxDone  = false;
+    logoRxActive = false;
+    if (logoRxTotal == 0 || logoRxGot < logoRxTotal) {
+        // 没收齐就别去解：解一半的 JPEG 出来是花屏，比明确失败更难查
+        abortLogoUpload("长度不匹配，跳过解码");
+        return;
+    }
+    LOG_PORT.printf("[WALLPAPER] got %lu bytes, PSRAM free %lu, decoding...\n",
+                    (unsigned long)logoRxGot,
+                    (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    esp_task_wdt_reset();
+
+    uint16_t* out = (uint16_t*)heap_caps_malloc(WP_PIXELS * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out == NULL) { abortLogoUpload("out of PSRAM"); return; }
+
+    logoOutBuf = out;
+    memset(out, 0, WP_PIXELS * 2);   // 先铺黑：JPEG 没盖满 240x240 时不留上一张的残影
+    esp_task_wdt_reset();
+
+    // 关键：JPEGDEC 这个对象有多大？
+    //   JPEGDEC 里只包了一个 JPEGIMAGE，光几个大数组就有
+    //     usUnalignedPixels[2056]  4112 B
+    //     usHuffAC[2048]          4096 B
+    //     ucHuffDC[1024*2]        2048 B
+    //     ucFileBuf[2048]         2048 B
+    //     sQuantTable[32]           64 B
+    //   合计约 12.6 KB。
+    // 原来这里写的是 `JPEGDEC jpeg;` —— 局部变量，编译器直接给它从 loop 任务的
+    // 栈上开 12.6KB。Arduino 的 loopTask 栈只有 8KB，一开解码立刻踩过栈顶，
+    // GTask/window overflow 触发 panic → 芯片复位。
+    // 症状正是"壁纸传到 98%（数据收齐、开始解码的那一瞬）键盘就重启"：
+    // 传输阶段一切正常，崩在解码第一行。
+    // 改成 static：进 .bss（内部 DRAM），不占栈。之所以不放 PSRAM，是 JPEGDEC
+    // 内部对 usPixels / sMCUs 有 16 字节 SIMD 对齐的假设，PSRAM 上未对齐访问
+    // 既慢又不可靠；12.6KB 静态内存换稳定，值。
+    static JPEGDEC jpeg;
+    bool ok = false;
+    if (jpeg.openRAM(logoRxBuf, (int)logoRxGot, logoJpegDraw)) {
+        LOG_PORT.printf("[WALLPAPER] jpeg header %dx%d, decoding...\n",
+                        jpeg.getWidth(), jpeg.getHeight());
+        jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+        ok = (jpeg.decode(0, 0, 0) != 0);
+        jpeg.close();
+    }
+    logoOutBuf = nullptr;
+    esp_task_wdt_reset();
+    LOG_PORT.printf("[WALLPAPER] decode %s\n", ok ? "ok" : "FAILED");
+
+    // 注意：写盘那 200 多毫秒里旧的 wpPixels 必须保持有效 —— 屏还在用它画壁纸，
+    // 这里提前 free 就是 use-after-free，wpImgDsc.data 还会指向已释放的地址。
+    // 所以先把旧指针扣下，等新图彻底接上再释放。
+    uint16_t* oldPixels = wpPixels;
+
+    if (ok) {
+        // 落盘一份，重启后直接从 FFat 读回。分块写 + 喂狗：115KB 一次写完
+        // 在 FFat 上是毫秒级的，loop 任务挂在任务看门狗上，稳妥点分段喂。
+        File f = FFat.open("/logo.bin", FILE_WRITE);
+        if (f) {
+            const uint8_t* p = (const uint8_t*)out;
+            size_t left = (size_t)WP_PIXELS * 2;
+            while (left) {
+                size_t n = left > 16384 ? 16384 : left;
+                f.write((uint8_t*)p, n);
+                p += n; left -= n;
+                esp_task_wdt_reset();
+            }
+            f.close();
+            LOG_PORT.printf("[WALLPAPER] /logo.bin written\n");
+        } else {
+            LOG_PORT.printf("[WALLPAPER] open /logo.bin FAILED\n");
+        }
+    }
+
+    logoRxTotal = 0;
+    logoRxGot   = 0;
+
+    if (!ok) {
+        heap_caps_free(out);
+        triggerHud("壁纸传输", "解码失败", lv_color_hex(CLR_RED));
+        return;
+    }
+
+    // 顺序不能反：先接新图（wpImgDsc.data 才有合法地址），再释放旧图
+    wpPixels = out;
+    bindWallpaperSource();
+    if (oldPixels) heap_caps_free(oldPixels);
+
+    if (wp_img) {
+        lv_img_set_src(wp_img, &wpImgDsc);
+        lv_obj_invalidate(wp_img);
+    }
+
+    triggerHud("壁纸更新", "上传完成", lv_color_hex(CLR_GREEN));
+
+    // 主动回报：网页轮询 LOGO_STATUS 时能拿到确定答案。
+    // 以前网页"字节发完"就 alert 上传成功，那是假成功 —— BLE 写成功只说明
+    // 数据交给蓝牙了，不代表键盘解出来、落盘了。
+    if (pCharacteristic) {
+        char okmsg[24] = "LOGOSTATUS:OK:0/0";
+        pCharacteristic->setValue((uint8_t*)okmsg, strlen(okmsg));
+        pCharacteristic->notify();
+    }
+}
+
+// 开机：FFat 里有 /logo.bin 就读回 PSRAM，重启不用重传。
+static void loadWallpaperFromDisk(void) {
+    if (!FFat.exists("/logo.bin")) return;
+    File f = FFat.open("/logo.bin", FILE_READ);
+    if (!f) return;
+    size_t sz = f.size();
+    f.close();
+    if (sz != (size_t)(WP_PIXELS * 2)) return;   // 尺寸对不上就当没有，宁可空着
+
+    uint16_t* buf = (uint16_t*)heap_caps_malloc(WP_PIXELS * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == nullptr) return;
+    File r = FFat.open("/logo.bin", FILE_READ);
+    if (!r) { heap_caps_free(buf); return; }
+    size_t rd = r.read((uint8_t*)buf, WP_PIXELS * 2);
+    r.close();
+    if (rd != (size_t)(WP_PIXELS * 2)) { heap_caps_free(buf); return; }
+
+    if (wpPixels) heap_caps_free(wpPixels);
+    wpPixels = buf;
+    bindWallpaperSource();
+}
+
+// ===========================
 // 构建：壁纸模式
 // ===========================
 static void build_style_wallpaper(void) {
@@ -1226,8 +1748,12 @@ static void build_style_wallpaper(void) {
     lv_obj_set_pos(wp_img, 0, 0);
     lv_obj_set_style_bg_color(wp_img, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
     lv_obj_set_style_border_width(wp_img, 0, LV_PART_MAIN);
-    // 没上传壁纸时给一块深色底，不至于全黑
-    lv_img_set_src(wp_img, NULL);
+    // 上传过壁纸就挂上去；没上传时给一块深色底，不至于全黑
+    if (wpReady) {
+        lv_img_set_src(wp_img, &wpImgDsc);
+    } else {
+        lv_img_set_src(wp_img, NULL);
+    }
 
     // 压一层半透明黑，保证上面的字在任意壁纸上都读得出来
     lv_obj_t* scrim = lv_obj_create(wp_bg);
@@ -1249,6 +1775,122 @@ static void build_style_wallpaper(void) {
     mkLabel(wp_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
     lv_label_set_text(wp_lbl_time, "--:--");
     lv_obj_center(wp_lbl_time);
+}
+
+// ===========================
+// 息屏 / 屏保
+// ===========================
+// 屏保是一块独立的屏幕对象，和主屏并存：
+//   SAVER_OFF  沿用老行为 —— 拆掉主屏，屏幕全黑
+//   SAVER_WALL 壁纸占满，亮度压到最低（息屏就该灭灯，但还能看出图案）
+//   SAVER_INFO 时间 + 温湿度，常亮可读
+// 唤醒统一走 gotoMainScreen()：先 showScreen(主屏) 再 destroyScreensaver()，
+// 顺序反了就会删掉活动屏，LVGL 8.4 会把 disp->act_scr 置成 NULL。
+static void destroyScreensaver(void) {
+    sv_img = nullptr;
+    sv_lbl_time = nullptr; sv_lbl_date = nullptr;
+    sv_lbl_temp = nullptr; sv_lbl_hum = nullptr;
+    if (scr_saver != nullptr) {
+        lv_obj_del(scr_saver);
+        scr_saver = nullptr;
+    }
+    if (currentScreen == scr_saver) currentScreen = nullptr;
+}
+
+// 菜单第 12 项：黑屏 → 壁纸 → 时间温湿度 → 黑屏
+static void cycleScreensaverMode(void) {
+    saverMode = (saverMode + 1) % TOTAL_SAVER_MODES;
+    preferences.putUChar("saver_mode", saverMode);
+
+    // 正在屏保状态下切换：立刻按新模式重建，用户不用等下一次超时
+    if (currentSysMode == SYS_MODE_SLEEP) {
+        destroyScreensaver();
+        if (saverMode == SAVER_OFF) destroyMainScreen();
+        else enterScreensaver();
+    } else if (saverMode == SAVER_OFF && scr_main == nullptr) {
+        // 从屏保模式退回来，但主屏早就被拆了 —— 现在就得补回来
+        renderCurrentDisplayBase();
+    }
+    build_menu();
+    triggerHud("屏保风格", saverModeNames[saverMode], lv_color_hex(CLR_ACCENT));
+}
+
+static void enterScreensaver(void) {
+    if (saverMode == SAVER_OFF) {
+        destroyMainScreen();
+        return;
+    }
+    if (scr_saver != nullptr) { destroyScreensaver(); }
+
+    scr_saver = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_saver, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr_saver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_saver, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (saverMode == SAVER_WALL) {
+        // 纯壁纸：没有钟，没有角标，图片铺满整屏
+        sv_img = lv_img_create(scr_saver);
+        lv_obj_set_size(sv_img, 240, 240);
+        lv_obj_set_pos(sv_img, 0, 0);
+        lv_obj_set_style_bg_color(sv_img, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
+        lv_obj_set_style_border_width(sv_img, 0, LV_PART_MAIN);
+        lv_img_set_src(sv_img, NULL);   // 还没上传壁纸时的占位底色
+    } else {
+        // 时间 + 温湿度
+        sv_lbl_time = lv_label_create(scr_saver);
+        mkLabel(sv_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+        lv_label_set_text(sv_lbl_time, "--:--");
+        lv_obj_align(sv_lbl_time, LV_ALIGN_CENTER, 0, -22);
+
+        sv_lbl_date = lv_label_create(scr_saver);
+        mkLabel(sv_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+        lv_label_set_text(sv_lbl_date, "----/--/--");
+        lv_obj_align(sv_lbl_date, LV_ALIGN_CENTER, 0, 14);
+
+        sv_lbl_temp = lv_label_create(scr_saver);
+        mkLabel(sv_lbl_temp, &lv_font_simsun_16_cjk, CLR_ACCENT);
+        lv_label_set_text(sv_lbl_temp, "--.-C");
+        lv_obj_align(sv_lbl_temp, LV_ALIGN_BOTTOM_MID, -34, -18);
+
+        sv_lbl_hum = lv_label_create(scr_saver);
+        mkLabel(sv_lbl_hum, &lv_font_simsun_16_cjk, CLR_VIOLET);
+        lv_label_set_text(sv_lbl_hum, "--%");
+        lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 34, -18);
+    }
+
+    updateScreensaver();
+    showScreen(scr_saver);
+}
+
+// 屏保的慢变量刷新。息屏时 currentSysMode != SYS_MODE_NORMAL，
+// updateDynamicElements() 压根不会被调用，所以这里自己按同样的节奏跑。
+static void updateScreensaver(void) {
+    if (scr_saver == nullptr) return;
+    if (saverMode == SAVER_WALL) return;   // 纯壁纸没有会变的元素
+
+    // 和 updateDynamicElements() 同样的 100ms 节奏（那边是 DYNAMIC_REFRESH_MS，
+    // 那个宏定义在文件后段，这里用字面量避免前向依赖）
+    static unsigned long lastRunMs = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastRunMs < 100UL) return;
+    lastRunMs = nowMs;
+
+    time_t now = time(nullptr);
+    struct tm* ti = localtime(&now);
+    if (!ti || ti->tm_year < 124) return;
+
+    static char tbuf[16], dbuf[32], cbuf[16], hbuf[16];
+    static const char* WEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    strftime(tbuf, sizeof(tbuf), "%H:%M", ti);
+    snprintf(dbuf, sizeof(dbuf), "%04d/%02d/%02d %s",
+             ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+    snprintf(cbuf, sizeof(cbuf), "%.1fC", shtTemp);
+    snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
+
+    setText(sv_lbl_time, tbuf);
+    setText(sv_lbl_date, dbuf);
+    setText(sv_lbl_temp, shtAvailable ? cbuf : "无传感器");
+    setText(sv_lbl_hum, shtAvailable ? hbuf : "");
 }
 
 // ===========================
@@ -1308,6 +1950,9 @@ static void handleMenuSelect(void) {
             totalKeyCount = 0;
             preferences.putUInt("keyCount", 0);
             triggerHud("击键计数", "已清零", lv_color_hex(CLR_ACCENT));
+            break;
+        case 11: // 屏保风格（黑屏 / 壁纸 / 时间温湿度）
+            cycleScreensaverMode();
             break;
     }
 }
@@ -1402,8 +2047,22 @@ static void build_menu(void) {
             lv_label_set_text(num, numBuf[i]);
             lv_obj_align(num, LV_ALIGN_RIGHT_MID, -12, 0);
 
+            // 当前值角标：目前只有「屏保风格」用得上，其余项留空、设成透明
+            lv_obj_t* val = lv_label_create(btn);
+            mkLabel(val, &lv_font_simsun_16_cjk, CLR_ACCENT);
+            lv_label_set_text(val, "");
+            lv_obj_align(val, LV_ALIGN_RIGHT_MID, -34, 0);
+            if (i != MENU_ITEMS - 1) lv_obj_add_flag(val, LV_OBJ_FLAG_HIDDEN);
+            menu_items_val[i] = val;
+
             menu_items[i] = btn;
         }
+    }
+
+    // 屏保风格那一项把当前值直接顶在条目右边，省得进二级界面才知道选了什么
+    if (menu_items_val[MENU_ITEMS - 1]) {
+        setText(menu_items_val[MENU_ITEMS - 1],
+                saverMode < TOTAL_SAVER_MODES ? saverModeNames[saverMode] : "");
     }
 
     // ---- 更新页码 ----
@@ -1528,6 +2187,46 @@ static void triggerHud(const char* title, const char* value, lv_color_t color) {
 // ===========================
 // 通知系统实现
 // ===========================
+//
+// 正文兜底：主机只发颜色、不带文字（就是 `ALERT:RED`）时，notifTexts 里存空串，
+// 由 drawNotifPanel() 现场合成「你有 N 条消息」—— 条数会随确认一条条变，
+// 必须绘制时才算，不能像固定文案那样入队时就写死。
+// 之前这里是回一个英文 "Alert"，屏上就俩英文字母，等于什么都没告诉人。
+//
+// 主机带了正文（`ALERT:RED:磁盘不足`）就以主机说的为准，这里完全不介入。
+// 想挑一句更具体的话，让 PC 端用 kbctl_hid.py alert <颜色> <描述> 明确下发。
+// 常用告警文案库。主机只发颜色、不带正文（`ALERT:RED`）时，从这里轮换取一句，
+// 免得屏上只有一个"你有 N 条消息"这种废话。
+// 这张表和 PC 端 kbctl_hid.py 里的 ALERT_PRESETS 是一一对应的，改一处记得改另一处。
+//
+// 之前这里只有一句注释说"从常用文案库里挑一句"，实际实现里根本没这张表：
+// pushNotification() 存空串、drawNotifPanel() 兜底成「你有 N 条消息」。
+// 所以网页上那三个 🚨/🟢/⚠️ 按钮（只发颜色）按下去，展示框里永远只有那一句，
+// 主机自己带的说明文字（`ALERT:RED:磁盘空间不足`）才显示得出来。
+static const char* const ALERT_PRESET_RED[] = {
+    "构建失败", "磁盘空间不足", "服务已宕机", "内存溢出",
+    "网络连接中断", "CI 流水线失败", "磁盘写入错误", "进程异常退出",
+};
+static const char* const ALERT_PRESET_YELLOW[] = {
+    "服务器无响应", "CPU 温度偏高", "电量不足", "磁盘即将写满",
+    "测试未通过", "证书即将过期", "队列积压", "同步冲突待处理",
+};
+static const char* const ALERT_PRESET_GREEN[] = {
+    "部署完成", "构建通过", "备份已完成", "任务已结束",
+    "依赖已更新", "测试全部通过", "文件已同步", "服务已恢复",
+};
+
+// 按颜色轮换着取，同一颜色连按两次给两句不同的，不会一直重复。
+static const char* nextAlertPreset(AlertType type) {
+    static uint8_t idxRed = 0, idxYellow = 0, idxGreen = 0;
+    switch (type) {
+        case ALERT_RED:    return ALERT_PRESET_RED[(idxRed++)    % (sizeof(ALERT_PRESET_RED)    / sizeof(char*))];
+        case ALERT_YELLOW: return ALERT_PRESET_YELLOW[(idxYellow++) % (sizeof(ALERT_PRESET_YELLOW) / sizeof(char*))];
+        case ALERT_GREEN:  return ALERT_PRESET_GREEN[(idxGreen++)  % (sizeof(ALERT_PRESET_GREEN)  / sizeof(char*))];
+        default:           return nullptr;
+    }
+}
+
 static void pushNotification(AlertType type, const String& text) {
     if (type == ALERT_NONE) return;
     if (notifCount >= MAX_NOTIFS) {
@@ -1540,13 +2239,29 @@ static void pushNotification(AlertType type, const String& text) {
     }
 
     notifQueue[notifCount] = type;
-    strncpy(notifTexts[notifCount], text.c_str(), 127);
+    if (text.length() > 0) {
+        strncpy(notifTexts[notifCount], text.c_str(), 127);   // 主机带了正文，以主机说的为准
+    } else {
+        const char* preset = nextAlertPreset(type);
+        if (preset) strncpy(notifTexts[notifCount], preset, 127);
+        else        notifTexts[notifCount][0] = '\0';
+    }
     notifTexts[notifCount][127] = '\0';
     notifCount++;
 
     drawNotifPanel();
 }
 
+// 通知面板：居中大卡片。
+// 交互模型（用户定的）：来一条就显示最新那条 + 灯按它的颜色闪；用户没处理又来一条，
+// 屏幕切到新消息、灯换色，但"还有几条没处理"要一直摆着；按一次静音/灯光键 = 掉最新一条，
+// 队列里前一条自动顶上继续显示、继续闪；全清完灯自然灭。所以这里只画"队尾 + 剩余条数"。
+//
+// 之前是贴在顶部的 58px 小条：存在感太弱，人扫一眼就过去了 —— 但这东西的价值
+// 全在"别漏掉"，所以改成压在屏幕正中，数字和正文都放大。
+// 手头只有 simsun_16_cjk 一个中文点阵字库，程序里没法现生成 24px，
+// 所以正文用 LVGL 的 transform_zoom 把 16px 拉到 1.5 倍（draw 时缩放，不额外占 Flash）。
+// 注意：zoom 缩放的是**绘制**，排版仍按未缩放的宽度算，所以宽度要除以 1.5 再给。
 static void drawNotifPanel(void) {
     if (notifCount == 0) {
         if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
@@ -1557,6 +2272,9 @@ static void drawNotifPanel(void) {
     if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
 
     // 语义色：错误=红 / 正常=绿 / 警告=琥珀 / 普通=青
+    // 只用颜色表示，**不写"错误/正常/警告"这些字**：一条告警到底算不算错误
+    // 取决于主机那边在干什么，键盘擅自下判断经常是错的（CI 变绿、构建变红都很常见）。
+    // 文字留给消息正文自己说。
     AlertType latestType = notifQueue[notifCount - 1];
     uint32_t accent;
     switch (latestType) {
@@ -1566,42 +2284,80 @@ static void drawNotifPanel(void) {
         default:           accent = CLR_ACCENT; break;
     }
 
-    // 和 HUD 同一套卡片语言：纯黑底 + 2px 语义描边 + 左侧竖条 + 状态圆点
+    // 纯黑底 + 2px 语义描边，居中 228x196（屏是 240x240）
+    // 之前左边还挂了一条 5px 竖条，现在去掉了：描边本身已经带语义色，
+    // 竖条只是把正文挤窄一截，告警文字才是这块屏上真正要看的东西。
     scr_notif = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(scr_notif, 232, 58);
-    lv_obj_align(scr_notif, LV_ALIGN_TOP_MID, 0, 6);
-    mkCard(scr_notif, 0x000000, 12);
+    lv_obj_set_size(scr_notif, 228, 196);
+    lv_obj_center(scr_notif);
+    mkCard(scr_notif, 0x000000, 14);
     lv_obj_set_style_border_width(scr_notif, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(scr_notif, lv_color_hex(accent), LV_PART_MAIN);
     lv_obj_move_foreground(scr_notif);
 
-    lv_obj_t* bar = lv_obj_create(scr_notif);
-    lv_obj_set_size(bar, 5, 46);
-    lv_obj_align(bar, LV_ALIGN_LEFT_MID, 4, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(accent), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    // 左上角：同色圆点。只表示"这条是红/绿/黄"，不写"错误/正常/警告"
+    // —— 一条通知算不算错误取决于主机上下文，键盘擅自下判断经常是错的。
+    // 文字留给消息正文自己说。
+    lv_obj_t* kindDot = lv_obj_create(scr_notif);
+    lv_obj_set_size(kindDot, 16, 16);
+    lv_obj_set_style_radius(kindDot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kindDot, lv_color_hex(accent), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(kindDot, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(kindDot, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(kindDot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(kindDot, LV_ALIGN_TOP_LEFT, 18, 15);
 
-    // 状态圆点 + 文本（主机下发的通知可能是中文）
-    lv_obj_t* dot = lv_obj_create(scr_notif);
-    lv_obj_set_size(dot, 10, 10);
-    lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 20, 14);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(accent), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    // 右上角：还剩几条待处理。之前这条信息占了整个顶部一行 + 一个 28 号大数字，
+    // 逼得正文只剩 138 宽；现在收成一行，数字用 20 号大字体单独拎出来，
+    // "1 条" 也一眼看得见（单条的时候最容易被当成没有条数）。
+    char nbuf[8];
+    snprintf(nbuf, sizeof(nbuf), "%d", notifCount);
+    lv_obj_t* cntNum = lv_label_create(scr_notif);
+    mkLabel(cntNum, &lv_font_montserrat_20, accent);
+    lv_label_set_text(cntNum, nbuf);
+    lv_obj_align(cntNum, LV_ALIGN_TOP_RIGHT, -18, 12);
+
+    lv_obj_t* cntLbl = lv_label_create(scr_notif);
+    mkLabel(cntLbl, &lv_font_simsun_16_cjk, CLR_TEXT);
+    lv_label_set_text(cntLbl, "条待处理");
+    lv_obj_align_to(cntLbl, cntNum, LV_ALIGN_OUT_LEFT_TOP, -3, 3);
+
+    // ---- 分隔线 ----
+    lv_obj_t* sep = lv_obj_create(scr_notif);
+    lv_obj_set_size(sep, 196, 1);
+    lv_obj_align(sep, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sep, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- 主体：最新一条的告警正文，1.5 倍，约 3 行 ----
+    // 主机没给正文时（`ALERT:RED`）不留空白，合成一句「你有 N 条消息」——
+    // 条数每次确认都会变，所以在这里现算，不能入队时写死。
+    char fallback[32];
+    const char* body = notifTexts[notifCount - 1];
+    if (body[0] == '\0') {
+        snprintf(fallback, sizeof(fallback), "你有 %d 条消息", (int)notifCount);
+        body = fallback;
+    }
 
     notif_label = lv_label_create(scr_notif);
     mkLabel(notif_label, &lv_font_simsun_16_cjk, CLR_TEXT);
-    lv_label_set_text(notif_label, notifTexts[notifCount - 1]);
-    lv_obj_set_width(notif_label, 186);
+    lv_label_set_text(notif_label, body);
+    lv_obj_set_width(notif_label, 138);        // 138 * 1.5 ≈ 207，卡片内宽 216
     lv_label_set_long_mode(notif_label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(notif_label, LV_ALIGN_TOP_LEFT, 38, 12);
+    lv_obj_set_style_transform_zoom(notif_label, 384, LV_PART_MAIN);   // 1.5x
+    lv_obj_set_style_text_line_space(notif_label, 6, LV_PART_MAIN);
+    lv_obj_align(notif_label, LV_ALIGN_TOP_MID, 0, 48);
+    lv_obj_set_height(notif_label, 76);        // 视觉高度 114，正好约 3 行
 
-    // 通知显示时间（3秒）
+    // ---- 底部：操作提示（只提灯光键，这是实际会按的那个） ----
+    lv_obj_t* hint = lv_label_create(scr_notif);
+    mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(hint, "按灯光键处理");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    // notifStartMs 记录"最新一条通知是什么时候到的"，兜底超时用（见 NOTIF_SAFETY_MS）
     notifStartMs = millis();
     notifShowMs = 3000;
 }
@@ -1609,6 +2365,37 @@ static void drawNotifPanel(void) {
 static void clearNotifications(void) {
     notifCount = 0;
     if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
+}
+
+// 通知不再"弹 3 秒自己消失"了。红绿灯告警的价值就在于灯一直闪到人处理为止，
+// 3 秒后自动消失等于什么都没发生 —— 这也是 s3.ino 原版的做法：通知常驻，
+// 按静音键逐条确认。现在只有一道兜底：120 秒没人碰就整队清掉，
+// 免得键盘放一晚上红灯闪到天亮。
+#define NOTIF_SAFETY_MS 120000UL
+
+// 当前生效的告警永远取队尾（最新）那条。屏幕面板和灯光共用这一个来源，
+// 不会出现"屏上显示黄的、灯在闪红的"这种各说各话。
+static AlertType currentAlertType(void) {
+    return (notifCount > 0) ? notifQueue[notifCount - 1] : ALERT_NONE;
+}
+
+// 用户按静音键 = "我已知晓"。只掉最新的一条，前一条自动顶上继续显示，
+// 灯也跟着换成前一条的颜色；全清完之后灯自然就不闪了。
+// 返回 false 表示当前没有待处理通知，调用方据此决定要不要给别的反馈。
+static bool acknowledgeAlert(void) {
+    if (notifCount == 0) return false;
+
+    notifCount--;
+    drawNotifPanel();
+
+    if (notifCount == 0) {
+        triggerHud("通知已处理", "全部清除", lv_color_hex(CLR_GREEN));
+    } else {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "还剩 %d 条", notifCount);
+        triggerHud("已确认", buf, lv_color_hex(CLR_GREEN));
+    }
+    return true;
 }
 
 // ===========================
@@ -2513,6 +3300,39 @@ static void executeSequenceAction(String seq) {
 }
 
 static void executeMacro(String keyName) {
+    // ME 键是特殊的：它带的内容不是"按什么键"，而是一整段要贴给主机的文本。
+    // 网页端蓝牙过来时只写 /me_hex.txt（HEX 字符串），按下 ME 键才真的打字。
+    // 外面套 [HEXS] / [HEXE] 是主机端识别用的标记 —— 纯 ASCII 打字发中文根本
+    // 做不到，hex 走一遍协议才能把 UTF-8 字节原样送到主机。
+    if (keyName == "ME") {
+        LOG_PORT.println("[ME] key pressed");
+        if (FFat.exists("/me_hex.txt")) {
+            File f = FFat.open("/me_hex.txt", FILE_READ);
+            if (f) {
+                LOG_PORT.printf("[ME] sending %u bytes\n", (unsigned)f.size());
+                Keyboard.print("[HEXS]");
+                delay(20);
+                while (f.available()) {
+                    int c = f.read();
+                    if (c < 0) break;
+                    Keyboard.print((char)c);
+                    delay(1);
+                    esp_task_wdt_reset();   // 大文件逐字打印时喂狗，别中途重启
+                }
+                f.close();
+                delay(20);
+                Keyboard.print("[HEXE]");
+                triggerHud("ME 文本", "已发送", lv_color_hex(CLR_GREEN));
+                return;
+            }
+            LOG_PORT.println("[ME] open /me_hex.txt FAILED");
+        } else {
+            LOG_PORT.println("[ME] /me_hex.txt not found");
+        }
+        triggerHud("ME 文本", "尚未设置", lv_color_hex(CLR_TEXT_DIM));
+        return;
+    }
+
     char pKey[32];
     snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, keyName.c_str());
     String macroData = preferences.getString(pKey, "");
@@ -2749,7 +3569,9 @@ static void scanKeyboardMatrix(void) {
                                 menuSel = 0;
                                 menuScrollOffset = 0;
                                 menuNeedsRebuild = true;
-                                triggerHud("系统菜单", "请选择功能", lv_color_hex(CLR_ACCENT));
+                                // 不再弹"系统菜单/请选择功能"HUD：菜单本身就是提示，
+                                // 每次进菜单都闪一次只是噪音，还压住菜单第一屏。
+
                             }
                             // MA / MB 全局键
                             else if (baseKey == K_MA) {
@@ -2761,6 +3583,18 @@ static void scanKeyboardMatrix(void) {
                             // MR 键：第一次按 = 进入"连续输入"录制（必须排在 >= MACRO_BASE 之前）
                             else if (baseKey == K_MR) {
                                 enterRecording();
+                            }
+                            // 静音键（Consumer 页 0xE2）：先给主机发静音，再处理本机告警
+                            else if (baseKey == KEY_MUTE_USAGE) {
+                                // 0xE2 属于 HID Consumer Usage Page，不是 Keyboard。
+                                // 以前它落进下面的"普通键盘"分支走 Keyboard.press(0xE2)，
+                                // 主机那边收到的根本不是静音，等于这个键白配了。
+                                ConsumerControl.press(CONSUMER_CONTROL_MUTE);
+                                ConsumerControl.release();
+                                currentMode = MODE_MUTE;   // 旋钮跟着切到音量
+                                if (!acknowledgeAlert()) {
+                                    triggerHud("静音", "无待处理通知", lv_color_hex(CLR_TEXT_DIM));
+                                }
                             }
                             // 宏按键
                             else if (baseKey >= MACRO_BASE) {
@@ -2806,9 +3640,8 @@ static void scanKeyboardMatrix(void) {
                                 uint16_t mappedKey = getMappedKey(baseKey);
                                 // 最近按键显示：走 getKeyName，空格显示 "Space" 而不是 "20"
                                 snprintf(lastKeyPressed, sizeof(lastKeyPressed), "%s", getKeyName(baseKey));
-                                // 触发律动效果
-                                uint8_t barIdx = totalKeyCount % 24;
-                                rhythmBars[barIdx] = 60;
+                                // 触发律动效果：峰值柱 + 两侧余晖（pulseRhythm 里定义波形的形状）
+                                pulseRhythm();
                                 hostKeyHeld[r][c] = true;
                                 kbPress((uint8_t)mappedKey);
                             }
@@ -2936,6 +3769,16 @@ static void handleCommand(const String& cmd) {
         // 可以在此添加标语显示逻辑
     }
     // REMAP:prof:clear:rules - Key remapping
+    //
+    // 第三个字段历史上两边对不上，是"映射清不掉"的全部原因：
+    //   网页 s3-setting.html 发的是 `REMAP:0:1:...`（那个 1 是 1.x 遗留的布尔标记）
+    //   固件这里只认 `clear`
+    // 结果：保存时 clearCmd=="1" 走不进清空分支，规则被**追加**到旧规则后面，
+    // 点"清空此方案"也是发 1，同样什么都不做 —— 界面上却已经 alert"已清空！"。
+    // 现在两边都收：clear / 1 / 0 / CLEAR / reset 都当清空。
+    //
+    // 另外把语义定死成"**整份替换**"：只要带了 rules，就先把这个方案的条数归零
+    // 再逐条写入。以前是纯追加，存 3 条再存 1 条就变成 4 条，旧的永远留在里面。
     else if (cmd.startsWith("REMAP:")) {
         String params = cmd.substring(6);
         int firstColon = params.indexOf(':');
@@ -2944,17 +3787,35 @@ static void handleCommand(const String& cmd) {
             int prof = params.substring(0, firstColon).toInt();
             String clearCmd = params.substring(firstColon + 1, secondColon);
             String rules = params.substring(secondColon + 1);
+            clearCmd.toUpperCase();
+            bool wantClear = (clearCmd == "CLEAR" || clearCmd == "RESET" ||
+                              clearCmd == "1"  || clearCmd == "0");
 
             if (prof >= 0 && prof < TOTAL_PROFILES) {
-                if (clearCmd == "clear") {
+                // 清掉这个方案的全部规则：条数归零 + 逐条擦掉 NVS 里的键，
+                // 只置 0 的话那些 rmp_p_i 键还留在 NVS 里，换固件/读档时会诈尸。
+                if (wantClear) {
+                    for (int i = 0; i < remapCounts[prof]; i++) {
+                        char itemKey[20];
+                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+                        preferences.remove(itemKey);
+                    }
                     remapCounts[prof] = 0;
+                    memset(profileRemaps[prof], 0, sizeof(profileRemaps[prof]));
                     char key[16];
                     snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
                     preferences.putInt(key, 0);
-                    triggerHud("按键重映射", "已清空", lv_color_hex(CLR_AMBER));
                 }
-                // 解析映射规则: fromKey,toKey;fromKey,toKey;...
-                if (rules.length() > 0 && remapCounts[prof] < MAX_REMAP_RULES) {
+
+                if (rules.length() > 0) {
+                    // 整份替换：先把旧的清掉，再写新的
+                    for (int i = 0; i < remapCounts[prof]; i++) {
+                        char itemKey[20];
+                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+                        preferences.remove(itemKey);
+                    }
+                    remapCounts[prof] = 0;
+
                     int start = 0;
                     while (start < rules.length() && remapCounts[prof] < MAX_REMAP_RULES) {
                         int semicolon = rules.indexOf(';', start);
@@ -2975,12 +3836,40 @@ static void handleCommand(const String& cmd) {
                     char key[16];
                     snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
                     preferences.putInt(key, remapCounts[prof]);
-                    char buf[16];
-                    snprintf(buf, sizeof(buf), "%d rules", remapCounts[prof]);
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), "%d 条已保存", remapCounts[prof]);
+                    LOG_PORT.printf("[REMAP] prof=%d saved %d rules\n", prof, remapCounts[prof]);
                     triggerHud("按键重映射", buf, lv_color_hex(CLR_GREEN));
+                } else if (wantClear) {
+                    LOG_PORT.printf("[REMAP] prof=%d cleared\n", prof);
+                    triggerHud("按键重映射", "已清空", lv_color_hex(CLR_AMBER));
                 }
             }
         }
+    }
+    // REMAP:prof:read - 把这个方案现有的规则回读给网页
+    // （回读只能靠 BLE notify，所以这里往同一个特征里 notify 一条 REMAPDUMP:）
+    else if (cmd.startsWith("REMAPREAD:")) {
+        int prof = cmd.substring(9).toInt();
+        char out[BLE_CMD_BUF_SIZE];
+        if (prof < 0 || prof >= TOTAL_PROFILES) {
+            snprintf(out, sizeof(out), "REMAPDUMP:%d:ERR", prof);
+        } else {
+            int n = snprintf(out, sizeof(out), "REMAPDUMP:%d:", prof);
+            for (int i = 0; i < remapCounts[prof] && n < (int)sizeof(out) - 16; i++) {
+                n += snprintf(out + n, sizeof(out) - n, "%s%u,%u",
+                               i ? ";" : "",
+                               profileRemaps[prof][i].fromKey, profileRemaps[prof][i].toKey);
+            }
+        }
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)out, strlen(out));
+            pCharacteristic->notify();
+        }
+        LOG_PORT.printf("[REMAP] read prof=%d -> %s\n", prof, out);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "读取到 %d 条", (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0);
+        triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
     }
     // SET:name:value - Macro definition
     else if (cmd.startsWith("SET:")) {
@@ -3008,18 +3897,114 @@ static void handleCommand(const String& cmd) {
             triggerHud("已写入全局键", name.c_str(), lv_color_hex(CLR_ACCENT));
         }
     }
-    // ME_TEXT:text - ME text send (macro/execute text)
+    // ME 键文本：网页端把 UTF-8 文本转成 hex 后分片下发，这里只负责落盘。
+    // 按下 ME 键时才由 executeMacro("ME") 读出来发给电脑（见那里的 [HEXS] 协议），
+    // 所以下发阶段一个字都不往主机打 —— 蓝牙发消息 ≠ 立刻在电脑上打字。
+    else if (cmd == "ME_START") {
+        File f = FFat.open("/me_hex.txt", FILE_WRITE);
+        if (f) f.close();
+        meHexBytes = 0;
+        LOG_PORT.println("[ME] START");
+    }
+    else if (cmd.startsWith("ME_DATA:")) {
+        String hex = cmd.substring(8);
+        if (hex.length() == 0) return;
+        File f = FFat.open("/me_hex.txt", FILE_APPEND);
+        if (f) { f.print(hex); f.close(); meHexBytes += hex.length(); }
+        else LOG_PORT.println("[ME] append FAILED (FFat open failed)");
+    }
+    else if (cmd == "ME_END") {
+        size_t sz = 0;
+        if (FFat.exists("/me_hex.txt")) {
+            File f = FFat.open("/me_hex.txt", FILE_READ);
+            if (f) { sz = f.size(); f.close(); }
+        }
+        LOG_PORT.printf("[ME] END onDisk=%u appended=%u\n", (unsigned)sz, (unsigned)meHexBytes);
+        if (sz == 0) triggerHud("ME 文本", "存入失败", lv_color_hex(CLR_RED));
+        else {
+            char info[32];
+            snprintf(info, sizeof(info), "%u 字节已存", (unsigned)sz);
+            triggerHud("ME 文本", info, lv_color_hex(CLR_GREEN));
+        }
+    }
+    // ME_TEXT:text —— 网页端一次性直发（旧写法）。仍然保留，
+    // 但和新的 ME_START/ME_DATA/ME_END 一样不再立刻往主机打字，
+    // 只是先存一份到 /me_hex.txt，按 ME 键才发。
     else if (cmd.startsWith("ME_TEXT:")) {
         String text = cmd.substring(8);
-        executeSequenceAction(text);
-        triggerHud("文本已发送", "完成", lv_color_hex(CLR_GREEN));
+        if (text.length() == 0) return;
+        // 转成 hex 存，和分片那条路落到同一个文件
+        String hex;
+        hex.reserve(text.length() * 2);
+        for (unsigned i = 0; i < text.length(); i++) {
+            char b[3];
+            snprintf(b, sizeof(b), "%02X", (unsigned char)text[i]);
+            hex += b;
+        }
+        File f = FFat.open("/me_hex.txt", FILE_WRITE);
+        if (f) { f.print(hex); f.close(); }
+        char info[32];
+        snprintf(info, sizeof(info), "%u 字已存", (unsigned)text.length());
+        triggerHud("ME 文本", info, lv_color_hex(CLR_GREEN));
     }
     // LOGO_JPEG_START:size - Wallpaper upload start
+    // 网页端声明本次要发多少字节的 JPEG。收到这条就切进二进制接收模式，
+    // 后面 BLE 写包一律当原始字节处理，收满自动收尾（不需要 END 包，
+    // 也就没有"二进制数据里混进命令"的歧义）。
     else if (cmd.startsWith("LOGO_JPEG_START:")) {
-        int size = cmd.substring(16).toInt();
-        // 预留壁纸上传接口
-        triggerHud("壁纸", "正在接收", lv_color_hex(CLR_AMBER));
-        // 实际数据通过BLECharacteristic的二进制数据接收
+        uint32_t total = (uint32_t)cmd.substring(16).toInt();
+        LOG_PORT.printf("[WALLPAPER] START, total=%lu\n", (unsigned long)total);
+
+        if (total == 0 || total > LOGO_RX_MAX) {
+            triggerHud("壁纸传输", "长度不合法", lv_color_hex(CLR_RED));
+        } else if (logoRxAlloc(total) == nullptr) {
+            triggerHud("壁纸传输", "内存不足", lv_color_hex(CLR_RED));
+        } else {
+            // 重传：不释放缓冲，只把写入位置归零重新覆盖（见 logoRxAlloc 的说明）
+            logoRxTotal  = total;
+            logoRxGot    = 0;
+            logoRxDone   = false;
+            logoRxActive = true;
+            logoRxLastMs = millis();
+            char buf[28];
+            snprintf(buf, sizeof(buf), "%u KB", (unsigned)(total / 1024));
+            triggerHud("壁纸传输", buf, lv_color_hex(CLR_AMBER));
+        }
+    }
+    // LOGO_JPEG_FLUSH - 网页端把最后一包写完之后显式敲一下"发完了"。
+    //
+    // 以前是"收满 logoRxTotal 就自动收尾"，但 BLE 的包是异步到达的：
+    // 固件在收到第 N 包、累加到刚好等于 total 的那一刻就可能在下一包还在路上时
+    // 冲进解码，此时 logoRxActive 已经置 false，那几包在途的 JPEG 字节就会被
+    // 当成文本命令灌进命令队列。显式收尾把"发完"这件事变成一个双方都确认的动作。
+    else if (cmd == "LOGO_JPEG_FLUSH") {
+        LOG_PORT.printf("[WALLPAPER] FLUSH got=%lu total=%lu\n",
+                        (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+        if (!logoRxActive) {
+            // 没在接收就当空操作，网页会接着轮 LOGO_STATUS 拿到真实状态
+        } else if (logoRxGot >= logoRxTotal) {
+            logoRxDone = true;          // loop() 里真正去解码
+        } else {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "数据不全 %lu/%lu",
+                     (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+            abortLogoUpload(buf);
+        }
+    }
+    // LOGO_STATUS - 网页轮询真实结果。
+    // 网页以前是"发完字节就 alert 上传成功"，那是**假成功**：BLE 写成功只说明
+    // 数据交给蓝牙了，不代表键盘解出来、落盘了。现在键盘主动回报状态。
+    else if (cmd == "LOGO_STATUS") {
+        char out[64];
+        const char* state = logoRxActive ? (logoRxDone ? "READY" : "RECV")
+                                         : (wpReady ? "OK" : "IDLE");
+        snprintf(out, sizeof(out), "LOGOSTATUS:%s:%lu/%lu",
+                 state, (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)out, strlen(out));
+            pCharacteristic->notify();
+        }
+        LOG_PORT.printf("[WALLPAPER] status: %s\n", out);
     }
     // NOTIFY:text -> ALERT_GREEN
     else if (cmd.startsWith("NOTIFY:")) {
@@ -3027,40 +4012,161 @@ static void handleCommand(const String& cmd) {
         pushNotification(ALERT_GREEN, text);
     }
     // ALERT: - Notification alerts
+    // 颜色后面不跟正文（就是 ALERT:RED）时传空串，pushNotification() 会
+    // 从常用文案库里挑一句 —— 别再回一个英文 "Alert" 糊弄过去了。
     else if (cmd.startsWith("ALERT:")) {
         String sub = cmd.substring(6);
         if (sub == "OFF" || sub == "CLEAR") {
             clearNotifications();
         }
         else if (sub.startsWith("RED")) {
-            String text = sub.startsWith("RED:") ? sub.substring(4) : "Alert";
+            String text = sub.startsWith("RED:") ? sub.substring(4) : "";
             pushNotification(ALERT_RED, text);
         }
         else if (sub.startsWith("GREEN")) {
-            String text = sub.startsWith("GREEN:") ? sub.substring(6) : "Alert";
+            String text = sub.startsWith("GREEN:") ? sub.substring(6) : "";
             pushNotification(ALERT_GREEN, text);
         }
         else if (sub.startsWith("YELLOW")) {
-            String text = sub.startsWith("YELLOW:") ? sub.substring(7) : "Alert";
+            String text = sub.startsWith("YELLOW:") ? sub.substring(7) : "";
             pushNotification(ALERT_YELLOW, text);
         }
     }
-    else if (cmd == "BTN:KNOB") {
+    else if (cmd == "BTN:KNOB" || cmd == "BTN:LIGHT" || cmd.startsWith("ROT:")) {
+        // 这三条和 C3 侧键是同一套语义（见 handleC3Command），
+        // 主机/BLE 也能触发，所以统一走同一个实现，别各写一份。
+        if (cmd.startsWith("ROT:")) {
+            knobAdjust(cmd.substring(4) == "R" ? 1 : -1);
+        } else if (cmd == "BTN:KNOB") {
+            handleC3Command(cmd);
+        } else {
+            handleC3Command(cmd);
+        }
+    }
+}
+
+// ===========================
+// 旋钮：按 currentMode 调对应的东西
+// ===========================
+// 界面态（菜单 / 设置页）里旋钮是导航和调参，只有回到主界面它才是"调灯"。
+// 音量、屏幕亮度、静音都是 Consumer 页 usage，本机并不真的持有音量 ——
+// 只能把 usage 丢给主机，由操作系统去调（这和原版 s3.ino 的做法一致）。
+static void knobAdjust(int dir) {
+    if (currentSysMode == SYS_MODE_MENU) {
+        menuSel = (dir > 0) ? (menuSel + 1) % MENU_ITEMS
+                            : (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
+        build_menu();
+        return;
+    }
+    if (IS_SETTING_MODE(currentSysMode)) { adjustSettingField(dir); return; }
+
+    // 转到这个模式之前先把背光开关放开：不然"旋钮没反应"其实是灯本来就是灭的
+    if (currentMode == MODE_LIGHT && !lightOn) {
+        lightOn = true;
+        preferences.putBool("light_on", true);
+    }
+
+    char pct[8];
+    switch (currentMode) {
+        case MODE_LIGHT: {
+            if (dir > 0) brightness = (brightness <= 235) ? (uint8_t)(brightness + 20) : 255;
+            else          brightness = (brightness >= 20)  ? (uint8_t)(brightness - 20) : 0;
+            preferences.putUChar("brightness", brightness);
+            snprintf(pct, sizeof(pct), "%d%%", brightness * 100 / 255);
+            triggerHud("键盘背光", pct, lv_color_hex(CLR_AMBER));
+            break;
+        }
+        case MODE_SCREEN_BRIGHTNESS: {
+            if (dir > 0) ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_INCREMENT);
+            else          ConsumerControl.press(CONSUMER_CONTROL_BRIGHTNESS_DECREMENT);
+            ConsumerControl.release();
+            triggerHud("屏幕亮度", dir > 0 ? "调亮" : "调暗", lv_color_hex(CLR_ACCENT));
+            break;
+        }
+        case MODE_MUTE: {
+            if (dir > 0) ConsumerControl.press(CONSUMER_CONTROL_VOLUME_INCREMENT);
+            else          ConsumerControl.press(CONSUMER_CONTROL_VOLUME_DECREMENT);
+            ConsumerControl.release();
+            triggerHud("系统音量", dir > 0 ? "增加" : "减少", lv_color_hex(CLR_GREEN));
+            break;
+        }
+        case MODE_CPG:
+        default: {
+            if (dir > 0) currentEffect = (uint8_t)((currentEffect + 1) % MAX_EFFECTS);
+            else          currentEffect = (uint8_t)((currentEffect + MAX_EFFECTS - 1) % MAX_EFFECTS);
+            preferences.putUChar("effect", currentEffect);
+            triggerHud("灯效切换", effectNames[currentEffect], lv_color_hex(CLR_ACCENT));
+            break;
+        }
+    }
+}
+
+// C3 -> 本机的一条指令。语义照抄 s3.ino 原版，去掉响铃/g_forceOff 那两段
+// （本工程没有闹钟响铃流程，背光总开关叫 lightOn）。
+static void handleC3Command(const String& cmd) {
+    if (cmd == "PONG") { c3Connected = true; return; }
+
+    // 息屏期间任何 C3 动作都算"有人回来了"（旋钮碰一下也算）
+    if (currentSysMode == SYS_MODE_SLEEP) gotoMainScreen();
+
+    if (cmd == "ENC:+")      { knobAdjust(1);  return; }
+    if (cmd == "ENC:-")      { knobAdjust(-1); return; }
+    if (cmd.startsWith("ROT:")) { knobAdjust(cmd.substring(4) == "R" ? 1 : -1); return; }
+
+    if (cmd == "BTN:KNOB") {
         if (currentSysMode == SYS_MODE_MENU) {
             handleMenuSelect();
+        } else if (IS_SETTING_MODE(currentSysMode)) {
+            saveSettingScreen();
+        } else {
+            pulseRhythm();   // 顺手打一下律动，旋钮按下去是有反馈的
         }
+        return;
     }
-    else if (cmd == "BTN:LIGHT") {
-        if (currentSysMode == SYS_MODE_MENU) {
-            gotoMainScreen();
-        }
+
+    if (cmd == "BTN:LIGHT") {
+        // 菜单里按灯光键 = 退回主屏（和 MC 一样的手感，别把人困在菜单里）
+        if (currentSysMode == SYS_MODE_MENU) { gotoMainScreen(); return; }
+        // 告警排在最前：有待处理通知时，这一下是"我已知晓"，
+        // 只掉最新一条，剩下的继续显示、继续闪。不切控制目标，
+        // 免得通知刚确认完旋钮就调到别的东西上。
+        if (acknowledgeAlert()) return;
+        // 没通知时才轮到灯光键自己的职责：在 背光 / 屏幕亮度 之间切目标
+        currentMode = (currentMode == MODE_LIGHT) ? MODE_SCREEN_BRIGHTNESS : MODE_LIGHT;
+        triggerHud("控制目标", modeNamesCN[currentMode], lv_color_hex(CLR_AMBER));
+        return;
     }
-    else if (cmd.startsWith("ROT:")) {
-        bool isRight = cmd.substring(4) == "R";
-        if (currentSysMode == SYS_MODE_MENU) {
-            menuSel = isRight ? (menuSel + 1) % MENU_ITEMS : (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
-            build_menu();
+    if (cmd == "BTN:LIGHT_HOLD") {
+        lightOn = !lightOn;
+        preferences.putBool("light_on", lightOn);
+        triggerHud("背光总开关", lightOn ? "已开启" : "已关闭", lv_color_hex(CLR_AMBER));
+        return;
+    }
+    if (cmd == "BTN:MUTE") {
+        if (!lightOn) { lightOn = true; preferences.putBool("light_on", true); }
+        currentMode = MODE_MUTE;
+        ConsumerControl.press(CONSUMER_CONTROL_MUTE);
+        ConsumerControl.release();
+        // 静音键同时也是告警的确认键：顺手把最新一条处理掉
+        if (!acknowledgeAlert()) {
+            triggerHud("静音控制", "静音切换", lv_color_hex(CLR_GREEN));
         }
+        return;
+    }
+    if (cmd == "BTN:CPG") {
+        if (!lightOn) { lightOn = true; preferences.putBool("light_on", true); }
+        currentMode = MODE_CPG;
+        if (currentEffect == 0) currentEffect = 1;   // 跳过"关闭"这一档
+        else currentEffect = (uint8_t)((currentEffect + 1) % MAX_EFFECTS);
+        preferences.putUChar("effect", currentEffect);
+        triggerHud("灯效切换", effectNames[currentEffect], lv_color_hex(CLR_ACCENT));
+        return;
+    }
+    // 两个长按都是进下载模式重启
+    if (cmd == "BTN:MUTE_HOLD" || cmd == "BTN:CPG_HOLD") {
+        triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
+        pendingRestartMs = millis() + 600;
+        return;
     }
 }
 
@@ -3123,6 +4229,32 @@ static void drawBreathing(uint8_t maxR, uint8_t maxG, uint8_t maxB) {
 }
 
 static void renderLightingEngine(void) {
+    // 告警优先：队列里有东西的时候，0~15 主背光整个让出来给告警闪，
+    // 平时设的灯效和背光亮度这期间一律不生效 —— 告警就该是全场最显眼的东西。
+    // 16~18 三颗锁状态灯照旧由 renderIndicators 驱动，锁状态不能被吞掉。
+    AlertType alert = currentAlertType();
+    if (alert != ALERT_NONE) {
+        static unsigned long lastBlinkMs = 0;
+        static bool blinkOn = false;
+        unsigned long nowMs = millis();
+        if (nowMs - lastBlinkMs >= 180) { lastBlinkMs = nowMs; blinkOn = !blinkOn; }
+
+        if (blinkOn) {
+            uint8_t r = 0, g = 0, b = 0;
+            switch (alert) {
+                case ALERT_RED:    r = 255;             break;
+                case ALERT_GREEN:  g = 255;             break;
+                case ALERT_YELLOW: r = 255; g = 180;    break;
+                default:           r = 0; g = 200; b = 255; break;
+            }
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, r, g, b);
+        } else {
+            clearAllLeds();   // 只清 0~15，锁状态灯 16~18 留给 renderIndicators
+        }
+        renderIndicators();
+        return;
+    }
+
     // 背光总开关只管 0~15；16~18 三颗锁状态灯始终由 renderIndicators 驱动，
     // 不受背光开关和背光亮度影响（见 renderIndicators 的注释）
     if (!lightOn) {
@@ -3292,31 +4424,9 @@ static void updateDynamicElements(void) {
         }
 
         case DISP_MODE_RHYTHM: {
-            // 柱子从基线往上长：高度 4~100，颜色随高度从青渐变到紫
-            // 这里是全项目最热的一处：24 根柱子 × (尺寸 + 位置 + 底色) = 72 次写入。
-            // 之前是无条件写，等于每轮 loop 都把屏幕重新 invalidate 一遍 72 次，
-            // 节奏页会重演信息面板那种"卡死 + 按键失灵"。setSizePos/setBgColor
-            // 会先读回比对，静止时一次 LVGL 调用都不产生。
-            for (int i = 0; i < 24; i++) {
-                if (!rh_bars[i]) continue;
-                uint8_t hgt = rhythmBars[i];
-                if (hgt > 0) rhythmBars[i] = hgt - 1;
-
-                uint8_t v = (hgt > 25) ? 25 : hgt;
-                int barH = 4 + v * 4;
-                setSizePos(rh_bars[i], 6, barH, 2 + i * 10, 110 - barH);
-
-                if (hgt == 0) {
-                    setBgColor(rh_bars[i], CLR_SURFACE_2);
-                } else {
-                    // 颜色随高度在 青(0x22D3EE) → 紫(0xA78BFA) 之间线性插值
-                    uint16_t t = (uint16_t)(v * 255 / 25);
-                    uint8_t r = (uint8_t)(0x22 + (0xA7 - 0x22) * t / 255);
-                    uint8_t g = (uint8_t)(0xD3 + (0x8B - 0xD3) * t / 255);
-                    uint8_t b = (uint8_t)(0xEE + (0xFA - 0xEE) * t / 255);
-                    setBgColor(rh_bars[i], ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
-                }
-            }
+            // 柱子动画不在这里跑 —— 它有自己的 16ms 快节拍 tickRhythm()。
+            // 之前柱子也挂在下面这段 100ms 刷新里，一根柱子从 60 掉到 0 要 6 秒，
+            // 看着就是"律动很慢"，其实是刷新率被 DYNAMIC_REFRESH_MS 锁死了。
             setText(rh_lbl_keys, num_buf);
             break;
         }
@@ -3326,6 +4436,73 @@ static void updateDynamicElements(void) {
             break;
         }
     }
+}
+
+// ===========================
+// 律动页动画（独立快节拍）
+// ===========================
+// 律动是全屏唯一的"动效"，必须跟得上手指。之前的实现把柱子的下落挂在
+// updateDynamicElements() 里，而那个函数被 DYNAMIC_REFRESH_MS = 100ms 卡着
+// （对时钟/温湿度是对的，对动画就是灾难）：一根柱子从峰值掉到基线要 6 秒，
+// 打字的节奏全被抹平了，看上去就是"律动很慢"。
+//
+// 现在单独一个 16ms 节拍（~60fps），并且给一次击键同时点亮峰值柱和两侧邻柱，
+// 打出连续波而不是一根孤柱。静止时 24 根柱子全部是 0，直接 return，
+// 一个 LVGL 调用都不产生 —— 这是之前"节奏页卡死"的解药，不能丢。
+#define RHYTHM_TICK_MS 16UL
+// 柱高量程 0~25（对应像素高 4~104），每 tick 掉 1 → 峰值约 400ms 落回基线。
+#define RHYTHM_DECAY 1
+
+static void tickRhythm(void) {
+    if (currentSysMode != SYS_MODE_NORMAL) return;
+    if (currentDispMode != DISP_MODE_RHYTHM || rh_bg == nullptr) return;
+
+    static unsigned long lastMs = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastMs < RHYTHM_TICK_MS) return;
+    lastMs = nowMs;
+
+    bool anyAlive = false;
+    for (int i = 0; i < 24; i++) if (rhythmBars[i] > 0) { anyAlive = true; break; }
+    if (!anyAlive) return;
+
+    // 这里是全项目最热的一处：24 根柱子 × (尺寸 + 位置 + 底色) = 72 次写入。
+    // setSizePos/setBgColor 会先读回比对，值没变就不写 —— 关键，别绕过它。
+    for (int i = 0; i < 24; i++) {
+        if (!rh_bars[i]) continue;
+        uint8_t hgt = rhythmBars[i];
+        if (hgt > RHYTHM_DECAY) rhythmBars[i] = hgt - RHYTHM_DECAY;
+        else                     rhythmBars[i] = 0;
+
+        uint8_t v = rhythmBars[i];
+        int barH = 4 + v * 4;
+        setSizePos(rh_bars[i], 6, barH, 2 + i * 10, 110 - barH);
+
+        if (v == 0) {
+            setBgColor(rh_bars[i], CLR_SURFACE_2);
+        } else {
+            // 颜色随高度在 青(0x22D3EE) → 紫(0xA78BFA) 之间线性插值
+            uint16_t t = (uint16_t)(v * 255 / 25);
+            uint8_t r = (uint8_t)(0x22 + (0xA7 - 0x22) * t / 255);
+            uint8_t g = (uint8_t)(0xD3 + (0x8B - 0xD3) * t / 255);
+            uint8_t b = (uint8_t)(0xEE + (0xFA - 0xEE) * t / 255);
+            setBgColor(rh_bars[i], ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+        }
+    }
+}
+
+// 击键激励：峰值柱拉满，左右各亮一档弱一点的，再远一点给一档余晖。
+// 键盘在屏幕上扫出一段波，比孤零零一根柱子有"律动"的意思。
+static void pulseRhythm(void) {
+    int idx = (int)(totalKeyCount % 24);
+    uint8_t peak = 21 + (uint8_t)(esp_random() % 5);   // 21~25
+    rhythmBars[idx] = peak;
+    if (rhythmBars[(idx + 1) % 24] < 14) rhythmBars[(idx + 1) % 24] = 14;
+    if (rhythmBars[(idx + 23) % 24] < 14) rhythmBars[(idx + 23) % 24] = 14;
+    if (rhythmBars[(idx + 2) % 24] < 8)  rhythmBars[(idx + 2) % 24] = 8;
+    if (rhythmBars[(idx + 22) % 24] < 8)  rhythmBars[(idx + 22) % 24] = 8;
+    if (rhythmBars[(idx + 3) % 24] < 4)  rhythmBars[(idx + 3) % 24] = 4;
+    if (rhythmBars[(idx + 21) % 24] < 4) rhythmBars[(idx + 21) % 24] = 4;
 }
 
 // ===========================
@@ -3352,20 +4529,32 @@ static void renderCurrentDisplayBase(void) {
     if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
     if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
 
+    // **必须清掉子对象指针，否则就是野指针**
+    // 上面的 lv_obj_del(ip_bg) 会连同 card / 三颗锁灯胶囊 / 所有 label 一起释放，
+    // 但 LVGL 不会替我们把外部变量置空。之前这里只把 ip_bg 写成 nullptr，
+    // ip_lbl_clock / ipLockDot[] / ipLockLbl[] / ipLockChip[] 全留在已释放的地址上。
+    // 切走后的下一轮 loop，updateDynamicElements() 的 INFO_PANEL 分支照样每帧去写
+    // 这些指针 —— setText/setBgColor 里的 nullptr 检查全部失效，直接踩坏堆 → 崩溃重启。
+    // 这就是"切到信息面板就崩"的真凶：崩在切换之后，而不是切的那一瞬间。
+    resetStylePointers();
+
     // ------------------------------------------------------------------
-    // 临时诊断：主屏风格整体停用
+    // 诊断：按位掩码控制启用哪些主屏风格
     // ------------------------------------------------------------------
-    // 现象：进主屏风格后整机卡死、按键全部失灵。
+    // 现象：六种风格全开时进主屏整机卡死、按键全部失灵；全关时一切正常。
     // 这里只跳过"建内容"这一步，主屏仍然是 ensureMainScreen() 那块合法屏幕，
     // 所以切屏、息屏、菜单、设置、录制、按键扫描等外围逻辑都保持原样。
     //
-    // 停用是安全的：所有 gk_/bc_/ip_/km_/rh_/wp_ 指针此时全是 nullptr，而
+    // 被关掉的风格，其 gk_/bc_/ip_/km_/rh_/wp_ 指针全是 nullptr，而
     // updateDynamicElements() 里对这些指针的写入全部经过 setText/setBgColor/
     // setTextColor/setSizePos，这四个 setter 第一行就是 if (o == nullptr) return。
-    // 顶部条 topLockDot[] 同理。所以屏幕全黑，但键盘应当恢复正常响应。
+    // 顶部条 topLockDot[] 同理（已并入 resetStylePointers）。所以那几种风格是空屏，
+    // 键盘照常响应。
     //
-    // 想恢复：把下面这行改成 false，六种风格立刻全部回来。
-    if (MAIN_STYLE_DISABLED) { mainContentValid = true; return; }
+    // 现在默认是 STYLE_BIT_ALL（六种全开）。真要临时关掉某一种排查问题，
+    // 把对应的位从 MAIN_STYLE_MASK 里去掉即可。
+    uint32_t modeBit = 1u << (currentDispMode & 0x1F);
+    if ((MAIN_STYLE_MASK & modeBit) == 0) { mainContentValid = true; return; }
 
     switch (currentDispMode) {
         case DISP_MODE_GEEK: build_style_geek(); break;
@@ -3472,7 +4661,7 @@ static void showBootDiagnostics(void) {
     uint32_t boots = preferences.getUInt("boot_cnt", 0) + 1;
     preferences.putUInt("boot_cnt", boots);
 
-    Serial.printf("[BOOT] reason=%d (%s) psram=%u heap=%u minHeap=%u boots=%u\n",
+    LOG_PORT.printf("[BOOT] reason=%d (%s) psram=%u heap=%u minHeap=%u boots=%u\n",
                   (int)why, resetReasonName(why), (unsigned)psram,
                   (unsigned)heapFree, (unsigned)heapMin, (unsigned)boots);
 
@@ -3519,7 +4708,7 @@ static void showBootDiagnostics(void) {
         pushBootHud(2900, "上次", buf, CLR_TEXT_DIM);
     }
 
-    Serial.printf("[BOOT] prev: hang=%u stage=%u(%s) key=%s uptimeMs=%u\n",
+    LOG_PORT.printf("[BOOT] prev: hang=%u stage=%u(%s) key=%s uptimeMs=%u\n",
                   (unsigned)ct_prev.hang, (unsigned)ct_prev.stage,
                   ctStageName(ct_prev.stage),
                   (ct_prev.keyCode == 0xFFFFFFFFUL) ? "none" : getKeyName((uint16_t)ct_prev.keyCode),
@@ -3534,7 +4723,7 @@ void setup() {
     // 现场也已经留在 RTC 慢存里了，下次开机能显示出来。
     ct_begin();
 
-    Serial.begin(115200);
+    LOG_PORT.begin(115200);
     delay(500);
     Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
 
@@ -3550,6 +4739,8 @@ void setup() {
     Keyboard.begin();
     ConsumerControl.begin();
     SystemControl.begin();
+    // 厂商通道必须先注册回调再 begin()，否则主机发下来的报告没人收
+    VendorHID.onEvent(onHidVendorEvent);
     VendorHID.begin();
     USB.begin();
 
@@ -3561,7 +4752,7 @@ void setup() {
 
     // LVGL
     lvgl_driver_init(&tft);
-    Serial.println("[LVGL] Ready");
+    LOG_PORT.println("[LVGL] Ready");
 
     // NVS
     preferences.begin("keyboard", false);
@@ -3578,6 +4769,8 @@ void setup() {
     }
 
     currentDispMode = preferences.getUChar("disp_mode", DISP_MODE_GEEK);
+    saverMode = preferences.getUChar("saver_mode", SAVER_OFF);
+    if (saverMode >= TOTAL_SAVER_MODES) saverMode = SAVER_OFF;
     currentProfile = preferences.getUChar("curr_prof", 0);
     totalKeyCount = preferences.getUInt("keyCount", 0);
 
@@ -3596,7 +4789,7 @@ void setup() {
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000);
     if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
-        Serial.println("[MCP23017] Init failed, recovering...");
+        LOG_PORT.println("[MCP23017] Init failed, recovering...");
         recoverI2CBus();
     }
 
@@ -3613,16 +4806,25 @@ void setup() {
     // BLE
     BLEDevice::init("YYQ-MX9.0");
     BLEDevice::setMTU(517);
+    // 必须在 BLE 起来之前建好：onWrite 里判的就是 bleCmdQueue != nullptr
+    bleCmdQueue = xQueueCreate(BLE_CMD_QUEUE_LEN, BLE_CMD_BUF_SIZE);
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
     BLEService* pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_WRITE);
+    // 必须带 NOTIFY：网页的"从键盘读取"按钮要靠它把映射规则回读上来
+    // （REMAP:prof:read -> 固件 notify 一条 REMAPDUMP:...）。只给 WRITE 的话，
+    // 键盘没有任何回话通道，网页上就永远是空的，用户也分不清"没保存"还是"读不出来"。
+    pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
     pCharacteristic->setCallbacks(new MyCallbacks());
     pService->start();
     BLEDevice::startAdvertising();
 
     // FFat
     FFat.begin(true);
+
+    // 开机把上次传的壁纸从盘上读回 PSRAM，重启不用让网页再传一遍
+    loadWallpaperFromDisk();
 
     // 键盘矩阵
     initBaseMatrix();
@@ -3655,7 +4857,7 @@ void setup() {
     ct_ready();
     ct_startMonitor();
 
-    Serial.println("YYQ-MX9.0 LVGL Ready");
+    LOG_PORT.println("YYQ-MX9.0 LVGL Ready");
 }
 
 // ===========================
@@ -3685,6 +4887,26 @@ void loop() {
     }
 
     // BLE 重连
+    // 主机指令在这里统一落到 LVGL 任务：NimBLE 回调只入队，
+    // 解析和所有 lv_* 调用都在这一行之后，和键盘触发的路径同属一个任务。
+    drainBleCommands();
+
+    // 壁纸：收齐了就解码（几百毫秒，放主任务不占 BLE 主机任务）。
+    // 传一半断线（关网页、走出范围）必须超时放掉缓冲，否则后面所有文本
+    // 指令都会被当成 JPEG 数据吃掉，键盘直接"失联"。
+    if (logoRxDone) finishLogoUpload();
+    if (logoRxActive && !logoRxDone && millis() - logoRxLastMs > LOGO_RX_TIMEOUT_MS) {
+        abortLogoUpload("传输中断");
+    }
+
+    // USB HID 厂商通道走同一套纪律：USB 回调只往环形缓冲里塞字节，
+    // 解析放在这里，和键盘触发的路径在同一个任务里碰 LVGL。
+    handleHidVendorCommands();
+
+    // C3 侧键 / 旋钮：Serial1 的行解析。放这里而不是中断里 ——
+    // 灯光键确认通知要重画面板、旋钮要弹 HUD，都在主任务里做。
+    handleC3Events();
+
     if (!deviceConnected && oldDeviceConnected) {
         ct_mark(CT_S_BLE_DELAY);
         delay(500);
@@ -3726,8 +4948,9 @@ void loop() {
     if (currentSysMode == SYS_MODE_NORMAL && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
         currentSysMode = SYS_MODE_SLEEP;
         ct_mark(CT_S_SLEEP);
-        // 拆主屏：连带作废所有指向子控件的全局指针，唤醒时 gotoMainScreen() 会重建
-        destroyMainScreen();
+        // SAVER_OFF 走老路径拆主屏；壁纸/时间温湿度则另起一块屏保屏，
+        // 主屏原样留着，唤醒时切回去就行，省掉一次重建。
+        enterScreensaver();
     }
 
     // 菜单重建（在主循环中处理，避免与 LVGL 冲突）
@@ -3741,6 +4964,12 @@ void loop() {
     if (currentSysMode == SYS_MODE_NORMAL) {
         ct_mark(CT_S_DYNAMIC);
         updateDynamicElements();
+        // 律动页的柱子动画走独立 16ms 节拍，跟上面 100ms 的慢刷新解耦。
+        // 放在 updateDynamicElements() 里面就是"律动很慢"的根因。
+        tickRhythm();
+    } else if (currentSysMode == SYS_MODE_SLEEP) {
+        // 息屏期间 updateDynamicElements() 不跑，屏保的时钟/温湿度自己刷
+        updateScreensaver();
     }
 
     // HUD 消失
@@ -3750,16 +4979,12 @@ void loop() {
         if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
     }
 
-    // 通知消失（自动移除最老的通知）
+    // 通知兜底超时：正常路径是按静音键确认掉，不自动消失。
+    // 万一没人按键（比如键盘整晚没人碰），到点整队清掉，别让红灯闪一宿。
     ct_mark(CT_S_NOTIF);
-    if (notifCount > 0 && millis() - notifStartMs > notifShowMs) {
-        // 移除最老的通知
-        for (int i = 0; i < notifCount - 1; i++) {
-            notifQueue[i] = notifQueue[i + 1];
-            strncpy(notifTexts[i], notifTexts[i + 1], 127);
-        }
-        notifCount--;
-        drawNotifPanel();
+    if (notifCount > 0 && millis() - notifStartMs > NOTIF_SAFETY_MS) {
+        clearNotifications();
+        triggerHud("通知超时", "已自动清除", lv_color_hex(CLR_TEXT_DIM));
     }
 
     // LVGL

@@ -1,56 +1,88 @@
-import re, sys
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+校验固件里所有中文字符是否都在 lv_font_simsun_16_cjk 字库里。
 
-font = r"E:\ai-project\mx9.0\archives\6.0\lvgl_s3\src\lv_font_simsun_16_cjk.c"
-ino  = r"E:\ai-project\mx9.0\archives\6.0\lvgl_s3\src\lvgl_s3.ino"
+背景：这个字库是用 lv_font_conv 从 simhei.ttf 生成的**子集**（注释里 -r 那串
+只圈了约一千个常用字）。凡是不在那串范围里的汉字，LVGL 会画成 □ 方框 ——
+表现为"文字乱码"。所以每加一条中文文案，都必须先过这个脚本。
 
-src = open(font, encoding="utf-8", errors="ignore").read()
+用法：
+    python check_font.py            # 报告所有缺字 + 出处
+    python check_font.py --chars    # 只把缺字打进剪贴板用的集合
+"""
 
-# parse cmaps
-cmaps = []
-for m in re.finditer(r"range_start\s*=\s*(\d+).{0,4}range_length\s*=\s*(\d+).{0,4}glyph_id_start\s*=\s*(\d+)", src, re.S):
-    cmaps.append(tuple(int(x) for x in m.groups()))
+import os
+import re
+import sys
 
-def find_list(name):
-    m = re.search(re.escape(name) + r"\[\]\s*=\s*\{(.*?)\};", src, re.S)
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONT_C = os.path.join(HERE, "src", "lv_font_simsun_16_cjk.c")
+SOURCES = [
+    os.path.join(HERE, "src", "lvgl_s3.ino"),
+]
+
+CJK = re.compile(r"[\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF]")
+
+
+def load_covered():
+    # 3500 字的 -r 串有两万多字符，头部注释很长，别只读一小段
+    with open(FONT_C, "r", encoding="utf-8", errors="replace") as f:
+        head = f.read(120000)
+    m = re.search(r"-r\s+(.+?)(?:\s+-o\s|$)", head, re.S)
     if not m:
-        return None
-    body = m.group(1)
-    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
-    body = re.sub(r"//[^\n]*", "", body)
-    return [int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]+)", body)]
+        raise SystemExit("解析不出 -r 范围，字库头部格式变了？")
+    covered = set()
+    for part in m.group(1).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            covered.update(range(int(a, 16), int(b, 16) + 1))
+        else:
+            covered.add(int(part, 16))
+    return covered
 
-lists = {}
-for nm in ["unicode_list_1", "unicode_list_5", "glyph_id_ofs_list_4"]:
-    v = find_list(nm)
-    if v is not None:
-        lists[nm] = v
 
-def covered(cu):
-    for (rs, rl, gs) in cmaps:
-        if rs <= cu < rs + rl:
-            if rl <= 128:
-                return True  # dense tiny range
-            # sparse lists
-            for nm in ("unicode_list_1", "unicode_list_5"):
-                if nm in lists:
-                    if (cu - rs) in lists[nm]:
-                        return True
-            if "glyph_id_ofs_list_4" in lists and len(lists["glyph_id_ofs_list_4"]) == rl:
-                return True
-    return False
+def scan(path, covered):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    missing = {}
+    for i, line in enumerate(lines, 1):
+        if not CJK.search(line):
+            continue
+        # 注释里的中文不影响显示，但顺手一起报出来更容易定位
+        for ch in set(CJK.findall(line)):
+            if ord(ch) not in covered:
+                missing.setdefault(ch, []).append(i)
+    return missing
 
-text = open(ino, encoding="utf-8", errors="ignore").read()
-# only string literals
-lits = re.findall(r'"((?:[^"\\]|\\.)*)"', text)
-chars = set()
-for s in lits:
-    for ch in s:
-        if ord(ch) > 0x2000:
-            chars.add(ch)
 
-print("cmaps:", cmaps)
-for k, v in lists.items():
-    print(k, "len", len(v), v[:8])
-missing = sorted([c for c in chars if not covered(ord(c))])
-print("CJK chars used:", len(chars))
-print("MISSING (%d):" % len(missing), " ".join("%s(U+%04X)" % (c, ord(c)) for c in missing))
+def main():
+    covered = load_covered()
+    total = 0
+    for path in SOURCES:
+        if not os.path.exists(path):
+            print(f"跳过（不存在）：{path}")
+            continue
+        missing = scan(path, covered)
+        total += len(missing)
+        name = os.path.basename(path)
+        if not missing:
+            print(f"[OK] {name}：没有缺字")
+            continue
+        print(f"[缺 {len(missing)} 字] {name}：")
+        for ch, lines in sorted(missing.items()):
+            spots = ", ".join(str(n) for n in lines[:6])
+            more = f" 等 {len(lines)} 处" if len(lines) > 6 else ""
+            print(f"    {ch}  U+{ord(ch):04X}  行 {spots}{more}")
+    print()
+    if total:
+        print(f"合计 {total} 个字不在字库里，会显示成方框。")
+        sys.exit(1)
+    print("全部命中字库。")
+
+
+if __name__ == "__main__":
+    main()

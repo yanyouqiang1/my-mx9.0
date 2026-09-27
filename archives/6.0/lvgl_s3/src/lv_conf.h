@@ -136,7 +136,11 @@
 #define LV_FONT_MONTSERRAT_12_SUBPX 0
 #define LV_FONT_MONTSERRAT_28_COMPRESSED 0
 #define LV_FONT_MONTSERRAT_48_COMPRESSED 0
-#define LV_USE_FONT_COMPRESSED    0
+// 字库生成时带了 --no-compress，所以这里保持 1 只是当保险：万一以后又换成压缩字库，
+// 至少不会掉进 lv_font_fmt_txt.c 的
+// "Compressed fonts is used but LV_USE_FONT_COMPRESSED is not enabled" 分支直接
+// return NULL —— 那个分支的表现是所有中文全部空白，只有 Montserrat 的数字还在。
+#define LV_USE_FONT_COMPRESSED    1
 #define LV_USE_FONT_SUBPX         0
 
 // 中文子集字体（黑体 16px，ASCII + 源码里实际用到的 300 个汉字）

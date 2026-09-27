@@ -50,48 +50,19 @@
 
     <!-- 顶部 Tab -->
     <div class="top-tabs">
-        <button id="tab-bt-btn" class="active" onclick="switchTab('bt')">📶 蓝牙</button>
-        <button id="tab-profile-btn" onclick="switchTab('profile')">📋 方案配置</button>
+        <button id="tab-profile-btn" class="active" onclick="switchTab('profile')">📋 方案配置</button>
         <button id="tab-system-btn" onclick="switchTab('system')">⚙️ 系统设置</button>
     </div>
 
-    <!-- =================== 蓝牙 Tab（第一页） =================== -->
-    <div id="tab-bt" class="tab-panel active">
+    <!-- =================== 方案配置 Tab =================== -->
+    <div id="tab-profile" class="tab-panel active">
 
-        <!-- 1. 连接 + 校时 + 通知灯 -->
+        <!-- 1. ME 蓝牙发送文本 -->
         <div class="card">
-            <h2>1. 蓝牙连接、精准校时与系统通知灯</h2>
-            <div style="display: flex; gap: 15px; align-items: center;">
-                <button class="btn" id="connectBtn">连接键盘蓝牙</button>
-                <span id="status" style="font-weight: bold; color: #f87171;">未连接</span>
-                <button class="btn btn-green" id="syncTimeBtn" style="margin-left: auto;">同步电脑时间</button>
-            </div>
-            <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
-                <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
-                <div class="alert-bar">
-                    <button class="btn btn-red" onclick="sendAlert('RED')">🚨 触发红灯闪烁</button>
-                    <button class="btn btn-green" onclick="sendAlert('GREEN')">🟢 触发绿灯闪烁</button>
-                    <button class="btn btn-yellow" onclick="sendAlert('YELLOW')">⚠️ 触发黄灯闪烁</button>
-                    <button class="btn btn-tag" onclick="sendAlert('OFF')">⏹️ 停止报警闪烁</button>
-                </div>
-                <div class="hint" style="margin-top: 10px;">
-                    要带说明文字就填这里（不填就用键盘内置文案库里轮换的一句）。<br>
-                    例：磁盘空间不足 / 构建失败 / 服务器无响应 / 部署完成 …
-                </div>
-                <div style="display: flex; gap: 8px; margin-top: 6px;">
-                    <input id="alertTextInput" type="text" placeholder="说明文字（可留空）" style="flex: 1;">
-                    <button class="btn" onclick="sendAlertWithText('RED')">带说明下发</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- 2. ME 键文本 -->
-        <div class="card">
-            <h2>2. ME 键文本（下发存储，按 ME 键才发给电脑）</h2>
+            <h2>1. ME 蓝牙发送文本</h2>
             <div class="hint">
-                这里下发只是把文本<b>存进键盘</b>，不会立刻在电脑上打字。<br>
-                存好之后按键盘上的 <b>ME</b> 键，文本才会通过蓝牙打给主机的光标位置。<br>
-                文本按 UTF-8 转成 hex 存盘，所以中文也能正常发（4.0 起的标准协议）。
+                按一下键盘上的 ME 键，键值会被拦截不发，文本会通过蓝牙立刻打给主机光标位置。
+                不会写到固件里——关掉网页就丢了，想存为"ME 默认文本"得用 MR 录制或 FFat 写入。
             </div>
             <div style="margin-top: 10px;">
                 <button class="btn-tag" onclick="insertMeTag('[ENTER]')">回车 [ENTER]</button>
@@ -102,27 +73,13 @@
                 <button class="btn-tag" onclick="insertMeTag('SLEEP(500)')">⏱️ 延时 500ms</button>
                 <button class="btn-tag" onclick="insertMeTag('SLEEP(1000)')">⏱️ 延时 1s</button>
             </div>
-            <textarea id="meTextInput" rows="3" placeholder="例：hello world[ENTER]second line"></textarea>
-            <button class="btn btn-green" id="meSendBtn" style="width: 100%; margin-top: 8px;">📡 下发并存入 ME 键</button>
+            <textarea id="meTextInput" rows="3" placeholder="例：hello world[ENTER]SLEEP(200)second line"></textarea>
+            <button class="btn btn-green" id="meSendBtn" style="width: 100%; margin-top: 8px;">📡 通过蓝牙发送给 ME</button>
         </div>
 
-        <!-- 蓝牙收发流水：出问题时先看这里 -->
+        <!-- 2. 按方案按键映射 REMAP -->
         <div class="card">
-            <h2>3. 蓝牙收发流水（排错用）</h2>
-            <div class="hint">显示每条发出的指令和键盘回话。网页上"保存成功"到底成没成，看键盘回话最准。</div>
-            <div id="bleLog" style="margin-top: 8px; max-height: 220px; overflow-y: auto;
-                background:#0b1220; border:1px solid #1e293b; border-radius:6px;
-                padding:8px; font-family:Consolas,monospace; font-size:12px; color:#94a3b8;
-                white-space:pre-wrap; word-break:break-all;">（还没有任何收发记录）</div>
-        </div>
-    </div>
-
-    <!-- =================== 方案配置 Tab =================== -->
-    <div id="tab-profile" class="tab-panel">
-
-        <!-- 1. 按方案按键映射 REMAP -->
-        <div class="card">
-            <h2>1. 按方案按键映射 (REMAP) — 例：把 Win 映射为 Ctrl</h2>
+            <h2>2. 按方案按键映射 (REMAP) — 例：把 Win 映射为 Ctrl</h2>
             <div class="hint">
                 映射按方案独立保存，互不影响。底层用的是键盘 HID 键码（HID Usage ID），
                 常见修饰键：Ctrl=128, Shift=129, Alt=130, Win/Cmd=131。
@@ -160,12 +117,12 @@
                 <div id="remapRuleList" style="margin-top: 6px;"></div>
             </div>
 
-            <button class="btn btn-green" id="remapSaveBtn" style="width: 100%; margin-top: 12px;">💾 保存到键盘（保存后会自动读回确认）</button>
+            <button class="btn btn-green" id="remapSaveBtn" style="width: 100%; margin-top: 12px;">💾 保存到键盘</button>
         </div>
 
         <!-- 3. MA / MB / M1-M12 全局动作合并 -->
         <div class="card">
-            <h2>2. 全局独立功能键 (MA / MB / M1~M12)</h2>
+            <h2>3. 全局独立功能键 (MA / MB / M1~M12)</h2>
             <div class="hint">
                 这里配的是"按下这一颗键，除了按方案宏（M1-M12 才有）外，还会做什么"。
                 例如 M1 设成"切到方案 2 + Ctrl+Alt+T"，按 M1 会先切方案再发热键。
@@ -242,7 +199,7 @@
 
         <!-- 4. 方案专属宏 M1-M12 -->
         <div class="card">
-            <h2>3. 方案专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
+            <h2>4. 方案专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
             <div class="hint">这里编辑的是按方案宏：每个方案下的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
 
             <div>
@@ -303,9 +260,28 @@
     <!-- =================== 系统设置 Tab =================== -->
     <div id="tab-system" class="tab-panel">
 
-        <!-- 1. 时钟 / 闹钟 / 倒计时 -->
+        <!-- 1. 蓝牙连接、时间校准、系统通知灯 -->
         <div class="card">
-            <h2>1. 时钟 / 闹钟 / 倒计时</h2>
+            <h2>1. 蓝牙连接、精准校时与系统通知灯</h2>
+            <div style="display: flex; gap: 15px; align-items: center;">
+                <button class="btn" id="connectBtn">连接键盘蓝牙</button>
+                <span id="status" style="font-weight: bold; color: #f87171;">未连接</span>
+                <button class="btn btn-green" id="syncTimeBtn" style="margin-left: auto;">同步电脑时间</button>
+            </div>
+            <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
+                <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
+                <div class="alert-bar">
+                    <button class="btn btn-red" onclick="sendAlert('RED')">🚨 触发红灯闪烁</button>
+                    <button class="btn btn-green" onclick="sendAlert('GREEN')">🟢 触发绿灯闪烁</button>
+                    <button class="btn btn-yellow" onclick="sendAlert('YELLOW')">⚠️ 触发黄灯闪烁</button>
+                    <button class="btn btn-tag" onclick="sendAlert('OFF')">⏹️ 停止报警闪烁</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. 时钟 / 闹钟 / 倒计时 -->
+        <div class="card">
+            <h2>2. 时钟 / 闹钟 / 倒计时</h2>
             <div class="hint">
                 这三样在键盘上按 <b>MC</b> 键进菜单也能设（7 设置时间 / 8 闹钟设置 / 9 倒计时），
                 这里只是图个方便。到点时键盘会弹出常驻卡片 + 19 颗灯全红快闪，
@@ -338,7 +314,7 @@
 
         <!-- 3. 屏幕显示模式 & 按键回显 -->
         <div class="card">
-            <h2>2. 屏幕多主题展示模式 & 按键回显</h2>
+            <h2>3. 屏幕多主题展示模式 & 按键回显</h2>
             <div class="grid-2">
                 <div>
                     <label>主屏幕显示风格切换：</label>
@@ -363,7 +339,7 @@
 
         <!-- 4. 壁纸 / LOGO 画板上传 -->
         <div class="card">
-            <h2>3. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
+            <h2>4. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
             <div class="hint">
                 随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
                 <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
@@ -421,11 +397,10 @@
 
     // ========== Tab 切换 ==========
     function switchTab(name) {
-        const pages = ['bt', 'profile', 'system'];
-        for (const p of pages) {
-            document.getElementById('tab-' + p).classList.toggle('active', name === p);
-            document.getElementById('tab-' + p + '-btn').classList.toggle('active', name === p);
-        }
+        document.getElementById('tab-profile').classList.toggle('active', name === 'profile');
+        document.getElementById('tab-system').classList.toggle('active', name === 'system');
+        document.getElementById('tab-profile-btn').classList.toggle('active', name === 'profile');
+        document.getElementById('tab-system-btn').classList.toggle('active', name === 'system');
     }
 
     // ========== BLE 连接与发送 ==========
@@ -440,15 +415,6 @@
             const server = await device.gatt.connect();
             const service = await server.getPrimaryService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
             myCharacteristic = await service.getCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8");
-            // 必须订阅通知：固件要靠它回报"壁纸到底成没成"和"映射规则读回"。
-            // 只 startNotifications 不加事件监听是收不到的。
-            try {
-                myCharacteristic.addEventListener('characteristicvaluechanged', onBleNotify);
-                await myCharacteristic.startNotifications();
-                LOG_PORT_UI("已订阅键盘通知（上传结果 / 映射回读走这条通道）");
-            } catch (e) {
-                LOG_PORT_UI("订阅通知失败：" + e.message);
-            }
             document.getElementById('status').innerText = "已连接 ✅";
             document.getElementById('status').style.color = "#4ade80";
         } catch(e) {
@@ -456,72 +422,15 @@
         }
     });
 
-    // 键盘回话通道：固件会用它 notify 上传结果（LOGOSTATUS:）和映射规则回读（REMAPDUMP:）。
-    // 之前特征只有 WRITE，键盘没有任何回话通道，网页上就"发完即当成功"。
-    let bleNotifyLines = [];
-    let bleNotifyHandler = null;
-
-    function onBleNotify(e) {
-        const dv = e.target.value;
-        if (!dv) return;
-        // 通知可能被拆成多片，按 '\n' 拼行
-        bleNotifyLines.push(new TextDecoder().decode(dv.buffer ? dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength) : dv));
-        let all = bleNotifyLines.join('');
-        let parts = all.split('\n');
-        let rest = parts.pop();
-        bleNotifyLines = rest ? [rest] : [];
-        for (const line of parts) {
-            const t = line.trim();
-            if (!t) continue;
-            LOG_PORT_UI("← " + t);
-            if (bleNotifyHandler) bleNotifyHandler(t);
-        }
-    }
-
-    // 等键盘回一句话（带超时）。键盘主动 notify，不回来的就返回 null。
-    function waitBleNotify(prefix, timeoutMs) {
-        return new Promise((resolve) => {
-            const prev = bleNotifyHandler;
-            const timer = setTimeout(() => { bleNotifyHandler = prev; resolve(null); }, timeoutMs);
-            bleNotifyHandler = (line) => {
-                if (!line.startsWith(prefix)) { if (prev) prev(line); return; }
-                clearTimeout(timer);
-                bleNotifyHandler = prev;
-                resolve(line);
-            };
-        });
-    }
-
     async function sendBLE(str) {
         if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
         const encoder = new TextEncoder();
-        // 每条命令都补一个 '\n'：固件那边现在按行缓冲，' \n' 才是"这条发完了"的信号。
-        // 以前靠"包间静默"兜底，长指令被蓝牙拆包时很容易粘成两行错位。
-        try {
-            await myCharacteristic.writeValue(encoder.encode(str + "\n"));
-            LOG_PORT_UI("→ " + str);
-        } catch (e) {
-            const msg = `写入失败：${e && e.message ? e.message : e}`;
-            LOG_PORT_UI("✗ " + msg + "  指令：" + str);
-            alert(msg + `\n\n指令：${str}\n\n如果提示 "GATT operation failed"，多半是这一条太长被蓝牙拆包了；` +
-                  `把长度控制在一百来字节以内再试。`);
-            return false;
-        }
+        await myCharacteristic.writeValue(encoder.encode(str));
         await new Promise(r => setTimeout(r, 50));
         return true;
     }
 
-    // 页面上滚动显示 BLE 收发流水，排查"到底发出去没有 / 键盘回了什么"用
-    function LOG_PORT_UI(msg) {
-        const box = document.getElementById('bleLog');
-        if (!box) return;
-        if (box.innerHTML.indexOf('（还没有任何收发记录）') >= 0) box.innerHTML = '';
-        const t = new Date().toLocaleTimeString();
-        box.innerHTML = (box.innerHTML + `<div>[${t}] ${msg}</div>`).split('\n').slice(-60).join('\n');
-        box.scrollTop = box.scrollHeight;
-    }
-
-    // ========== 1. ME 键文本（存盘，按 ME 键才发） ==========
+    // ========== 1. ME 蓝牙发送文本 ==========
     function insertMeTag(tag) {
         const t = document.getElementById('meTextInput');
         const s = t.selectionStart, e = t.selectionEnd;
@@ -529,27 +438,11 @@
         t.focus();
     }
 
-    // 下发 ME 文本：按 4.0 起的标准协议走 ME_START / ME_DATA: / ME_END。
-    // 文本先转 UTF-8 再转 hex，所以中文也能存；固件收到后只写 /me_hex.txt，
-    // 一个字都不会立刻打给电脑 —— 要发得按键盘上的 ME 键。
     document.getElementById('meSendBtn').addEventListener('click', async () => {
         const text = document.getElementById('meTextInput').value;
         if (!text) return alert("请输入要发送的文本！");
-
-        const view = new TextEncoder().encode(text);
-        let hexStr = '';
-        for (let i = 0; i < view.length; i++) {
-            hexStr += view[i].toString(16).padStart(2, '0');
-        }
-
-        const ok = await sendBLE("ME_START");
-        if (!ok) return;
-        for (let i = 0; i < hexStr.length; i += 128) {
-            const chunkOk = await sendBLE("ME_DATA:" + hexStr.substring(i, i + 128));
-            if (!chunkOk) return;
-        }
-        const endOk = await sendBLE("ME_END");
-        if (endOk) alert(`已存入键盘（${text.length} 字符）。\n现在按键盘上的 ME 键才会发给电脑。`);
+        const ok = await sendBLE("ME_TEXT:" + text);
+        if (ok) alert(`已发送 ${text.length} 字符给键盘，主机光标位置会立刻收到。`);
     });
 
     // ========== 2. 按方案按键映射 REMAP ==========
@@ -600,70 +493,24 @@
 
     document.getElementById('remapClearBtn').addEventListener('click', async () => {
         if (!confirm("确定要清空当前方案的所有按键映射？")) return;
-        const prof = document.getElementById('remapProfile').value;
-        const ok = await sendBLE(`REMAP:${prof}:clear:`);
         remapRules = [];
         remapRefreshList();
-        if (ok) {
-            // 读回来确认一次：清空必须是"真的清掉了"，不是"我以为清掉了"
-            const back = await readRemap(prof);
-            if (back !== null && back.length === 0) {
-                alert(`已清空方案 ${Number(prof) + 1} 的按键映射（已从键盘读回确认：0 条）。`);
-            } else {
-                alert(`已下发清空指令，但从键盘读回仍有 ${back ? back.length : "?"} 条。\n请看键盘屏幕上的提示。`);
-            }
-        }
+        const prof = document.getElementById('remapProfile').value;
+        await sendBLE(`REMAP:${prof}:1:`);   // 清空信号
+        alert("已清空！");
     });
-
-    // 读回：让键盘把该方案现有的规则 notify 上来。
-    // 以前"从键盘读取"读不出来，是因为特征根本没有 NOTIFY，键盘没法回话。
-    function readRemap(prof, timeoutMs) {
-        const p = `REMAPDUMP:${prof}:`;
-        const pr = waitBleNotify(p, timeoutMs || 3000);
-        sendBLE(`REMAPREAD:${prof}`);   // 不 await：要先挂上监听再发指令
-        return pr.then(line => {
-            if (!line) return null;
-            const body = line.substring(p.length);
-            if (body === "ERR") return null;
-            if (!body) return [];
-            return body.split(';').filter(Boolean).map(s => {
-                const [f, t] = s.split(',').map(Number);
-                return { from: f, to: t };
-            });
-        });
-    }
 
     document.getElementById('remapSaveBtn').addEventListener('click', async () => {
         const prof = document.getElementById('remapProfile').value;
-        let pairs = "";
-        if (remapRules.length > 0) {
-            pairs = remapRules.map(r => `${r.from},${r.to}`).join(';');
-        }
-        // 第三个字段必须写 clear：固件那边认 clear / 1 / 0 都行，但协议上是 clear。
-        // 这条命令是"整份替换"，不是追加 —— 之前两边一个发 1 一个认 clear，
-        // 存进去的规则清不掉，点"清空此方案"也发 1，等于两条全是哑的。
-        const ok = await sendBLE(`REMAP:${prof}:clear:${pairs}`);
-        if (!ok) return;
-        const back = await readRemap(prof);
-        if (back === null) {
-            alert(`已下发保存指令，但没能从键盘读回确认。\n请看键盘屏幕上的提示。`);
-        } else if (back.length === remapRules.length) {
-            alert(`已保存 ${back.length} 条映射到方案 ${Number(prof) + 1}（已从键盘读回确认）。`);
-        } else {
-            alert(`下发的是 ${remapRules.length} 条，键盘读回是 ${back.length} 条，对不上。\n请看键盘屏幕上的提示。`);
-        }
-    });
-
-    document.getElementById('remapLoadBtn')?.addEventListener('click', async () => {
-        const prof = document.getElementById('remapProfile').value;
-        const back = await readRemap(prof, 4000);
-        if (back === null) {
-            alert("键盘没回话。\n请确认蓝牙已连接、固件是最新那版，然后重试。");
+        if (remapRules.length === 0) {
+            // 没规则就发清空指令，避免误保留旧规则
+            await sendBLE(`REMAP:${prof}:1:`);
+            alert("已清空此方案的按键映射。");
             return;
         }
-        remapRules = back;
-        remapRefreshList();
-        alert(back.length ? `已从键盘读回 ${back.length} 条映射。` : `方案 ${Number(prof) + 1} 在键盘上没有映射规则。`);
+        const pairs = remapRules.map(r => `${r.from},${r.to}`).join(';');
+        await sendBLE(`REMAP:${prof}:1:${pairs}`);
+        alert(`已保存 ${remapRules.length} 条映射到方案 ${Number(prof) + 1}！`);
     });
 
     document.getElementById('remapProfile').addEventListener('change', () => {
@@ -804,14 +651,6 @@
         await sendBLE("ALERT:" + color);
     }
 
-    // 带说明文字下发：说明会原样显示在键盘的告警展示框里。
-    // 以前这个输入框不存在，三个按钮只发 "ALERT:RED"，而固件里那张
-    // "常用文案库"只有注释没有实现，所以展示框里永远是"你有 N 条消息"。
-    async function sendAlertWithText(color) {
-        const text = (document.getElementById('alertTextInput').value || '').trim();
-        await sendBLE(text ? `ALERT:${color}:${text}` : `ALERT:${color}`);
-    }
-
     document.getElementById('alarmOnBtn').addEventListener('click', async () => {
         const t = document.getElementById('alarmTime').value;
         if (!t) return alert("请先选一个响铃时间！");
@@ -879,11 +718,7 @@
         img.src = url;
     });
 
-    // 每片必须 ≤ 一个 ATT 包能装下的量。协商到 MTU 517 时上限是 514 字节，
-    // 但 writeValue 在不同平台上是否替你再分片、会不会丢包并不一致 —— 之前
-    // 从 500 字节起步，一传就把键盘搞重启（固件侧也确有越界写，现在一并修了）。
-    // 180 字节足够小，一个 ATT Write Request 稳稳装下。
-    const CHUNK_STEPS = [180, 100, 20];
+    const CHUNK_STEPS = [500, 244, 180, 120, 20];
 
     async function pushWallpaper(bytes, chunkSize, pBox) {
         await sendBLE("LOGO_JPEG_START:" + bytes.length);
@@ -893,18 +728,6 @@
             pBox.innerText = `正在传输: ${Math.round(end / bytes.length * 100)}%  `
                 + `(${(end / 1024).toFixed(1)} / ${(bytes.length / 1024).toFixed(1)} KB)`;
         }
-        // 显式收尾。少了这一步，固件会"收满 total 就自己开解码"，
-        // 而最后几包还在蓝牙栈里排队 —— 那几包在途的 JPEG 字节会被当成
-        // 文本命令灌进命令队列。收尾也让网页能问出真实结果。
-        await sendBLE("LOGO_JPEG_FLUSH");
-    }
-
-    // 问键盘要真实结果：解码 + 写盘都完成了才算成功。
-    // 以前这里只等 3 秒就宣布成功，那是"字节写出去了"，不是"键盘装好了"。
-    async function queryLogoStatus(timeoutMs) {
-        const pr = waitBleNotify("LOGOSTATUS:", timeoutMs || 8000);
-        sendBLE("LOGO_STATUS");
-        return pr;
     }
 
     document.getElementById('uploadImageBtn').addEventListener('click', async () => {
@@ -929,17 +752,8 @@
                 }
             }
             if (lastErr) throw lastErr;
-            pBox.innerText = "✅ 数据已发出，等键盘解码并落盘...";
-            const line = await queryLogoStatus(10000);
-            if (!line) {
-                pBox.innerText = "⚠️ 键盘没有回话。\n请看键盘屏幕：显示"
-                    + "「壁纸更新 / 上传完成」也算成功；显示「传输 / 解码失败」请重传。";
-            } else if (line.startsWith("LOGOSTATUS:OK:")) {
-                pBox.innerText = "🎉 键盘已确认：解码完成并写入 /logo.bin。\n"
-                    + "切到壁纸风格即可看到，重启后会自动恢复。";
-            } else {
-                pBox.innerText = "❌ 键盘回报失败：" + line;
-            }
+            pBox.innerText = `🎉 上传完成！${(bytes.length / 1024).toFixed(1)} KB 已写入键盘`;
+            alert(`壁纸已上传成功！共 ${(bytes.length / 1024).toFixed(1)} KB`);
         } catch (err) {
             pBox.innerText = "❌ 上传失败: " + err.message;
         } finally {

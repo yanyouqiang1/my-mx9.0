@@ -17,7 +17,9 @@ YYQ-MX9.0 键盘指令控制台（HID 厂商通道版）
     python kbctl_hid.py alert red 磁盘空间不足  # 红灯爆闪 + 中文描述
     python kbctl_hid.py notify 开会了           # 绿灯通知，快捷写法
     python kbctl_hid.py alert off              # 清空整个通知队列
-    python kbctl_hid.py alert cycle            # 红->绿->黄->清空 走一遍
+    python kbctl_hid.py alert cycle            # 红->黄->绿->清空 走一遍（带中文正文）
+    python kbctl_hid.py alert demo             # 快速连发 3 条，方便看待处理条数累加
+    python kbctl_hid.py alert list             # 列出固件内置的常用告警文案
     python kbctl_hid.py marquee "YYQ 极客大师"
     python kbctl_hid.py disp 1
     python kbctl_hid.py raw "ALERT:YELLOW:服务器无响应"
@@ -323,13 +325,26 @@ class HidLink:
             print(f"已连上键盘 HID 厂商通道（{self.via}，"
                   f"OUT:{self.out_len} FEAT:{self.feat_len}）")
 
+    def _chunk_size(self):
+        """一次能塞多少字节净荷。
+
+        原来是写死的 REPORT_SIZE=63，但真正的上限由**这个设备实际暴露的报告长度**
+        决定（Output 报告和 Feature 报告还可能不一样）。写死 63 的后果：
+        设备只给 32 字节净荷时，WriteFile 按 64 字节发过去，Windows 直接拒收，
+        报"写入失败，键盘没有响应这个通道"—— 短命令（alert red）好好的，
+        长命令（宏、GSET 之类）一发就炸，看起来就像"M1 相关的下发全都失败"。
+        """
+        total = self.out_len if self.via == "OutputReport" else self.feat_len
+        return max(1, min(REPORT_SIZE, total - 1))
+
     def send(self, text, echo=True):
         # 结尾必须带换行：固件是按 \n 切行才执行指令的
         payload = text.encode("utf-8") + b"\n"
-        if len(payload) > REPORT_SIZE:
+        step = self._chunk_size()
+        if len(payload) > step:
             # 超过一个报告的容量就分片，固件那边会拼回完整一行再执行
-            for i in range(0, len(payload), REPORT_SIZE):
-                self._write(payload[i:i + REPORT_SIZE])
+            for i in range(0, len(payload), step):
+                self._write(payload[i:i + step])
         else:
             self._write(payload)
         if echo:
@@ -414,12 +429,18 @@ def build_command(line):
             return "ALERT:RED"
         if rest.lower() == "cycle":
             return "__CYCLE__"
-        # alert <颜色> [描述文字]：描述可以带空格、可以是中文，省略就用固件默认名
+        if rest.lower() == "demo":
+            return "__DEMO__"
+        if rest.lower() in ("list", "?"):
+            return "__LIST__"
+        # alert <颜色> [描述文字]：描述可以带空格、可以是中文。
+        # 省略描述时就只发颜色，固件会从内置常用文案库里挑一句。
         bits = rest.split(None, 1)
         key = bits[0].lower()
         text = bits[1].strip() if len(bits) > 1 else ""
         if key not in ALERT_COLORS:
-            raise ValueError("颜色只能是 red / green / yellow / off / cycle")
+            raise ValueError("颜色只能是 red / green / yellow / off，"
+                             "或者 cycle / demo / list")
         if not text:
             return ALERT_COLORS[key]
         if key in ("off", "stop"):
@@ -492,14 +513,59 @@ def build_command(line):
     raise ValueError(f"不认识这条命令：{line.strip()}   输入 help 看用法")
 
 
+# 常用告警文案：跟固件里那张表一一对应。这里列出来只是方便照着敲，
+# 直接 `alert red` 不带文字，固件也会自己从库里轮换着挑。
+ALERT_PRESETS = {
+    "red": ["构建失败", "磁盘空间不足", "服务已宕机", "内存溢出",
+            "网络连接中断", "CI 流水线失败", "磁盘写入错误", "进程异常退出"],
+    "yellow": ["服务器无响应", "CPU 温度偏高", "电量不足", "磁盘即将写满",
+               "测试未通过", "证书即将过期", "队列积压", "同步冲突待处理"],
+    "green": ["部署完成", "构建通过", "备份已完成", "任务已结束",
+              "依赖已更新", "测试全部通过", "文件已同步", "服务已恢复"],
+}
+
+
+def print_presets():
+    print("常用告警文案（省略描述直接 alert <颜色> 时，固件按这里轮换取）：")
+    for color, items in ALERT_PRESETS.items():
+        print(f"  {color:6s} {' / '.join(items)}")
+    print("  用法：alert red 构建失败      # 指定这一句")
+    print("        alert red               # 不指定，固件自己挑")
+
+
+# 演示脚本：带中文正文、间隔拉长到 3 秒。
+# 原来 cycle 只发颜色、每 2 秒一条，屏上只闪一个英文 Alert，
+# 看起来就像"通知没生效"。
+CYCLE_SCRIPT = [
+    ("red", "构建失败"),
+    ("yellow", "服务器无响应"),
+    ("green", "部署完成"),
+    ("off", None),
+]
+
+
 def alert_cycle(link):
-    for name in ("red", "green", "yellow", "off"):
-        label = {"red": "红灯爆闪", "green": "绿灯闪烁",
-                 "yellow": "黄灯闪烁", "off": "清空通知队列"}[name]
-        print(f"  {label}")
-        link.send(ALERT_COLORS[name], echo=False)
-        time.sleep(2.0)
-    print("  演示结束")
+    for name, text in CYCLE_SCRIPT:
+        if text is None:
+            print("  清空通知队列")
+            link.send(ALERT_COLORS[name], echo=False)
+            time.sleep(2.0)
+            continue
+        print(f"  {name:6s} {text}")
+        link.send(f"{ALERT_COLORS[name]}:{text}", echo=False)
+        time.sleep(3.0)
+    print("  演示结束（灯应该已经不闪了）")
+
+
+# 快速连发 3 条不同的，方便一眼看清右上角的待处理条数在往上累。
+def alert_demo(link):
+    for name, text in [("red", "构建失败"), ("yellow", "磁盘即将写满"),
+                       ("green", "部署完成")]:
+        print(f"  {name:6s} {text}")
+        link.send(f"{ALERT_COLORS[name]}:{text}", echo=False)
+        time.sleep(0.6)
+    print("  现在应该显示「3 条待处理」+ 最新的绿点「部署完成」。")
+    print("  按键盘侧边的灯光键逐条确认，条数会 3 -> 2 -> 1 -> 0，灯同步换色。")
 
 
 HELP_TEXT = """可用命令：
@@ -507,7 +573,9 @@ HELP_TEXT = """可用命令：
   alert red|green|yellow|off   触发红/绿/黄爆闪，off 清空整个队列
   alert red 磁盘空间不足        带中文描述下发一条通知（描述可省略）
   notify 开会了                 快捷写法，等同 alert green 开会了
-  alert cycle                  红->绿->黄->清空 连续演示一遍
+  alert cycle                  红->黄->绿->清空，带中文正文、每条停 3 秒
+  alert demo                   快速连发 3 条，方便看待处理条数累加
+  alert list                   列出固件内置的常用告警文案
   disp 0-5                     切换主屏风格（0 大字时钟 1 极客仪表盘 2 信息面板
                                3 击键监控 4 律动 5 壁纸）
   keys on|off                  按键回显开关
@@ -549,6 +617,10 @@ def interactive(link):
         try:
             if text == "__CYCLE__":
                 alert_cycle(link)
+            elif text == "__DEMO__":
+                alert_demo(link)
+            elif text == "__LIST__":
+                print_presets()
             else:
                 link.send(text)
         except Exception as e:
@@ -621,6 +693,10 @@ def main():
                 sys.exit(2)
             if text == "__CYCLE__":
                 alert_cycle(link)
+            elif text == "__DEMO__":
+                alert_demo(link)
+            elif text == "__LIST__":
+                print_presets()
             elif text is not None:
                 link.send(text)
         else:
