@@ -553,6 +553,10 @@ static const uint32_t lockLedColor[3] = { CLR_GREEN, CLR_ACCENT, CLR_AMBER };
 //
 // 所以这里统一由 ensureMainScreen() 负责建/取主屏，风格一律往它上面建。
 static bool mainContentValid = false;
+
+// 临时诊断开关：true = 主屏只保留一块空白底色，不建任何风格内容（见 renderCurrentDisplayBase）。
+// 置 false 立即恢复原来的 6 种主屏风格。
+static const bool MAIN_STYLE_DISABLED = true;
 static void renderCurrentDisplayBase(void);   // 定义在文件后段，这里先声明
 
 static lv_obj_t* ensureMainScreen(void) {
@@ -3347,6 +3351,21 @@ static void renderCurrentDisplayBase(void) {
     if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
     if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
     if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
+
+    // ------------------------------------------------------------------
+    // 临时诊断：主屏风格整体停用
+    // ------------------------------------------------------------------
+    // 现象：进主屏风格后整机卡死、按键全部失灵。
+    // 这里只跳过"建内容"这一步，主屏仍然是 ensureMainScreen() 那块合法屏幕，
+    // 所以切屏、息屏、菜单、设置、录制、按键扫描等外围逻辑都保持原样。
+    //
+    // 停用是安全的：所有 gk_/bc_/ip_/km_/rh_/wp_ 指针此时全是 nullptr，而
+    // updateDynamicElements() 里对这些指针的写入全部经过 setText/setBgColor/
+    // setTextColor/setSizePos，这四个 setter 第一行就是 if (o == nullptr) return。
+    // 顶部条 topLockDot[] 同理。所以屏幕全黑，但键盘应当恢复正常响应。
+    //
+    // 想恢复：把下面这行改成 false，六种风格立刻全部回来。
+    if (MAIN_STYLE_DISABLED) { mainContentValid = true; return; }
 
     switch (currentDispMode) {
         case DISP_MODE_GEEK: build_style_geek(); break;
