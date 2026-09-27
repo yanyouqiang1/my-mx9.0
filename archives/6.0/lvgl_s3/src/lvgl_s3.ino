@@ -2226,7 +2226,7 @@ static void handleCommand(const String& cmd) {
         static char marqueeText[256] = {0};
         strncpy(marqueeText, text.c_str(), sizeof(marqueeText) - 1);
         marqueeText[sizeof(marqueeText) - 1] = '\0';
-        triggerHud("Marquee", text.substring(0, min(16, text.length())).c_str(), lv_color_hex(CLR_CYAN));
+        triggerHud("Marquee", text.substring(0, min(16u, text.length())).c_str(), lv_color_hex(CLR_CYAN));
         // 可以在此添加标语显示逻辑
     }
     // REMAP:prof:clear:rules - Key remapping
