@@ -33,7 +33,7 @@
 /*====================
    帧缓冲
    ====================*/
-#define LV_DISP_DOUBLE_BUF       1
+#define LV_DISP_DOUBLE_BUF       0
 #define LV_DISP_REFR_PERIOD     33   // 30fps
 #define LV_DISP_DEF_REFR_PERIOD 33
 
@@ -129,7 +129,10 @@
 #define LV_USE_FONT_COMPRESSED    0
 #define LV_USE_FONT_SUBPX         0
 
-// 使用 LVGL 内置 Montserrat 字体（ASCII 全覆盖，无需外部字库）
+// 思源宋体 SimSun：包含 1000+ 常用 CJK 汉字（含星期用字）
+#define LV_FONT_SIMSUN_16_CJK    1
+
+// 使用 LVGL 内置 Montserrat 字体作为默认字体（ASCII 全覆盖）
 #define LV_FONT_CUSTOM_DECLARE  /* 无自定义字体 */
 #define LV_FONT_DEFAULT         &lv_font_montserrat_14
 
