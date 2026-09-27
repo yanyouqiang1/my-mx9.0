@@ -6,7 +6,7 @@
 - [x] Task 3: 添加6种显示风格 (commit 491eb43)
 - [x] Task 4: 实现设置界面 (commit 84f880a)
 - [x] Task 5: 实现宏录制 (commit 9053ea1)
-- [ ] Task 6: 实现通知系统
+- [x] Task 6: 实现通知系统 (commit 8dcf8cc)
 - [ ] Task 7: BLE指令扩展
 - [ ] Task 8: 完整测试
 

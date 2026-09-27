@@ -2161,17 +2161,166 @@ static void recoverI2CBus(void) {
 // 命令处理
 // ===========================
 static void handleCommand(const String& cmd) {
-    if (cmd.startsWith("TIME:")) {
+    // DISP_MODE:n - Switch display mode
+    if (cmd.startsWith("DISP_MODE:")) {
+        int mode = cmd.substring(10).toInt();
+        if (mode >= 0 && mode < TOTAL_DISP_MODES) {
+            currentDispMode = mode;
+            preferences.putUChar("disp_mode", currentDispMode);
+            renderCurrentDisplayBase();
+            triggerHud("Display", dispModeNames[currentDispMode], lv_color_hex(CLR_CYAN));
+        }
+    }
+    // TIME:epoch - Sync time
+    else if (cmd.startsWith("TIME:")) {
         time_t t = cmd.substring(5).toInt();
         struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
         settimeofday(&tv, NULL);
+        preferences.putUInt("set_epoch", (uint32_t)t);
         triggerHud("Time", "Synced", lv_color_hex(0x00FF00));
     }
+    // ALARMSET:HH:MM - Set alarm
+    else if (cmd.startsWith("ALARMSET:")) {
+        String timeStr = cmd.substring(9);
+        int colonIdx = timeStr.indexOf(':');
+        if (colonIdx > 0) {
+            alarmHour = (uint8_t)timeStr.substring(0, colonIdx).toInt();
+            alarmMinute = (uint8_t)timeStr.substring(colonIdx + 1).toInt();
+            alarmEnabled = true;
+            preferences.putUChar("alarm_h", alarmHour);
+            preferences.putUChar("alarm_m", alarmMinute);
+            preferences.putBool("alarm_on", alarmEnabled);
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%02d:%02d", alarmHour, alarmMinute);
+            triggerHud("Alarm", buf, lv_color_hex(0x00FF00));
+        }
+    }
+    // TIMERSET:HH:MM:SS or TIMERSET:STOP
+    else if (cmd.startsWith("TIMERSET:")) {
+        String timeStr = cmd.substring(9);
+        if (timeStr == "STOP") {
+            timerRunning = false;
+            timerRemainSec = timerTotalSec;
+            triggerHud("Timer", "Stopped", lv_color_hex(0xFF8800));
+        } else {
+            int firstColon = timeStr.indexOf(':');
+            int secondColon = timeStr.lastIndexOf(':');
+            if (firstColon > 0 && secondColon > firstColon) {
+                timerEditH = timeStr.substring(0, firstColon).toInt();
+                timerEditM = timeStr.substring(firstColon + 1, secondColon).toInt();
+                timerEditS = timeStr.substring(secondColon + 1).toInt();
+                timerTotalSec = timerEditH * 3600 + timerEditM * 60 + timerEditS;
+                timerRemainSec = timerTotalSec;
+                timerRunning = true;
+                timerStartMs = millis();
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", timerEditH, timerEditM, timerEditS);
+                triggerHud("Timer", buf, lv_color_hex(0x00FFFF));
+            }
+        }
+    }
+    // MARQUEE:text - Set marquee text
+    else if (cmd.startsWith("MARQUEE:")) {
+        String text = cmd.substring(8);
+        // 存储标语文本用于显示
+        static char marqueeText[256] = {0};
+        strncpy(marqueeText, text.c_str(), sizeof(marqueeText) - 1);
+        marqueeText[sizeof(marqueeText) - 1] = '\0';
+        triggerHud("Marquee", text.substring(0, min(16, text.length())).c_str(), lv_color_hex(CLR_CYAN));
+        // 可以在此添加标语显示逻辑
+    }
+    // REMAP:prof:clear:rules - Key remapping
+    else if (cmd.startsWith("REMAP:")) {
+        String params = cmd.substring(6);
+        int firstColon = params.indexOf(':');
+        int secondColon = params.indexOf(':', firstColon + 1);
+        if (firstColon > 0 && secondColon > firstColon) {
+            int prof = params.substring(0, firstColon).toInt();
+            String clearCmd = params.substring(firstColon + 1, secondColon);
+            String rules = params.substring(secondColon + 1);
+
+            if (prof >= 0 && prof < TOTAL_PROFILES) {
+                if (clearCmd == "clear") {
+                    remapCounts[prof] = 0;
+                    char key[16];
+                    snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
+                    preferences.putInt(key, 0);
+                    triggerHud("Remap", "Cleared", lv_color_hex(0xFFFF00));
+                }
+                // 解析映射规则: fromKey,toKey;fromKey,toKey;...
+                if (rules.length() > 0 && remapCounts[prof] < MAX_REMAP_RULES) {
+                    int start = 0;
+                    while (start < rules.length() && remapCounts[prof] < MAX_REMAP_RULES) {
+                        int semicolon = rules.indexOf(';', start);
+                        String rule = (semicolon > 0) ? rules.substring(start, semicolon) : rules.substring(start);
+                        int comma = rule.indexOf(',');
+                        if (comma > 0) {
+                            profileRemaps[prof][remapCounts[prof]].fromKey = (uint16_t)rule.substring(0, comma).toInt();
+                            profileRemaps[prof][remapCounts[prof]].toKey = (uint16_t)rule.substring(comma + 1).toInt();
+
+                            char itemKey[20];
+                            snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, remapCounts[prof]);
+                            uint32_t val = ((uint32_t)profileRemaps[prof][remapCounts[prof]].fromKey << 16) | profileRemaps[prof][remapCounts[prof]].toKey;
+                            preferences.putUInt(itemKey, val);
+                            remapCounts[prof]++;
+                        }
+                        start = (semicolon > 0) ? semicolon + 1 : rules.length();
+                    }
+                    char key[16];
+                    snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
+                    preferences.putInt(key, remapCounts[prof]);
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%d rules", remapCounts[prof]);
+                    triggerHud("Remap", buf, lv_color_hex(0x00FF00));
+                }
+            }
+        }
+    }
+    // SET:name:value - Macro definition
+    else if (cmd.startsWith("SET:")) {
+        String params = cmd.substring(4);
+        int colonIdx = params.indexOf(':');
+        if (colonIdx > 0) {
+            String name = params.substring(0, colonIdx);
+            String value = params.substring(colonIdx + 1);
+            char pKey[32];
+            snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, name.c_str());
+            preferences.putString(pKey, value);
+            triggerHud("SET", name.c_str(), lv_color_hex(0x00FF00));
+        }
+    }
+    // GSET:name:value - Global key assignment
+    else if (cmd.startsWith("GSET:")) {
+        String params = cmd.substring(5);
+        int colonIdx = params.indexOf(':');
+        if (colonIdx > 0) {
+            String name = params.substring(0, colonIdx);
+            String value = params.substring(colonIdx + 1);
+            char gKey[32];
+            snprintf(gKey, sizeof(gKey), "g_%s", name.c_str());
+            preferences.putString(gKey, value);
+            triggerHud("GSET", name.c_str(), lv_color_hex(0x00FFFF));
+        }
+    }
+    // ME_TEXT:text - ME text send (macro/execute text)
+    else if (cmd.startsWith("ME_TEXT:")) {
+        String text = cmd.substring(8);
+        executeSequenceAction(text);
+        triggerHud("ME_TEXT", "Sent", lv_color_hex(0x00FF00));
+    }
+    // LOGO_JPEG_START:size - Wallpaper upload start
+    else if (cmd.startsWith("LOGO_JPEG_START:")) {
+        int size = cmd.substring(16).toInt();
+        // 预留壁纸上传接口
+        triggerHud("Wallpaper", "Receiving...", lv_color_hex(0xFFFF00));
+        // 实际数据通过BLECharacteristic的二进制数据接收
+    }
+    // NOTIFY:text -> ALERT_GREEN
     else if (cmd.startsWith("NOTIFY:")) {
-        // NOTIFY:text -> ALERT_GREEN
         String text = cmd.substring(7);
         pushNotification(ALERT_GREEN, text);
     }
+    // ALERT: - Notification alerts
     else if (cmd.startsWith("ALERT:")) {
         String sub = cmd.substring(6);
         if (sub == "OFF" || sub == "CLEAR") {
@@ -2192,13 +2341,11 @@ static void handleCommand(const String& cmd) {
     }
     else if (cmd == "BTN:KNOB") {
         if (currentSysMode == SYS_MODE_MENU) {
-            // 菜单选择
             handleMenuSelect();
         }
     }
     else if (cmd == "BTN:LIGHT") {
         if (currentSysMode == SYS_MODE_MENU) {
-            // 返回主屏
             currentSysMode = SYS_MODE_NORMAL;
             showScreen(scr_main);
         }
@@ -2209,9 +2356,6 @@ static void handleCommand(const String& cmd) {
             menuSel = isRight ? (menuSel + 1) % MENU_ITEMS : (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
             build_menu();
         }
-    }
-    else if (cmd.startsWith("ALARM:")) {
-        // 闹钟设置
     }
 }
 
