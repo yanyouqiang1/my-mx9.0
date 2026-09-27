@@ -129,6 +129,11 @@ TwoWire Wire_SHT(1);
 #define SYS_MODE_NORMAL   0
 #define SYS_MODE_MENU     1
 #define SYS_MODE_SLEEP    2
+#define SYS_MODE_SET_TIME 3
+#define SYS_MODE_SET_ALARM 4
+#define SYS_MODE_SET_TIMER 5
+#define SYS_MODE_CAL_TEMP 6
+#define IS_SETTING_MODE(m) ((m) >= SYS_MODE_SET_TIME && (m) <= SYS_MODE_CAL_TEMP)
 static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
 
@@ -236,6 +241,49 @@ static uint8_t indBrightness = 255;
 // 菜单滚动相关
 #define MENU_VISIBLE_ITEMS 6
 static int menuScrollOffset = 0;
+
+// ===========================
+// 设置界面全局变量
+// ===========================
+// 时间设置
+static int timeEditY = 2026, timeEditMo = 1, timeEditD = 1, timeEditH = 0, timeEditMi = 0;
+static int timeFieldIdx = 0;
+
+// 闹钟设置
+static bool alarmEditOn = false;
+static int alarmEditH = 7, alarmEditM = 0;
+static int alarmFieldIdx = 0;
+static bool alarmEnabled = false;
+static uint8_t alarmHour = 7, alarmMinute = 0;
+
+// 倒计时设置
+static int timerEditH = 0, timerEditM = 5, timerEditS = 0;
+static int timerFieldIdx = 0;
+static bool timerRunning = false;
+static unsigned long timerStartMs = 0;
+static uint32_t timerTotalSec = 0;
+static uint32_t timerRemainSec = 0;
+
+// 温度校准
+static float calTempOriginal = 62.0f;
+static int calTempField = 0;
+
+// 设置界面对象
+static lv_obj_t* set_time_lbl_date = nullptr;
+static lv_obj_t* set_time_lbl_time = nullptr;
+static lv_obj_t* set_time_field_labels[5] = { nullptr };
+
+static lv_obj_t* set_alarm_lbl_time = nullptr;
+static lv_obj_t* set_alarm_sw = nullptr;
+static lv_obj_t* set_alarm_field_labels[2] = { nullptr };
+
+static lv_obj_t* set_timer_lbl_time = nullptr;
+static lv_obj_t* set_timer_btn = nullptr;
+static lv_obj_t* set_timer_field_labels[3] = { nullptr };
+
+static lv_obj_t* set_cal_lbl_temp = nullptr;
+static lv_obj_t* set_cal_lbl_offset = nullptr;
+static lv_obj_t* set_cal_field_label = nullptr;
 
 // HUD
 typedef struct {
@@ -372,6 +420,18 @@ static void updateDynamicElements(void);
 static void triggerHud(const char* title, const char* value, uint16_t color);
 static void showScreen(lv_obj_t* target);
 static void handleMenuSelect(void);
+static void build_settings_time(void);
+static void build_settings_alarm(void);
+static void build_settings_timer(void);
+static void build_settings_caltemp(void);
+static void moveSettingField(int dir);
+static void adjustSettingField(int delta);
+static void saveSettingScreen(void);
+static void cancelSettingScreen(void);
+static void update_setting_time_display(void);
+static void update_setting_alarm_display(void);
+static void update_setting_timer_display(void);
+static void update_setting_caltemp_display(void);
 
 // ===========================
 // SHT31 温湿度
@@ -856,13 +916,13 @@ static void handleMenuSelect(void) {
             triggerHud("LED Brightness", indLevelNames[indLevel], lv_color_hex(0xFFFF00));
             break;
         case 6:  // 设置时间
-            showScreen(scr_settings_time);
+            build_settings_time();
             break;
         case 7:  // 闹钟设置
-            showScreen(scr_settings_alarm);
+            build_settings_alarm();
             break;
         case 8:  // 倒计时
-            showScreen(scr_settings_timer);
+            build_settings_timer();
             break;
         case 9:  // 刷新温湿度
             if (shtAvailable) {
@@ -873,7 +933,7 @@ static void handleMenuSelect(void) {
             }
             break;
         case 10: // 温度校准
-            showScreen(scr_settings_caltemp);
+            build_settings_caltemp();
             break;
         case 11: // 计数清零
             totalKeyCount = 0;
@@ -1011,6 +1071,453 @@ static void triggerHud(const char* title, const char* value, lv_color_t color) {
     hud.showMs = 1500;
 
     build_hud();
+}
+
+// ===========================
+// 设置界面显示更新函数
+// ===========================
+static void update_setting_time_display(void) {
+    if (set_time_lbl_date) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d", timeEditY, timeEditMo, timeEditD);
+        lv_label_set_text(set_time_lbl_date, buf);
+    }
+    if (set_time_lbl_time) {
+        static char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d", timeEditH, timeEditMi);
+        lv_label_set_text(set_time_lbl_time, buf);
+    }
+    // 高亮当前字段
+    const char* fieldNames[5] = { "YEAR", "MON", "DAY", "HOUR", "MIN" };
+    for (int i = 0; i < 5; i++) {
+        if (set_time_field_labels[i]) {
+            lv_obj_set_style_text_color(set_time_field_labels[i],
+                lv_color_hex(i == timeFieldIdx ? CLR_CYAN : CLR_WHITE), LV_PART_MAIN);
+        }
+    }
+}
+
+static void update_setting_alarm_display(void) {
+    if (set_alarm_lbl_time) {
+        static char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d", alarmEditH, alarmEditM);
+        lv_label_set_text(set_alarm_lbl_time, buf);
+    }
+    if (set_alarm_sw) {
+        if (alarmEnabled) {
+            lv_obj_add_state(set_alarm_sw, LV_STATE_CHECKED);
+        } else {
+            lv_obj_remove_state(set_alarm_sw, LV_STATE_CHECKED);
+        }
+    }
+    // 高亮当前字段
+    for (int i = 0; i < 2; i++) {
+        if (set_alarm_field_labels[i]) {
+            lv_obj_set_style_text_color(set_alarm_field_labels[i],
+                lv_color_hex(i == alarmFieldIdx ? CLR_CYAN : CLR_WHITE), LV_PART_MAIN);
+        }
+    }
+}
+
+static void update_setting_timer_display(void) {
+    if (set_timer_lbl_time) {
+        static char buf[32];
+        uint32_t h = timerRemainSec / 3600;
+        uint32_t m = (timerRemainSec % 3600) / 60;
+        uint32_t s = timerRemainSec % 60;
+        snprintf(buf, sizeof(buf), "%02u:%02u:%02u", h, m, s);
+        lv_label_set_text(set_timer_lbl_time, buf);
+    }
+    if (set_timer_btn) {
+        lv_obj_t* lbl = lv_obj_get_child(set_timer_btn, 0);
+        if (lbl) {
+            lv_label_set_text(lbl, timerRunning ? "STOP" : "START");
+        }
+    }
+    // 高亮当前字段
+    for (int i = 0; i < 3; i++) {
+        if (set_timer_field_labels[i]) {
+            lv_obj_set_style_text_color(set_timer_field_labels[i],
+                lv_color_hex(i == timerFieldIdx ? CLR_CYAN : CLR_WHITE), LV_PART_MAIN);
+        }
+    }
+}
+
+static void update_setting_caltemp_display(void) {
+    if (set_cal_lbl_temp) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f C", shtTemp);
+        lv_label_set_text(set_cal_lbl_temp, buf);
+    }
+    if (set_cal_lbl_offset) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "Offset: %.1f", shtTempOffset);
+        lv_label_set_text(set_cal_lbl_offset, buf);
+    }
+}
+
+// ===========================
+// 设置界面构建函数
+// ===========================
+static void build_settings_time(void) {
+    if (scr_settings_time) { lv_obj_del(scr_settings_time); }
+    scr_settings_time = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_settings_time, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+
+    // 标题
+    lv_obj_t* title = lv_label_create(scr_settings_time);
+    lv_label_set_text(title, "SET TIME");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 日期显示
+    set_time_lbl_date = lv_label_create(scr_settings_time);
+    lv_label_set_text(set_time_lbl_date, "2026-01-01");
+    lv_obj_set_style_text_font(set_time_lbl_date, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_time_lbl_date, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(set_time_lbl_date, LV_ALIGN_CENTER, 0, -50);
+
+    // 时间显示
+    set_time_lbl_time = lv_label_create(scr_settings_time);
+    lv_label_set_text(set_time_lbl_time, "00:00");
+    lv_obj_set_style_text_font(set_time_lbl_time, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_time_lbl_time, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(set_time_lbl_time, LV_ALIGN_CENTER, 0, 10);
+
+    // 字段标签
+    const char* fieldNames[5] = { "YEAR", "MON", "DAY", "HOUR", "MIN" };
+    int fieldX[5] = { -80, -40, 0, 40, 80 };
+    for (int i = 0; i < 5; i++) {
+        set_time_field_labels[i] = lv_label_create(scr_settings_time);
+        lv_label_set_text(set_time_field_labels[i], fieldNames[i]);
+        lv_obj_set_style_text_font(set_time_field_labels[i], &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(set_time_field_labels[i], lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+        lv_obj_align(set_time_field_labels[i], LV_ALIGN_CENTER, fieldX[i], 60);
+    }
+
+    // 提示文字
+    lv_obj_t* hint = lv_label_create(scr_settings_time);
+    lv_label_set_text(hint, "< > NAV  ^ v ADJ  RET SAVE  ESC CANCEL");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    // 初始化当前时间
+    time_t now = time(nullptr);
+    struct tm* ti = localtime(&now);
+    if (ti && ti->tm_year >= 124) {
+        timeEditY = ti->tm_year + 1900;
+        timeEditMo = ti->tm_mon + 1;
+        timeEditD = ti->tm_mday;
+        timeEditH = ti->tm_hour;
+        timeEditMi = ti->tm_min;
+    }
+    timeFieldIdx = 0;
+    update_setting_time_display();
+    showScreen(scr_settings_time);
+    currentSysMode = SYS_MODE_SET_TIME;
+}
+
+static void build_settings_alarm(void) {
+    if (scr_settings_alarm) { lv_obj_del(scr_settings_alarm); }
+    scr_settings_alarm = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_settings_alarm, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+
+    // 标题
+    lv_obj_t* title = lv_label_create(scr_settings_alarm);
+    lv_label_set_text(title, "ALARM");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 时间显示
+    set_alarm_lbl_time = lv_label_create(scr_settings_alarm);
+    lv_label_set_text(set_alarm_lbl_time, "07:00");
+    lv_obj_set_style_text_font(set_alarm_lbl_time, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_alarm_lbl_time, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(set_alarm_lbl_time, LV_ALIGN_CENTER, 0, -30);
+
+    // 开关
+    set_alarm_sw = lv_switch_create(scr_settings_alarm);
+    lv_obj_align(set_alarm_sw, LV_ALIGN_CENTER, 0, 30);
+    lv_obj_set_style_bg_color(set_alarm_sw, lv_color_hex(CLR_DARK), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(set_alarm_sw, lv_color_hex(CLR_ACCENT), LV_PART_INDICATOR);
+    lv_obj_t* sw_lbl = lv_label_create(scr_settings_alarm);
+    lv_label_set_text(sw_lbl, alarmEnabled ? "[ON]" : "[OFF]");
+    lv_obj_set_style_text_font(sw_lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sw_lbl, lv_color_hex(alarmEnabled ? CLR_CYAN : CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(sw_lbl, LV_ALIGN_CENTER, 0, 60);
+
+    // 字段标签
+    const char* fieldNames[2] = { "HOUR", "MIN" };
+    int fieldX[2] = { -40, 40 };
+    for (int i = 0; i < 2; i++) {
+        set_alarm_field_labels[i] = lv_label_create(scr_settings_alarm);
+        lv_label_set_text(set_alarm_field_labels[i], fieldNames[i]);
+        lv_obj_set_style_text_font(set_alarm_field_labels[i], &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(set_alarm_field_labels[i], lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+        lv_obj_align(set_alarm_field_labels[i], LV_ALIGN_CENTER, fieldX[i], -70);
+    }
+
+    // 提示文字
+    lv_obj_t* hint = lv_label_create(scr_settings_alarm);
+    lv_label_set_text(hint, "< > NAV  ^ v ADJ  RET SAVE  ESC CANCEL");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    // 初始化
+    alarmEditH = alarmHour;
+    alarmEditM = alarmMinute;
+    alarmFieldIdx = 0;
+    update_setting_alarm_display();
+    showScreen(scr_settings_alarm);
+    currentSysMode = SYS_MODE_SET_ALARM;
+}
+
+static void build_settings_timer(void) {
+    if (scr_settings_timer) { lv_obj_del(scr_settings_timer); }
+    scr_settings_timer = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_settings_timer, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+
+    // 标题
+    lv_obj_t* title = lv_label_create(scr_settings_timer);
+    lv_label_set_text(title, "TIMER");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 时间显示
+    set_timer_lbl_time = lv_label_create(scr_settings_timer);
+    lv_label_set_text(set_timer_lbl_time, "00:05:00");
+    lv_obj_set_style_text_font(set_timer_lbl_time, &lv_font_montserrat_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_timer_lbl_time, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(set_timer_lbl_time, LV_ALIGN_CENTER, 0, -40);
+
+    // 开始/停止按钮
+    set_timer_btn = lv_btn_create(scr_settings_timer);
+    lv_obj_set_size(set_timer_btn, 80, 40);
+    lv_obj_align(set_timer_btn, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_radius(set_timer_btn, 8, LV_PART_MAIN);
+    lv_obj_t* btn_lbl = lv_label_create(set_timer_btn);
+    lv_label_set_text(btn_lbl, "START");
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_center(btn_lbl);
+
+    // 字段标签
+    const char* fieldNames[3] = { "HOUR", "MIN", "SEC" };
+    int fieldX[3] = { -60, 0, 60 };
+    for (int i = 0; i < 3; i++) {
+        set_timer_field_labels[i] = lv_label_create(scr_settings_timer);
+        lv_label_set_text(set_timer_field_labels[i], fieldNames[i]);
+        lv_obj_set_style_text_font(set_timer_field_labels[i], &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(set_timer_field_labels[i], lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+        lv_obj_align(set_timer_field_labels[i], LV_ALIGN_CENTER, fieldX[i], -80);
+    }
+
+    // 提示文字
+    lv_obj_t* hint = lv_label_create(scr_settings_timer);
+    lv_label_set_text(hint, "< > NAV  ^ v ADJ  RET SAVE  ESC CANCEL");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    // 初始化
+    timerFieldIdx = 0;
+    if (timerTotalSec > 0) {
+        timerEditH = timerTotalSec / 3600;
+        timerEditM = (timerTotalSec % 3600) / 60;
+        timerEditS = timerTotalSec % 60;
+    }
+    if (!timerRunning) {
+        timerRemainSec = timerTotalSec;
+    }
+    update_setting_timer_display();
+    showScreen(scr_settings_timer);
+    currentSysMode = SYS_MODE_SET_TIMER;
+}
+
+static void build_settings_caltemp(void) {
+    if (scr_settings_caltemp) { lv_obj_del(scr_settings_caltemp); }
+    scr_settings_caltemp = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_settings_caltemp, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+
+    // 标题
+    lv_obj_t* title = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(title, "CALIBRATE TEMP");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 当前温度显示
+    lv_obj_t* temp_lbl = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(temp_lbl, "Current:");
+    lv_obj_set_style_text_font(temp_lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(temp_lbl, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(temp_lbl, LV_ALIGN_CENTER, 0, -60);
+
+    set_cal_lbl_temp = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(set_cal_lbl_temp, "--.- C");
+    lv_obj_set_style_text_font(set_cal_lbl_temp, &lv_font_montserrat_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_cal_lbl_temp, lv_color_hex(0xFF8C42), LV_PART_MAIN);
+    lv_obj_align(set_cal_lbl_temp, LV_ALIGN_CENTER, 0, -20);
+
+    // 偏移量显示
+    set_cal_lbl_offset = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(set_cal_lbl_offset, "Offset: 62.0");
+    lv_obj_set_style_text_font(set_cal_lbl_offset, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(set_cal_lbl_offset, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(set_cal_lbl_offset, LV_ALIGN_CENTER, 0, 30);
+
+    // 提示
+    lv_obj_t* hint2 = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(hint2, "Use ^ v to adjust offset");
+    lv_obj_set_style_text_font(hint2, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint2, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint2, LV_ALIGN_CENTER, 0, 60);
+
+    // 提示文字
+    lv_obj_t* hint = lv_label_create(scr_settings_caltemp);
+    lv_label_set_text(hint, "RET SAVE  ESC CANCEL");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    // 初始化
+    calTempOriginal = shtTempOffset;
+    update_setting_caltemp_display();
+    showScreen(scr_settings_caltemp);
+    currentSysMode = SYS_MODE_CAL_TEMP;
+}
+
+// ===========================
+// 设置界面控制函数
+// ===========================
+static void moveSettingField(int dir) {
+    switch (currentSysMode) {
+        case SYS_MODE_SET_TIME:
+            timeFieldIdx = (timeFieldIdx + dir + 5) % 5;
+            update_setting_time_display();
+            break;
+        case SYS_MODE_SET_ALARM:
+            alarmFieldIdx = (alarmFieldIdx + dir + 2) % 2;
+            update_setting_alarm_display();
+            break;
+        case SYS_MODE_SET_TIMER:
+            if (!timerRunning) {
+                timerFieldIdx = (timerFieldIdx + dir + 3) % 3;
+                update_setting_timer_display();
+            }
+            break;
+    }
+}
+
+static void adjustSettingField(int delta) {
+    switch (currentSysMode) {
+        case SYS_MODE_SET_TIME: {
+            switch (timeFieldIdx) {
+                case 0: timeEditY = constrain(timeEditY + delta, 2020, 2099); break;
+                case 1: timeEditMo = constrain(timeEditMo + delta, 1, 12); break;
+                case 2: timeEditD = constrain(timeEditD + delta, 1, 31); break;
+                case 3: timeEditH = constrain(timeEditH + delta, 0, 23); break;
+                case 4: timeEditMi = constrain(timeEditMi + delta, 0, 59); break;
+            }
+            update_setting_time_display();
+            break;
+        }
+        case SYS_MODE_SET_ALARM: {
+            switch (alarmFieldIdx) {
+                case 0: alarmEditH = constrain(alarmEditH + delta, 0, 23); break;
+                case 1: alarmEditM = constrain(alarmEditM + delta, 0, 59); break;
+            }
+            update_setting_alarm_display();
+            break;
+        }
+        case SYS_MODE_SET_TIMER: {
+            if (!timerRunning) {
+                switch (timerFieldIdx) {
+                    case 0: timerEditH = constrain(timerEditH + delta, 0, 23); break;
+                    case 1: timerEditM = constrain(timerEditM + delta, 0, 59); break;
+                    case 2: timerEditS = constrain(timerEditS + delta, 0, 59); break;
+                }
+                timerTotalSec = timerEditH * 3600 + timerEditM * 60 + timerEditS;
+                timerRemainSec = timerTotalSec;
+                update_setting_timer_display();
+            }
+            break;
+        }
+        case SYS_MODE_CAL_TEMP: {
+            shtTempOffset = constrain(shtTempOffset + delta * 0.5f, 50.0f, 80.0f);
+            update_setting_caltemp_display();
+            break;
+        }
+    }
+}
+
+static void saveSettingScreen(void) {
+    switch (currentSysMode) {
+        case SYS_MODE_SET_TIME: {
+            struct tm t = {0};
+            t.tm_year = timeEditY - 1900;
+            t.tm_mon = timeEditMo - 1;
+            t.tm_mday = timeEditD;
+            t.tm_hour = timeEditH;
+            t.tm_min = timeEditMi;
+            t.tm_sec = 0;
+            time_t epoch = mktime(&t);
+            struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            preferences.putUInt("set_epoch", epoch);
+            triggerHud("Time", "Saved", lv_color_hex(0x00FF00));
+            break;
+        }
+        case SYS_MODE_SET_ALARM: {
+            alarmHour = alarmEditH;
+            alarmMinute = alarmEditM;
+            alarmEnabled = lv_switch_get_state(set_alarm_sw);
+            preferences.putUChar("alarm_h", alarmHour);
+            preferences.putUChar("alarm_m", alarmMinute);
+            preferences.putBool("alarm_on", alarmEnabled);
+            triggerHud("Alarm", alarmEnabled ? "ON" : "OFF", lv_color_hex(CLR_CYAN));
+            break;
+        }
+        case SYS_MODE_SET_TIMER: {
+            timerRunning = false;
+            timerTotalSec = timerEditH * 3600 + timerEditM * 60 + timerEditS;
+            timerRemainSec = timerTotalSec;
+            triggerHud("Timer", "Saved", lv_color_hex(0x00FF00));
+            break;
+        }
+        case SYS_MODE_CAL_TEMP: {
+            preferences.putFloat("sht_offset", shtTempOffset);
+            triggerHud("Calibration", "Saved", lv_color_hex(0x00FF00));
+            break;
+        }
+    }
+    currentSysMode = SYS_MODE_NORMAL;
+    renderCurrentDisplayBase();
+}
+
+static void cancelSettingScreen(void) {
+    switch (currentSysMode) {
+        case SYS_MODE_SET_TIME:
+            triggerHud("Time", "Cancelled", lv_color_hex(0xFF8800));
+            break;
+        case SYS_MODE_SET_ALARM:
+            triggerHud("Alarm", "Cancelled", lv_color_hex(0xFF8800));
+            break;
+        case SYS_MODE_SET_TIMER:
+            timerRunning = false;
+            triggerHud("Timer", "Cancelled", lv_color_hex(0xFF8800));
+            break;
+        case SYS_MODE_CAL_TEMP:
+            shtTempOffset = calTempOriginal;
+            triggerHud("Calibration", "Cancelled", lv_color_hex(0xFF8800));
+            break;
+    }
+    currentSysMode = SYS_MODE_NORMAL;
+    renderCurrentDisplayBase();
 }
 
 // ===========================
@@ -1289,7 +1796,18 @@ static void scanKeyboardMatrix(void) {
                                     currentSysMode = SYS_MODE_NORMAL;
                                     showScreen(scr_main);
                                 }
-                            } else {
+                            }
+                            // 设置模式下的导航
+                            else if (IS_SETTING_MODE(currentSysMode)) {
+                                if (baseKey == KEY_LEFT_ARROW) moveSettingField(-1);
+                                else if (baseKey == KEY_RIGHT_ARROW) moveSettingField(1);
+                                else if (baseKey == KEY_UP_ARROW) adjustSettingField(1);
+                                else if (baseKey == KEY_DOWN_ARROW) adjustSettingField(-1);
+                                else if (baseKey == KEY_RETURN) saveSettingScreen();
+                                else if (baseKey == KEY_ESC) cancelSettingScreen();
+                            }
+                            // 正常模式
+                            else {
                                 uint16_t mappedKey = getMappedKey(baseKey);
                                 // 更新最近按键显示
                                 if (baseKey < 0x80) {
@@ -1327,8 +1845,8 @@ static void scanKeyboardMatrix(void) {
                             }
                         }
                         else {
-                            // 菜单模式下的导航键不发送
-                            if (currentSysMode == SYS_MODE_MENU) {
+                            // 设置模式和菜单模式下的导航键不发送
+                            if (currentSysMode == SYS_MODE_MENU || IS_SETTING_MODE(currentSysMode)) {
                                 // 仅拦截，不发送
                             } else {
                                 uint16_t mappedKey = getMappedKey(baseKey);
