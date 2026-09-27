@@ -188,7 +188,44 @@ static unsigned long pendingRestartMs = 0;
 
 // 菜单
 static uint8_t menuSel = 0;
-#define MENU_ITEMS 3
+#define MENU_ITEMS 12
+
+// 菜单项（中文）
+static const char* menuItemsCN[MENU_ITEMS] = {
+    "1. 返回主屏",
+    "2. 切换主屏风格",
+    "3. 切换配置方案",
+    "4. 按键回显开关",
+    "5. 键盘背光灯效",
+    "6. 状态灯亮度",
+    "7. 设置时间",
+    "8. 闹钟设置",
+    "9. 倒计时",
+    "10. 刷新温湿度",
+    "11. 温度校准",
+    "12. 计数清零"
+};
+
+// 辅助变量
+static bool showKeystrokes = true;
+
+// 灯效相关
+static const char* effectNames[] = {
+    "关闭", "纯红", "纯绿", "纯蓝", "冰蓝", "纯白",
+    "红呼吸", "绿呼吸", "蓝呼吸", "冰蓝呼吸", "流光", "彗星", "幻彩"
+};
+#define MAX_EFFECTS 13
+
+// 状态灯亮度
+#define IND_LEVEL_COUNT 4
+static const char* indLevelNames[] = { "关", "低", "中", "高" };
+static const uint8_t indLevelValues[] = { 0, 64, 140, 255 };
+static uint8_t indLevel = 3;
+static uint8_t indBrightness = 255;
+
+// 菜单滚动相关
+#define MENU_VISIBLE_ITEMS 6
+static int menuScrollOffset = 0;
 
 // HUD
 typedef struct {
@@ -264,6 +301,8 @@ static lv_obj_t* bc_lbl_date = nullptr;
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
 static lv_obj_t* menu_items[MENU_ITEMS];
+static lv_obj_t* menu_title = nullptr;
+static lv_obj_t* menu_position = nullptr;
 
 // 样式
 static lv_style_t style_bg;
@@ -292,6 +331,7 @@ static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
 static void triggerHud(const char* title, const char* value, uint16_t color);
 static void showScreen(lv_obj_t* target);
+static void handleMenuSelect(void);
 
 // ===========================
 // SHT31 温湿度
@@ -522,33 +562,114 @@ static void build_style_bigclock(void) {
 }
 
 // ===========================
-// 构建：菜单（预创建模式）
+// 菜单选择处理
+// ===========================
+static void handleMenuSelect(void) {
+    switch (menuSel) {
+        case 0:  // 返回主屏
+            currentSysMode = SYS_MODE_NORMAL;
+            showScreen(scr_main);
+            break;
+        case 1:  // 切换主屏风格 - 循环切换
+            currentDispMode = (currentDispMode + 1) % TOTAL_DISP_MODES;
+            renderCurrentDisplayBase();
+            triggerHud("Style",
+                currentDispMode == DISP_MODE_GEEK ? "Geek Mode" : "Big Clock",
+                lv_color_hex(CLR_CYAN));
+            break;
+        case 2:  // 切换配置方案 - 循环切换
+            switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+            break;
+        case 3:  // 按键回显开关
+            showKeystrokes = !showKeystrokes;
+            triggerHud("Keystrokes", showKeystrokes ? "ON" : "OFF",
+                lv_color_hex(showKeystrokes ? 0x00FF00 : 0xFF0000));
+            break;
+        case 4:  // 键盘背光灯效
+            currentEffect = (currentEffect + 1) % MAX_EFFECTS;
+            triggerHud("Light Effect", effectNames[currentEffect], lv_color_hex(0xFF00FF));
+            break;
+        case 5:  // 状态灯亮度
+            indLevel = (indLevel + 1) % IND_LEVEL_COUNT;
+            indBrightness = indLevelValues[indLevel];
+            triggerHud("LED Brightness", indLevelNames[indLevel], lv_color_hex(0xFFFF00));
+            break;
+        case 6:  // 设置时间
+            showScreen(scr_settings_time);
+            break;
+        case 7:  // 闹钟设置
+            showScreen(scr_settings_alarm);
+            break;
+        case 8:  // 倒计时
+            showScreen(scr_settings_timer);
+            break;
+        case 9:  // 刷新温湿度
+            if (shtAvailable) {
+                sht31_update();
+                triggerHud("SHT31", "Refreshed", lv_color_hex(0x00FF00));
+            } else {
+                triggerHud("SHT31", "Not Found", lv_color_hex(0xFF0000));
+            }
+            break;
+        case 10: // 温度校准
+            showScreen(scr_settings_caltemp);
+            break;
+        case 11: // 计数清零
+            totalKeyCount = 0;
+            preferences.putUInt("keyCount", 0);
+            triggerHud("Key Count", "Reset to 0", lv_color_hex(0x00FFFF));
+            break;
+    }
+}
+
+// ===========================
+// 构建：菜单（支持12项滚动）
 // ===========================
 static void build_menu(void) {
+    // 计算滚动偏移
+    if (menuSel < menuScrollOffset) {
+        menuScrollOffset = menuSel;
+    } else if (menuSel >= menuScrollOffset + MENU_VISIBLE_ITEMS) {
+        menuScrollOffset = menuSel - MENU_VISIBLE_ITEMS + 1;
+    }
+
     if (scr_menu == nullptr) {
         scr_menu = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(scr_menu, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
 
         // 标题
-        lv_obj_t* title = lv_label_create(scr_menu);
-        lv_label_set_text(title, "MENU");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
-        lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+        menu_title = lv_label_create(scr_menu);
+        lv_label_set_text(menu_title, "MENU");
+        lv_obj_set_style_text_font(menu_title, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(menu_title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+        lv_obj_align(menu_title, LV_ALIGN_TOP_MID, 0, 10);
 
-        // 菜单项
-        const char* items[] = { "Geek Mode", "Big Clock", "Back" };
+        // 位置指示
+        menu_position = lv_label_create(scr_menu);
+        lv_obj_set_style_text_font(menu_position, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(menu_position, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+        lv_obj_align(menu_position, LV_ALIGN_TOP_MID, 0, 35);
+
+        // 菜单容器
+        menu_cont = lv_obj_create(scr_menu);
+        lv_obj_set_size(menu_cont, 200, MENU_VISIBLE_ITEMS * 32);
+        lv_obj_align(menu_cont, LV_ALIGN_CENTER, 0, 15);
+        lv_obj_set_style_bg_color(menu_cont, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+        lv_obj_set_style_border_width(menu_cont, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(menu_cont, 0, LV_PART_MAIN);
+
+        // 创建菜单项（全部12项）
         for (int i = 0; i < MENU_ITEMS; i++) {
-            lv_obj_t* btn = lv_btn_create(scr_menu);
-            lv_obj_set_size(btn, 180, 40);
-            lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 60 + i * 50);
-            lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
+            lv_obj_t* btn = lv_btn_create(menu_cont);
+            lv_obj_set_size(btn, 190, 30);
+            lv_obj_set_style_radius(btn, 4, LV_PART_MAIN);
             lv_obj_set_style_bg_color(btn, lv_color_hex(CLR_DARK), LV_PART_MAIN);
             lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
 
             lv_obj_t* lbl = lv_label_create(btn);
-            lv_label_set_text(lbl, items[i]);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, LV_PART_MAIN);
+            lv_label_set_text(lbl, menuItemsCN[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
             lv_obj_set_style_text_color(lbl, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
             lv_obj_center(lbl);
 
@@ -556,14 +677,32 @@ static void build_menu(void) {
         }
     }
 
-    // 更新选中项样式
+    // 更新位置指示
+    if (menu_position) {
+        static char posBuf[24];
+        snprintf(posBuf, sizeof(posBuf), "%d/%d", menuSel + 1, MENU_ITEMS);
+        lv_label_set_text(menu_position, posBuf);
+    }
+
+    // 更新菜单项位置和可见性
     for (int i = 0; i < MENU_ITEMS; i++) {
         if (menu_items[i]) {
-            lv_obj_set_style_bg_color(menu_items[i], lv_color_hex(i == menuSel ? CLR_CYAN : CLR_DARK), LV_PART_MAIN);
+            int yPos = i * 32;
+            lv_obj_set_pos(menu_items[i], 5, yPos);
+
+            // 选中项高亮
+            bool isSelected = (i == menuSel);
+            bool isVisible = (i >= menuScrollOffset && i < menuScrollOffset + MENU_VISIBLE_ITEMS);
+            lv_obj_set_style_bg_color(menu_items[i],
+                lv_color_hex(isSelected ? CLR_CYAN : CLR_DARK), LV_PART_MAIN);
             lv_obj_t* lbl = lv_obj_get_child(menu_items[i], 0);
             if (lbl) {
-                lv_obj_set_style_text_color(lbl, lv_color_hex(i == menuSel ? CLR_BLACK : CLR_WHITE), LV_PART_MAIN);
+                lv_obj_set_style_text_color(lbl,
+                    lv_color_hex(isSelected ? CLR_BLACK : CLR_WHITE), LV_PART_MAIN);
             }
+            // 隐藏不在可见范围的项
+            lv_obj_set_style_opa(menu_items[i], isVisible ? LV_OPA_100 : LV_OPA_0, LV_PART_MAIN);
+            lv_obj_set_style_clip_corner(menu_items[i], true, LV_PART_MAIN);
         }
     }
 
@@ -883,21 +1022,9 @@ static void scanKeyboardMatrix(void) {
                                     build_menu();
                                 } else if (baseKey == KEY_RETURN) {
                                     // 选择菜单项
-                                    if (menuSel == 0) {
-                                        currentDispMode = DISP_MODE_GEEK;
-                                        currentSysMode = SYS_MODE_NORMAL;
-                                        renderCurrentDisplayBase();
-                                    } else if (menuSel == 1) {
-                                        currentDispMode = DISP_MODE_BIG_CLOCK;
-                                        currentSysMode = SYS_MODE_NORMAL;
-                                        renderCurrentDisplayBase();
-                                    } else {
-                                        // Back项：直接切换，不重建
-                                        currentSysMode = SYS_MODE_NORMAL;
-                                        showScreen(scr_main);
-                                    }
+                                    handleMenuSelect();
                                 } else if (baseKey == KEY_ESC) {
-                                    // ESC：直接切换，不重建
+                                    // ESC：返回主屏
                                     currentSysMode = SYS_MODE_NORMAL;
                                     showScreen(scr_main);
                                 }
@@ -966,24 +1093,12 @@ static void handleCommand(const String& cmd) {
     else if (cmd == "BTN:KNOB") {
         if (currentSysMode == SYS_MODE_MENU) {
             // 菜单选择
-            if (menuSel == 0) {
-                currentDispMode = DISP_MODE_GEEK;
-                currentSysMode = SYS_MODE_NORMAL;
-                renderCurrentDisplayBase();
-            } else if (menuSel == 1) {
-                currentDispMode = DISP_MODE_BIG_CLOCK;
-                currentSysMode = SYS_MODE_NORMAL;
-                renderCurrentDisplayBase();
-            } else {
-                // Back项：直接切换，不重建
-                currentSysMode = SYS_MODE_NORMAL;
-                showScreen(scr_main);
-            }
+            handleMenuSelect();
         }
     }
     else if (cmd == "BTN:LIGHT") {
         if (currentSysMode == SYS_MODE_MENU) {
-            // 直接切换，不重建
+            // 返回主屏
             currentSysMode = SYS_MODE_NORMAL;
             showScreen(scr_main);
         }
