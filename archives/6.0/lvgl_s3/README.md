@@ -66,9 +66,41 @@ python check_font.py  # 确认 MISSING 为 0
 
 - 主屏是真正的 `lv_obj_t` 屏幕对象，由 `ensureMainScreen()` 建/取，
   6 种主屏风格都建在它上面。**不要**改回 `lv_obj_create(lv_scr_act())`。
+- 6 种风格的根容器统一用 `makeRootPanel()` 建，**不要**再手写 `lv_obj_create` +
+  `set_size/pos`。原因：LVGL 默认主题给普通 `lv_obj` 套了 `card` 样式（`pad_all = 13px`
+  @DPI130），而 `lv_obj_set_pos()` 会走 `lv_obj_move_to()`，**把父对象的 pad+border
+  叠进子对象坐标**。于是任何"贴在 (0,0)"的子对象都会右下偏 13px，右边和下边被裁掉
+  —— 表现就是"整个界面往右移了一点"、壁纸模式下尤其明显。用 `lv_obj_align()` 的
+  子对象不受影响（对齐算 content 区中心，pad 对称时中心不变），所以很容易漏。
+- 顶部条（`dashTopBar()`）左三是三颗锁状态灯（NUM/CAP/SCR，只画圆点不写文字），
+  右边是方案指示：序号常显，1/2 号方案另配系统图标（Windows 四格窗 / 苹果），
+  图标全部用 `lv_obj` 基本图形拼，改样式时别去动 `topIconWin[] / topIconMac[]` 的
+  创建顺序（= 绘制顺序：果体 → 缺口 → 果柄 → 叶）。
+- **别用 `transform_zoom` / `transform_angle` 放大字号或做视觉效果**：
+  LVGL 8.4 的软件渲染器对需要 alpha 的中间图层有一道闸门
+  （`lv_draw_sw_layer.c`: `LV_COLOR_SCREEN_TRANSP == 0 && HAS_ALPHA → return NULL`），
+  本项目没开 `LV_COLOR_SCREEN_TRANSP`，走这条路的控件会被**静默地整个不画**。
+  要大字就上大字号的字库。
 - 回主屏统一走 `gotoMainScreen()`，它负责模式复位 + 内容重建 + 切屏。
 - 按键分发顺序必须和 `s3/s3.ino` 原版一致：界面态（菜单 → 设置 → 录制）先接管，
   `K_MC` 放最后。在界面态里 `K_MC` 和 `ESC` 都是"退出"。
+- 宏/序列/组合键的执行链和原版 `s3/s3.ino` 一致：`executeGlobalKey()` 吃
+  `GSET` 的 `SW:x+SEQ:…` / `SW:x+CMB:…`，`executeMacro()` 吃按方案的
+  `p<n>_<键名>`（`SEQ:` / `CMB:` 两种）。网页端 `s3-setting.html` 发的
+  `SET:p0_M1:…` 名字里已经带方案号，固件端**不要再拼一层** `p<currentProfile>_`。
+
+## 文件系统与分区（别踩）
+
+- 壁纸 `/logo.bin` 和 ME 文本 `/me_hex.txt` 存在 **SPIFFS** 上，**不是 FFat**。
+- 板子默认分区表（PlatformIO 的 `default_8MB.csv` / Arduino IDE 的 `default.csv`）
+  里只有 `spiffs` 分区，**没有 ffat 分区**。`FFat.begin()` 找不到 subtype=fat 的分区
+  会直接返回 false，之后每次 `FFat.open()` 都是一个无效 File —— 表现就是
+  "ME 文本存入失败""壁纸重启就丢"。
+- 所以烧录时的分区方案必须是**默认那几档**（带 spiffs 的）；选了
+  "16MB Flash (3MB APP/9.9MB FATFS)" 这类 FATFS 方案，SPIFFS 反而会挂不上。
+  （`lvgl_demo/` 那个 README 让人选 FATFS，是历史遗留，别照做。）
+- 分区表别改：宏 / 按键重映射 / 方案 / 灯光 / 校准值都在 `nvs` 分区，
+  挪动偏移等于把用户配置全抹掉。
 
 ## 目录结构
 

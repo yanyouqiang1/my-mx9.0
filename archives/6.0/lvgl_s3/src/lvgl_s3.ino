@@ -17,7 +17,7 @@
 #include <Preferences.h>
 #include <driver/timer.h>
 #include <esp_task_wdt.h>
-#include <FFat.h>
+#include <SPIFFS.h>
 #include <JPEGDEC.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -672,7 +672,7 @@ static lv_obj_t* wp_lbl_time = nullptr;
 // ===========================
 // 网页端本地已经把原图缩到 240x240 并压成 JPEG（十几 KB），BLE 写的是
 // LOGO_JPEG_START:<长度> + 一串裸字节。固件收齐后用 JPEGDEC 解成 RGB565，
-// 落到 PSRAM 里的一张常驻缓冲，同时再写一份 /logo.bin 到 FFat —— 重启后
+// 落到 PSRAM 里的一张常驻缓冲，同时再写一份 /logo.bin 到 SPIFFS —— 重启后
 // 直接从盘上读回，不用再传一遍。
 //
 // 缓冲是 PSRAM 而不是内部 DRAM：240*240*2 = 115KB，内部 DRAM 装不下。
@@ -708,9 +708,14 @@ static void loadWallpaperFromDisk(void);
 static uint8_t* logoRxAlloc(uint32_t total);
 
 // 主屏通用顶部条（6 种风格共用）
+//   左边：3 颗锁状态灯，只画圆点、不写 NUM/CAP/SCR 文字
+//   右边：当前方案 —— 1/2 号方案是 Windows / macOS，直接画系统图标；3/4 只显序号
 static lv_obj_t* topLockDot[3] = { nullptr, nullptr, nullptr };
 static uint32_t   topLockOn[3] = { 0, 0, 0 };
-static lv_obj_t* topProfileLbl = nullptr;
+static lv_obj_t* topProfileNum = nullptr;      // 方案序号 1~4
+static lv_obj_t* topIconBox    = nullptr;      // 系统图标的槽位（14x18，本身透明）
+static lv_obj_t* topIconWin[4] = { nullptr, nullptr, nullptr, nullptr };  // Windows 四格窗
+static lv_obj_t* topIconMac[4] = { nullptr, nullptr, nullptr, nullptr };  // 苹果：果体/缺口/柄/叶
 
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
@@ -844,7 +849,9 @@ static void resetStylePointers(void) {
     // 是切过去之后仍在刷新上一风格的顶部条。setBgColor 的 nullptr 检查拦不住，
     // 因为它不是 nullptr，是被释放后又被复用的地址。
     for (int i = 0; i < 3; i++) topLockDot[i] = nullptr;
-    topProfileLbl = nullptr;
+    topProfileNum = nullptr;
+    topIconBox = nullptr;
+    for (int i = 0; i < 4; i++) { topIconWin[i] = nullptr; topIconMac[i] = nullptr; }
 }
 static void destroyMainScreen(void) {
     gk_bg = nullptr; bc_bg = nullptr; ip_bg = nullptr;
@@ -1108,6 +1115,37 @@ static void mkLabel(lv_obj_t* l, const lv_font_t* f, uint32_t color) {
     lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
 }
 
+// ===========================
+// 全屏风格容器（6 种主屏风格统一走这里）
+// ===========================
+// 必须显式把 padding 清成 0，否则整个界面会整体往右下偏 13px。
+//
+// 原因：LVGL 默认主题会给**普通 lv_obj** 套一份 card 样式，其中
+// `pad_all = PAD_DEF`，在 240x240 / DPI 130 下 PAD_DEF = lv_disp_dpx(16) = 13。
+// 而 lv_obj_set_pos() 定位子对象时走的是 lv_obj_move_to()，后者会把
+// **父对象的 pad_left / pad_top + border 叠进子对象坐标**
+// （lvgl/src/core/lv_obj_pos.c 的 lv_obj_move_to，713-727 行）。
+//
+// 于是"贴在 (0,0)"的东西全部右下偏 13px：
+//   · dashTopBar() 的顶部条建在风格容器上 → 6 种风格的顶栏都右移+下移 13px，
+//     右侧 13px 被裁掉，屏幕左边露出一条底色 —— 就是"整体好像往右移了一点"；
+//   · 壁纸模式的 wp_img / scrim 建在 wp_bg 上 → 满屏图右移下移 13px，
+//     左边一条黑边、右边和底部各缺 13px，所以"展示壁纸的时候特别明显"。
+// 用 lv_obj_align() 的子对象不受影响（对齐算的是 content 区，pad 对称时中心不变），
+// 所以只有"贴边"的元素露馅 —— 这跟旋转没有关系。
+static lv_obj_t* makeRootPanel(lv_obj_t* parent, uint32_t bg) {
+    lv_obj_t* o = lv_obj_create(parent);
+    lv_obj_set_size(o, 240, 240);
+    lv_obj_set_pos(o, 0, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(bg), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
 // **只在内容真的变了时才 set_text**
 // updateDynamicElements() 是每轮 loop 都跑的，LVGL 的 lv_label_set_text 无条件
 // invalidate + 重排版，文本没变也照刷 —— 结果屏幕永远 dirty，SPI 一直在推满屏。
@@ -1162,11 +1200,46 @@ static void setSizePos(lv_obj_t* o, lv_coord_t w, lv_coord_t h, lv_coord_t x, lv
     lv_obj_set_pos(o, x, y);
 }
 
+// 显示/隐藏。同样只在状态真的变了才动：lv_obj_add_flag(LV_OBJ_FLAG_HIDDEN)
+// 会**无条件** lv_obj_invalidate()，每 100ms 无脑调一次就等于屏幕永远 dirty
+// （和上面 setBgColor / setText 是同一个道理）。
+static void setHidden(lv_obj_t* o, bool hidden) {
+    if (o == nullptr) return;
+    if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN) == hidden) return;
+    if (hidden) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+// 给顶部条里的小图形用的：一块纯色小方块/圆片。
+// 顶部条的这些图标是"贴边画的"，所以别用 mkCard/mkChip（那两个带 1px 描边），
+// 统一走这里，省得每个都要写 6 行 set_style。
+static lv_obj_t* iconRect(lv_obj_t* parent, lv_coord_t w, lv_coord_t h,
+                          lv_align_t align, lv_coord_t dx, lv_coord_t dy,
+                          uint32_t color, lv_coord_t radius) {
+    lv_obj_t* o = lv_obj_create(parent);
+    lv_obj_set_size(o, w, h);
+    lv_obj_align(o, align, dx, dy);
+    lv_obj_set_style_bg_color(o, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(o, radius, LV_PART_MAIN);
+    lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
 // ===========================
 // 主屏通用：顶部状态条
 // ===========================
-// 三颗锁状态灯 + 方案名，6 种风格共用。灯点用 topLockDot[] 存起来，
-// updateDynamicElements() 统一驱动，避免每种风格各写一份。
+// 左：3 颗锁状态灯（NUM / CAP / SCR）。**只画圆点，不写文字** ——
+//     原来"圆点 + NUM/CAP/SCR 小字"占掉左边 ~165px，而右边方案名
+//     （"方案1-Windows" 约 108px，右对齐到 -12）从 x≈120 就开始，两者直接叠在一起，
+//     这就是"上面挤了一点"。去掉文字后左边只占 ~54px，锁状态靠"第几颗圆点 + 颜色"
+//     区分（NUM=绿 / CAP=青 / SCR=琥珀，和 C3 上 16/17/18 号物理指示灯同色）。
+// 右：当前方案。方案 1/2 是 Windows / macOS，直接画系统图标；方案 3/4 不按系统分，
+//     只显序号。图标全部用基本图形拼（圆角矩形 + 圆），不占 Flash，
+//     也不用指望字库 / 字体符号里正好有苹果和四格窗这两个字形
+//     —— LVGL 内置符号表和这份中文字库里都没有它们，靠字符是画不出来的。
 static void dashTopBar(lv_obj_t* parent) {
     lv_obj_t* bar = lv_obj_create(parent);
     lv_obj_set_size(bar, 240, 28);
@@ -1180,30 +1253,68 @@ static void dashTopBar(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    const char* names[3] = { "NUM", "CAP", "SCR" };
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     for (int i = 0; i < 3; i++) {
-        lv_obj_t* d = lv_obj_create(bar);
-        lv_obj_set_size(d, 7, 7);
-        lv_obj_align(d, LV_ALIGN_LEFT_MID, 14 + i * 44, 0);
-        lv_obj_set_style_bg_color(d, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_border_width(d, 0, LV_PART_MAIN);
-        lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* d = iconRect(bar, 6, 6, LV_ALIGN_LEFT_MID, 12 + i * 18, 0,
+                               CLR_STROKE, LV_RADIUS_CIRCLE);
         topLockDot[i] = d;
         topLockOn[i] = onColors[i];
-
-        lv_obj_t* t = lv_label_create(bar);
-        mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_MUTE);
-        lv_label_set_text(t, names[i]);
-        lv_obj_align(t, LV_ALIGN_LEFT_MID, 25 + i * 44, 0);
     }
 
-    topProfileLbl = lv_label_create(bar);
-    mkLabel(topProfileLbl, &lv_font_simsun_16_cjk, CLR_ACCENT);
-    lv_label_set_text(topProfileLbl, profileNamesCN[currentProfile]);
-    lv_obj_align(topProfileLbl, LV_ALIGN_RIGHT_MID, -12, 0);
+    // 方案序号（1~4），贴着右边
+    topProfileNum = lv_label_create(bar);
+    mkLabel(topProfileNum, &lv_font_montserrat_14, CLR_ACCENT);
+    lv_label_set_text(topProfileNum, "1");
+    lv_obj_align(topProfileNum, LV_ALIGN_RIGHT_MID, -10, 0);
+
+    // 系统图标槽位。本身透明、空的，里面两组图标按当前方案显示/隐藏
+    // （由 updateDynamicElements() 驱动）。
+    topIconBox = lv_obj_create(bar);
+    lv_obj_set_size(topIconBox, 14, 18);
+    lv_obj_align(topIconBox, LV_ALIGN_RIGHT_MID, -26, 0);
+    lv_obj_set_style_bg_opa(topIconBox, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(topIconBox, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(topIconBox, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(topIconBox, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- 方案1 (Windows)：四格窗 ----
+    const lv_coord_t paneX[4] = { 0, 7, 0, 7 };
+    const lv_coord_t paneY[4] = { 2, 2, 9, 9 };
+    for (int i = 0; i < 4; i++) {
+        topIconWin[i] = iconRect(topIconBox, 6, 6, LV_ALIGN_TOP_LEFT,
+                                 paneX[i], paneY[i], CLR_ACCENT, 1);
+        setHidden(topIconWin[i], currentProfile != 0);
+    }
+
+    // ---- 方案2 (macOS)：苹果 ----
+    // 果体 = 一只压扁的圆；顶上用**底色**画一颗小圆把果体的边缘咬掉一块，
+    // 咬出来的凹陷就是苹果顶上那道缺口（它贴在顶栏上，底色恒为 CLR_SURFACE，
+    // 所以"用底色画"是安全的）；最后叠果柄和一片叶子。
+    // 建对象的顺序 = 绘制顺序，必须是 果体 → 缺口 → 柄 → 叶。
+    topIconMac[0] = iconRect(topIconBox, 14, 12, LV_ALIGN_BOTTOM_MID, 0, 0,
+                             CLR_ACCENT, LV_RADIUS_CIRCLE);          // 果体
+    topIconMac[1] = iconRect(topIconBox, 6, 6, LV_ALIGN_TOP_MID, 0, 4,
+                             CLR_SURFACE, LV_RADIUS_CIRCLE);         // 缺口
+    topIconMac[2] = iconRect(topIconBox, 2, 5, LV_ALIGN_TOP_MID, 0, 0,
+                             CLR_ACCENT, 1);                         // 果柄
+    topIconMac[3] = iconRect(topIconBox, 6, 3, LV_ALIGN_TOP_MID, 3, 1,
+                             CLR_ACCENT, 1);                         // 叶子
+    for (int i = 0; i < 4; i++) setHidden(topIconMac[i], currentProfile != 1);
+}
+
+// 顶部条右侧的方式指示（序号 + 系统图标）单独抽出来，两个地方都要用：
+//   · switchProfile() —— 换方案的瞬间立刻更新，不用等下面那 100ms 的慢刷新
+//   · updateDynamicElements() —— 万一顶部条是在别的方案下建出来的，这里兜住
+// 尤其要注意 updateDynamicElements() 开头有"系统时间还没校准就 return"的判断，
+// 只靠它会出现"换了方案图标不变"。
+static void updateTopBarProfile(void) {
+    static char profBuf[4];
+    snprintf(profBuf, sizeof(profBuf), "%u", (unsigned)(currentProfile + 1));
+    setText(topProfileNum, profBuf);
+    for (int i = 0; i < 4; i++) {
+        setHidden(topIconWin[i], currentProfile != 0);
+        setHidden(topIconMac[i], currentProfile != 1);
+    }
 }
 
 // 小统计卡：标题 + 数值
@@ -1232,11 +1343,7 @@ static lv_obj_t* statCard(lv_obj_t* parent, int cx, const char* cap,
 static void build_style_geek(void) {
     if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
 
-    gk_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(gk_bg, 240, 240);
-    lv_obj_set_pos(gk_bg, 0, 0);
-    lv_obj_set_style_bg_color(gk_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(gk_bg, 0, LV_PART_MAIN);
+    gk_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     dashTopBar(gk_bg);
 
@@ -1252,10 +1359,13 @@ static void build_style_geek(void) {
     lv_label_set_text(gk_lbl_date, "----/--/-- --");
     lv_obj_align(gk_lbl_date, LV_ALIGN_TOP_MID, 0, 104);
 
-    // 时钟下方一条强调线，视觉上把主区和数据区分开
+    // 时钟下方一条强调线，视觉上把主区和数据区分开。
+    // y 从 128 提到 124：上面修掉 padding 那 13px 偏移之后，日期落在 104~120、
+    // 统计卡落在 129~191（statCard 用的是 CENTER 对齐，不受 padding 影响，
+    // 所以位置没变）—— 128 会和卡片顶部叠在一起，只露出 1px 的线头。
     lv_obj_t* line = lv_obj_create(gk_bg);
     lv_obj_set_size(line, 40, 2);
-    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 128);
+    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 124);
     lv_obj_set_style_bg_color(line, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(line, 1, LV_PART_MAIN);
@@ -1274,11 +1384,7 @@ static void build_style_geek(void) {
 static void build_style_bigclock(void) {
     if (bc_bg) { lv_obj_del(bc_bg); bc_bg = nullptr; }
 
-    bc_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(bc_bg, 240, 240);
-    lv_obj_set_pos(bc_bg, 0, 0);
-    lv_obj_set_style_bg_color(bc_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(bc_bg, 0, LV_PART_MAIN);
+    bc_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     dashTopBar(bc_bg);
 
@@ -1319,11 +1425,7 @@ static void build_style_bigclock(void) {
 static void build_style_info_panel(void) {
     if (ip_bg) { lv_obj_del(ip_bg); ip_bg = nullptr; }
 
-    ip_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(ip_bg, 240, 240);
-    lv_obj_set_pos(ip_bg, 0, 0);
-    lv_obj_set_style_bg_color(ip_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(ip_bg, 0, LV_PART_MAIN);
+    ip_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     dashTopBar(ip_bg);
 
@@ -1407,11 +1509,7 @@ static void build_style_info_panel(void) {
 static void build_style_keymon(void) {
     if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
 
-    km_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(km_bg, 240, 240);
-    lv_obj_set_pos(km_bg, 0, 0);
-    lv_obj_set_style_bg_color(km_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(km_bg, 0, LV_PART_MAIN);
+    km_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     dashTopBar(km_bg);
 
@@ -1456,11 +1554,7 @@ static void build_style_keymon(void) {
 static void build_style_rhythm(void) {
     if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
 
-    rh_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(rh_bg, 240, 240);
-    lv_obj_set_pos(rh_bg, 0, 0);
-    lv_obj_set_style_bg_color(rh_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(rh_bg, 0, LV_PART_MAIN);
+    rh_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     dashTopBar(rh_bg);
 
@@ -1658,9 +1752,9 @@ static void finishLogoUpload(void) {
     uint16_t* oldPixels = wpPixels;
 
     if (ok) {
-        // 落盘一份，重启后直接从 FFat 读回。分块写 + 喂狗：115KB 一次写完
-        // 在 FFat 上是毫秒级的，loop 任务挂在任务看门狗上，稳妥点分段喂。
-        File f = FFat.open("/logo.bin", FILE_WRITE);
+        // 落盘一份，重启后直接从 SPIFFS 读回。分块写 + 喂狗：115KB 一次写完
+        // 在 SPIFFS 上是毫秒级的，loop 任务挂在任务看门狗上，稳妥点分段喂。
+        File f = SPIFFS.open("/logo.bin", FILE_WRITE);
         if (f) {
             const uint8_t* p = (const uint8_t*)out;
             size_t left = (size_t)WP_PIXELS * 2;
@@ -1708,10 +1802,10 @@ static void finishLogoUpload(void) {
     }
 }
 
-// 开机：FFat 里有 /logo.bin 就读回 PSRAM，重启不用重传。
+// 开机：SPIFFS 里有 /logo.bin 就读回 PSRAM，重启不用重传。
 static void loadWallpaperFromDisk(void) {
-    if (!FFat.exists("/logo.bin")) return;
-    File f = FFat.open("/logo.bin", FILE_READ);
+    if (!SPIFFS.exists("/logo.bin")) return;
+    File f = SPIFFS.open("/logo.bin", FILE_READ);
     if (!f) return;
     size_t sz = f.size();
     f.close();
@@ -1719,7 +1813,7 @@ static void loadWallpaperFromDisk(void) {
 
     uint16_t* buf = (uint16_t*)heap_caps_malloc(WP_PIXELS * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf == nullptr) return;
-    File r = FFat.open("/logo.bin", FILE_READ);
+    File r = SPIFFS.open("/logo.bin", FILE_READ);
     if (!r) { heap_caps_free(buf); return; }
     size_t rd = r.read((uint8_t*)buf, WP_PIXELS * 2);
     r.close();
@@ -1736,11 +1830,7 @@ static void loadWallpaperFromDisk(void) {
 static void build_style_wallpaper(void) {
     if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
 
-    wp_bg = lv_obj_create(ensureMainScreen());
-    lv_obj_set_size(wp_bg, 240, 240);
-    lv_obj_set_pos(wp_bg, 0, 0);
-    lv_obj_set_style_bg_color(wp_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
-    lv_obj_set_style_border_width(wp_bg, 0, LV_PART_MAIN);
+    wp_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
 
     // 壁纸铺满
     wp_img = lv_img_create(wp_bg);
@@ -2259,9 +2349,8 @@ static void pushNotification(AlertType type, const String& text) {
 //
 // 之前是贴在顶部的 58px 小条：存在感太弱，人扫一眼就过去了 —— 但这东西的价值
 // 全在"别漏掉"，所以改成压在屏幕正中，数字和正文都放大。
-// 手头只有 simsun_16_cjk 一个中文点阵字库，程序里没法现生成 24px，
-// 所以正文用 LVGL 的 transform_zoom 把 16px 拉到 1.5 倍（draw 时缩放，不额外占 Flash）。
-// 注意：zoom 缩放的是**绘制**，排版仍按未缩放的宽度算，所以宽度要除以 1.5 再给。
+// 正文用字体本身的 16px 排满卡片内宽（最多 5 行）；**不要**再用 transform_zoom
+// 放大，原因见下面创建 notif_label 处的注释。
 static void drawNotifPanel(void) {
     if (notifCount == 0) {
         if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
@@ -2331,7 +2420,7 @@ static void drawNotifPanel(void) {
     lv_obj_set_style_border_width(sep, 0, LV_PART_MAIN);
     lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ---- 主体：最新一条的告警正文，1.5 倍，约 3 行 ----
+    // ---- 主体：最新一条的告警正文 ----
     // 主机没给正文时（`ALERT:RED`）不留空白，合成一句「你有 N 条消息」——
     // 条数每次确认都会变，所以在这里现算，不能入队时写死。
     char fallback[32];
@@ -2341,15 +2430,30 @@ static void drawNotifPanel(void) {
         body = fallback;
     }
 
+    // **这里绝对不要再用 transform_zoom 放大字号。**
+    //
+    // 以前正文是"16px 拉到 1.5 倍"（transform_zoom = 384），思路是用缩放冒充大字，
+    // 但那会让这个 label 走 LVGL 的**中间图层**渲染路径，而 LVGL 8.4 的软件渲染器
+    // 在这条路上有一道闸门（lvgl/src/draw/sw/lv_draw_sw_layer.c 第 45 行）：
+    //     if(LV_COLOR_SCREEN_TRANSP == 0 && (flags & LV_DRAW_LAYER_FLAG_HAS_ALPHA))
+    //         return NULL;
+    // 本项目 lv_conf.h 没开 LV_COLOR_SCREEN_TRANSP（默认 0），于是图层建不出来，
+    // refr_obj() 直接 return —— **这个 label 一个像素都不画**。
+    // 表现就是通知面板弹出来了（圆点、条数、"按灯光键处理"都在，它们都不走图层），
+    // 唯独正文是空的，主机发什么文字都一样。
+    //
+    // 现在改回原生 16px 排版：宽度给满卡片内宽，行距收紧，能放 5 行。
+    // 字库那边是 3500 常用汉字 + 源码补字的全量字库，任意汉字正文都出得来，
+    // 所以"直接把字排大"这条路走不通时（240x240 放不下 24px 全量字库），
+    // 靠"排满一屏"来保证可读性才是稳的。
     notif_label = lv_label_create(scr_notif);
     mkLabel(notif_label, &lv_font_simsun_16_cjk, CLR_TEXT);
     lv_label_set_text(notif_label, body);
-    lv_obj_set_width(notif_label, 138);        // 138 * 1.5 ≈ 207，卡片内宽 216
+    lv_obj_set_width(notif_label, 200);        // 卡片内宽 224（228 减两侧 2px 描边），各留 12
     lv_label_set_long_mode(notif_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_transform_zoom(notif_label, 384, LV_PART_MAIN);   // 1.5x
-    lv_obj_set_style_text_line_space(notif_label, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(notif_label, 4, LV_PART_MAIN);
     lv_obj_align(notif_label, LV_ALIGN_TOP_MID, 0, 48);
-    lv_obj_set_height(notif_label, 76);        // 视觉高度 114，正好约 3 行
+    lv_obj_set_height(notif_label, 112);       // 5 行 × (16 字高 + 4 行距) = 100
 
     // ---- 底部：操作提示（只提灯光键，这是实际会按的那个） ----
     lv_obj_t* hint = lv_label_create(scr_notif);
@@ -2925,23 +3029,30 @@ static void finishMacroRecording(const String& targetKey) {
         return;
     }
 
-    // 构建宏数据字符串
+    // 构建宏数据字符串。格式必须和 executeSequenceAction / executeComboAction
+    // 的解析方式对上（也和网页端下发的那套保持一致）：
+    //   SEQ → 可打印字符原样拼，回车/Tab/Esc/退格拼成 [ENTER] [TAB] [ESC] [BACKSPACE]
+    //         （直接把 KEY_RETURN=0xB0 那种原始码写进去，播放时会被当成
+    //          不可打印字符丢掉 —— 录了半天回车，回放时回车没了）
+    //   CMB → 十进制码点逗号分隔，例 "128,129,65"。以前这里写的是 %02X 十六进制
+    //         带尾逗号（"C0,1F,"），而播放端按十进制读，"C0" 解析成 0 → 一个键都不按。
     String macroData;
     if (recStage == REC_STAGE_SEQ) {
-        // SEQ: 击键序列
         macroData = "SEQ:";
         for (int i = 0; i < recKeyCount; i++) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%c", (char)recKeyBuffer[i]);
-            macroData += buf;
+            uint16_t c = recKeyBuffer[i];
+            if (c == KEY_RETURN)         macroData += "[ENTER]";
+            else if (c == KEY_TAB)       macroData += "[TAB]";
+            else if (c == KEY_ESC)       macroData += "[ESC]";
+            else if (c == KEY_BACKSPACE) macroData += "[BACKSPACE]";
+            else if (c >= 32 && c <= 126) macroData += (char)c;
+            // 其余（修饰键/方向键/F 键）SEQ 模式下表达不了，跳过
         }
     } else {
-        // CMB: 组合键（同时按下的键）
         macroData = "CMB:";
         for (int i = 0; i < recKeyCount; i++) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02X,", recKeyBuffer[i]);
-            macroData += buf;
+            macroData += String(recKeyBuffer[i]);
+            if (i < recKeyCount - 1) macroData += ",";
         }
     }
 
@@ -3151,18 +3262,30 @@ void switchProfile(uint8_t profIdx) {
     currentProfile = profIdx;
     preferences.putUChar("curr_prof", profIdx);
     triggerHud("配置方案", profileNamesCN[currentProfile], lv_color_hex(CLR_VIOLET));
+    // 顶部条的序号 + 系统图标立刻跟上。等 updateDynamicElements() 那 100ms 也行，
+    // 但它开头有"系统时间未校准就 return"的分支，靠它会出现图标不跟着换。
+    updateTopBarProfile();
 }
 
 // ===========================
 // 键盘工具函数
 // ===========================
+// 修饰键有**两套**编码，两个都要认：
+//   0x80~0x87 = Arduino 风格（KEY_LEFT_CTRL…），按键矩阵和网页"组合键"用的是这套
+//   0xE0~0xE7 = USB HID 风格，网页"按键映射"里的修饰键下拉给的是这套
+//                （见 s3-setting.html 的 KEY_OPTIONS："🔹 Left Ctrl": 224）
+// 以前只认前者，HID 风格的值会被直接喂给 Keyboard.press()：它按 ">= 0x88 就是
+// 非打印键" 处理，0xE0 落到 (0xE0 - 0x88) = 0x88 这个不存在的 usage 上 ——
+// 主机收到的既不是 Ctrl 也不是任何一个键。
 static inline void kbPress(uint8_t code) {
-    if (code >= 0x80 && code < 0x88) Keyboard.pressRaw((uint8_t)(code + 0x60));
+    if (code >= 0xE0 && code < 0xE8) Keyboard.pressRaw(code);
+    else if (code >= 0x80 && code < 0x88) Keyboard.pressRaw((uint8_t)(code + 0x60));
     else Keyboard.press(code);
 }
 
 static inline void kbRelease(uint8_t code) {
-    if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
+    if (code >= 0xE0 && code < 0xE8) Keyboard.releaseRaw(code);
+    else if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
     else Keyboard.release(code);
 }
 
@@ -3279,24 +3402,96 @@ static uint16_t getMappedKey(uint16_t originalKey) {
 }
 
 // ===========================
-// 宏执行
+// 宏执行：SEQ(击键流) / CMB(组合键) + 全局动作
 // ===========================
+// 这一整块是从原版 s3/s3.ino 抄回来的 —— LVGL 移植时把它砍掉了一半，
+// 结果"网页里配好的宏在键盘上按下去什么也不发生"：
+//   · executeGlobalKey() 只解析 GSET payload 里的 "SW:"，后面的 "+SEQ:…"/"+CMB:…"
+//     整段被丢掉（网页的 payload 就是 `SW:1+SEQ:你好` / `SW:2+CMB:128,129,65`）
+//   · executeMacro() 只认 "SEQ:"，"CMB:" 一条都没实现，组合键全废
+//   · executeComboAction() 这个函数在移植版里直接消失了
+// 下面按原版语义补齐，行为以原版为准。
+
+// delay() 期间 loopTask 是被挂起的，而 loopTask 挂在任务看门狗上
+// （setup() 里 esp_task_wdt_add(NULL)），所以宏里一个 SLEEP(1000) 就能触发
+// 看门狗复位。凡是宏里要等的地方都走这个函数，边等边喂狗。
+static void kbSafeDelay(unsigned long ms) {
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        esp_task_wdt_reset();
+        delay(1);
+    }
+}
+
+// SEQ: 连续击键流。支持三类写法：
+//   SLEEP(ms) / [SLEEP:ms]  等一会儿再打下一个键
+//   [ENTER] [TAB] [ESC] [BACKSPACE]  特殊键（键盘录制的宏就是用这几个 tag 存的）
+//   其余可打印 ASCII 字符，逐字打出去，每个之间留 5ms 让主机跟得上
 static void executeSequenceAction(String seq) {
     int i = 0;
-    while (i < seq.length()) {
+    while (i < (int)seq.length()) {
         if (seq.substring(i).startsWith("SLEEP(")) {
             int endP = seq.indexOf(')', i + 6);
             if (endP != -1) {
-                delay(seq.substring(i + 6, endP).toInt());
+                int sleepMs = seq.substring(i + 6, endP).toInt();
+                if (sleepMs > 0) kbSafeDelay(sleepMs);
                 i = endP + 1;
-            } else { i++; }
-        } else {
-            uint8_t c = (uint8_t)seq[i];
-            if (c >= 32 && c <= 126) Keyboard.write(c);
-            else if (c == 0xB0) Keyboard.write(' ');
-            i++;
+                continue;
+            }
+        } else if (seq.substring(i).startsWith("[SLEEP:")) {
+            int endB = seq.indexOf(']', i + 7);
+            if (endB != -1) {
+                int sleepMs = seq.substring(i + 7, endB).toInt();
+                if (sleepMs > 0) kbSafeDelay(sleepMs);
+                i = endB + 1;
+                continue;
+            }
+        } else if (seq[i] == '[') {
+            int endB = seq.indexOf(']', i);
+            if (endB != -1) {
+                String tag = seq.substring(i + 1, endB);
+                bool matched = true;
+                if (tag == "ENTER")           Keyboard.write(KEY_RETURN);
+                else if (tag == "TAB")        Keyboard.write(KEY_TAB);
+                else if (tag == "ESC")        Keyboard.write(KEY_ESC);
+                else if (tag == "BACKSPACE")  Keyboard.write(KEY_BACKSPACE);
+                else matched = false;
+                if (matched) { i = endB + 1; continue; }
+            }
         }
+        // 只发 ASCII：中文/全角字符的 UTF-8 字节 >= 0x80，喂给 Keyboard.write()
+        // 会被当成"修饰键码"(0x80~0x87) 或非打印键，主机收到的是乱七八糟的
+        // Ctrl/Alt 按住事件。中文只能走 ME 那条 hex 通道。
+        uint8_t c = (uint8_t)seq[i++];
+        if (c >= 32 && c <= 126) Keyboard.write(c);
+        kbSafeDelay(5);
     }
+}
+
+// CMB: 组合键，编码是"HID 码点用逗号分隔"，例如 Ctrl+Shift+A = "128,129,65"
+// （码值定义和网页 KEY_OPTIONS 一致：Ctrl=128 Shift=129 Alt=130 Win=131，
+//  普通键用 Arduino 的码值，字母就是 ASCII）。
+// 关键是**先全部按住、再一起松开**：挨个 press+release 出来的是三个单键，
+// 不是组合键。
+static void executeComboAction(String cmb) {
+    while (cmb.length() > 0) {
+        int comma = cmb.indexOf(',');
+        String tok = (comma == -1) ? cmb : cmb.substring(0, comma);
+        tok.trim();
+        int code = tok.toInt();
+        if (code > 0) kbPress((uint8_t)code);
+        if (comma == -1) break;
+        cmb = cmb.substring(comma + 1);
+    }
+    kbSafeDelay(50);
+    Keyboard.releaseAll();
+}
+
+// GSET payload 的后半段：`SEQ:…` 或 `CMB:…`。
+// SW: 那一段已经在 executeGlobalKey() 里处理掉了。
+static void executeActionPayload(String extra) {
+    if (extra.startsWith("SEQ:"))      executeSequenceAction(extra.substring(4));
+    else if (extra.startsWith("CMB:")) executeComboAction(extra.substring(4));
 }
 
 static void executeMacro(String keyName) {
@@ -3306,8 +3501,8 @@ static void executeMacro(String keyName) {
     // 做不到，hex 走一遍协议才能把 UTF-8 字节原样送到主机。
     if (keyName == "ME") {
         LOG_PORT.println("[ME] key pressed");
-        if (FFat.exists("/me_hex.txt")) {
-            File f = FFat.open("/me_hex.txt", FILE_READ);
+        if (SPIFFS.exists("/me_hex.txt")) {
+            File f = SPIFFS.open("/me_hex.txt", FILE_READ);
             if (f) {
                 LOG_PORT.printf("[ME] sending %u bytes\n", (unsigned)f.size());
                 Keyboard.print("[HEXS]");
@@ -3337,7 +3532,8 @@ static void executeMacro(String keyName) {
     snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, keyName.c_str());
     String macroData = preferences.getString(pKey, "");
     if (macroData.length() == 0) return;
-    if (macroData.startsWith("SEQ:")) executeSequenceAction(macroData.substring(4));
+    if (macroData.startsWith("SEQ:"))      executeSequenceAction(macroData.substring(4));
+    else if (macroData.startsWith("CMB:")) executeComboAction(macroData.substring(4));
 }
 
 static void executeGlobalKey(String gKey) {
@@ -3347,12 +3543,24 @@ static void executeGlobalKey(String gKey) {
         else if (gKey == "MB") switchProfile(1);
         return;
     }
-    if (val.startsWith("SW:")) {
-        int plusIdx = val.indexOf('+');
-        String swPart = (plusIdx != -1) ? val.substring(3, plusIdx) : val.substring(3);
+    if (val == "NONE") return;      // 网页"清除全局配置"写进来的哨兵值
+
+    // 网页的 payload 语法（见 s3-setting.html buildGlobalkPayload）：
+    //   NONE | SW:<方案> | SW:<方案>+SEQ:<文本> | SW:<方案>+CMB:<码点,码点>
+    //   （也可能只有后半段：SEQ:<文本> / CMB:<码点,码点>）
+    // <方案> 是 0~3，或 NEXT = 循环切到下一个方案。
+    String rest = val;
+    if (rest.startsWith("SW:")) {
+        rest = rest.substring(3);
+        int plusIdx = rest.indexOf('+');
+        String swPart = (plusIdx != -1) ? rest.substring(0, plusIdx) : rest;
         if (swPart == "NEXT") switchProfile((currentProfile + 1) % TOTAL_PROFILES);
         else if (swPart != "NONE") switchProfile(swPart.toInt());
+
+        if (plusIdx == -1) return;
+        rest = rest.substring(plusIdx + 1);
     }
+    executeActionPayload(rest);
 }
 
 // ===========================
@@ -3872,16 +4080,32 @@ static void handleCommand(const String& cmd) {
         triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
     }
     // SET:name:value - Macro definition
+    //
+    // 名字里已经带方案号时**不能再套一层**。网页发的是 `SET:p0_M1:SEQ:…`
+    // （方案号由用户在下拉框里选，见 s3-setting.html 的 activeProfile），
+    // 而这里以前无条件再拼一遍 currentProfile，于是存进去的键是 `p0_p0_M1`，
+    // 而 executeMacro() 读的是 `p0_M1` —— 存的键和读的键永远对不上，
+    // 表现就是"网页里保存的宏/序列，按键盘上的 M1-M12 毫无反应"。
+    // 只有不带方案前缀的老写法（`SET:M1:…`）才补当前方案。
     else if (cmd.startsWith("SET:")) {
         String params = cmd.substring(4);
         int colonIdx = params.indexOf(':');
         if (colonIdx > 0) {
             String name = params.substring(0, colonIdx);
             String value = params.substring(colonIdx + 1);
-            char pKey[32];
-            snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, name.c_str());
-            preferences.putString(pKey, value);
-            triggerHud("已写入宏", name.c_str(), lv_color_hex(CLR_GREEN));
+            bool hasProfPrefix = (name.length() >= 3 && name[0] == 'p' &&
+                                  name[1] >= '0' && name[1] <= '9' && name[2] == '_');
+            String storeKey = name;
+            if (!hasProfPrefix) {
+                char pKey[32];
+                snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, name.c_str());
+                storeKey = pKey;
+            }
+            preferences.putString(storeKey.c_str(), value);
+            char info[40];
+            snprintf(info, sizeof(info), "%s / 方案%u", name.c_str(),
+                     (unsigned)(currentProfile + 1));
+            triggerHud("已写入宏", info, lv_color_hex(CLR_GREEN));
         }
     }
     // GSET:name:value - Global key assignment
@@ -3901,7 +4125,7 @@ static void handleCommand(const String& cmd) {
     // 按下 ME 键时才由 executeMacro("ME") 读出来发给电脑（见那里的 [HEXS] 协议），
     // 所以下发阶段一个字都不往主机打 —— 蓝牙发消息 ≠ 立刻在电脑上打字。
     else if (cmd == "ME_START") {
-        File f = FFat.open("/me_hex.txt", FILE_WRITE);
+        File f = SPIFFS.open("/me_hex.txt", FILE_WRITE);
         if (f) f.close();
         meHexBytes = 0;
         LOG_PORT.println("[ME] START");
@@ -3909,14 +4133,14 @@ static void handleCommand(const String& cmd) {
     else if (cmd.startsWith("ME_DATA:")) {
         String hex = cmd.substring(8);
         if (hex.length() == 0) return;
-        File f = FFat.open("/me_hex.txt", FILE_APPEND);
+        File f = SPIFFS.open("/me_hex.txt", FILE_APPEND);
         if (f) { f.print(hex); f.close(); meHexBytes += hex.length(); }
-        else LOG_PORT.println("[ME] append FAILED (FFat open failed)");
+        else LOG_PORT.println("[ME] append FAILED (SPIFFS open failed)");
     }
     else if (cmd == "ME_END") {
         size_t sz = 0;
-        if (FFat.exists("/me_hex.txt")) {
-            File f = FFat.open("/me_hex.txt", FILE_READ);
+        if (SPIFFS.exists("/me_hex.txt")) {
+            File f = SPIFFS.open("/me_hex.txt", FILE_READ);
             if (f) { sz = f.size(); f.close(); }
         }
         LOG_PORT.printf("[ME] END onDisk=%u appended=%u\n", (unsigned)sz, (unsigned)meHexBytes);
@@ -3941,7 +4165,7 @@ static void handleCommand(const String& cmd) {
             snprintf(b, sizeof(b), "%02X", (unsigned char)text[i]);
             hex += b;
         }
-        File f = FFat.open("/me_hex.txt", FILE_WRITE);
+        File f = SPIFFS.open("/me_hex.txt", FILE_WRITE);
         if (f) { f.print(hex); f.close(); }
         char info[32];
         snprintf(info, sizeof(info), "%u 字已存", (unsigned)text.length());
@@ -4370,12 +4594,15 @@ static void updateDynamicElements(void) {
              ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
     snprintf(num_buf, sizeof(num_buf), "%u", totalKeyCount);
 
-    // 顶部条的锁灯 + 方案名（6 种风格共用）
+    // 顶部条的锁灯 + 方案指示（6 种风格共用）
     const bool locks[3] = { numLock, capsLock, scrollLock };
     for (int i = 0; i < 3; i++) {
         setBgColor(topLockDot[i], locks[i] ? topLockOn[i] : CLR_STROKE);
     }
-    setText(topProfileLbl, profileNamesCN[currentProfile]);
+
+    // 方案指示：序号常显，系统图标只有方案 1(Windows) / 2(macOS) 才有；
+    // 3/4 不是按系统分的方案，光看序号即可。
+    updateTopBarProfile();
 
     switch (currentDispMode) {
         case DISP_MODE_GEEK: {
@@ -4820,8 +5047,18 @@ void setup() {
     pService->start();
     BLEDevice::startAdvertising();
 
-    // FFat
-    FFat.begin(true);
+    // 文件系统：必须用 SPIFFS，不能再用 FFat。
+    //
+    // 板子默认分区表（platformio.ini 没配 board_build.partitions，板定义给的是
+    // default_8MB.csv；Arduino IDE 那边是 default.csv）里**只有 spiffs 分区，
+    // 没有 ffat 分区**。FFat.begin() 会去 find 一个 subtype=fat 的分区，
+    // 找不到就直接 return false（串口里那句 "No fat partition found on flash"），
+    // 于是后面每一次 FFat.open() 都返回一个无效的 File：
+    //   · ME 文本写不进 /me_hex.txt → 按 ME 键报"尚未设置"、网页下发后 HUD 报"存入失败"
+    //   · 壁纸解出来的图写不进 /logo.bin → 当次能显示，一重启就没了
+    // SPIFFS 挂的就是表里那个 spiffs 分区（1.5MB），够放 115KB 的 logo + 一行文本，
+    // 而且不用改分区表 —— 改分区表会挪动 app 分区、有抹掉 NVS 里宏/映射的风险。
+    SPIFFS.begin(true);
 
     // 开机把上次传的壁纸从盘上读回 PSRAM，重启不用让网页再传一遍
     loadWallpaperFromDisk();
