@@ -77,16 +77,26 @@ void lvgl_driver_init(Adafruit_ST7789* tft_ptr) {
     // 1. LVGL 自身初始化（必须在任何 lv_xxx API 前调用）
     lv_init();
 
-    // 2. 分配 framebuffer 到 PSRAM（heap_caps_malloc 优先用 PSRAM，失败回落普通 heap）
+    // 2. 分配 framebuffer。
+    //
+    // **必须留在内部 DRAM**：LVGL 刷屏时把这块缓冲交给 SPI 做 DMA 取像素，
+    // 放 PSRAM 会引入缓存同步/DMA 能力上的坑，不值得为这 19.2KB 冒险。
+    // 要往 PSRAM 腾空间应该腾 LVGL 的**对象池**（lv_conf.h 的 LV_MEM_CUSTOM，
+    // 那块 LVGL 只做普通读写、不做 DMA），已经这么配了。
+    //
+    // MALLOC_CAP_DMA 是必须的：SPI 的 GDMA 只能从 DMA 能力内存取数。
     size_t buf_bytes = 240 * BUF_LINES * sizeof(lv_color_t);
-    buf_1 = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    buf_1 = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (buf_1 == NULL) {
-        // PSRAM 没开 / 不够 → 回退到普通 heap
         buf_1 = (lv_color_t*)malloc(buf_bytes);
-        Serial.printf("[LVGL] WARN: PSRAM alloc failed, falling back to internal heap (size=%u)\n", buf_bytes);
+        Serial.printf("[LVGL] WARN: internal DMA alloc failed, plain malloc (size=%u)\n", buf_bytes);
     } else {
-        Serial.printf("[LVGL] framebuffer @ PSRAM, size=%u bytes\n", buf_bytes);
+        Serial.printf("[LVGL] framebuffer @ internal DMA, size=%u bytes\n", buf_bytes);
     }
+    // PSRAM 状态：对象池靠它，开机诊断里也会显示
+    Serial.printf("[LVGL] PSRAM total=%u bytes, free=%u bytes\n",
+                  (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     if (buf_1 == NULL) {
         Serial.println("[LVGL] FATAL: no memory for framebuffer");
         return;

@@ -1,7 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-从源码中提取所有用到的字符（含中文），用 simsun.ttc 生成精简子集 LVGL 字体。
-输出: src/lv_font_simsun_16_cjk.c  (16px, bpp=4, 只含实际用到的字)
+从源码中提取所有用到的字符（含中文），用 simhei.ttf 生成精简子集 LVGL 字体。
+输出: src/lv_font_simsun_16_cjk.c  (16px, bpp=4, ASCII + 实际用到的汉字)
+
+⚠ 踩坑记录（别再改回去）
+------------------------
+这版 lv_font_conv 的 `--symbols` **不读文件**，它的参数值会被当成"字面字符"
+直接塞进字集（见 node_modules/lv_font_conv/lib/collect_font_data.js:73
+的 `ranger.add_symbols(source_path, item.symbols)`）。
+早期版本这里写的是 `--symbol charset.txt`，等于把那条文件路径的每个字符
+当成要生成的字形，charset.txt 里的 332 个汉字一个都没进去 ——
+产出的字体 cmap 只剩 0x20-0x7E，界面上所有中文全是空白/豆腐块。
+
+所以改成把码点显式列成 `-r` 区间。区间参数是纯 ASCII，
+不会在 Windows 的 cmd 转发 + GBK 代码页这一路上被改写，稳。
 """
 import os, re, sys, subprocess
 
@@ -11,7 +23,15 @@ OUT_C = os.path.join(SRC, "lv_font_simsun_16_cjk.c")
 OUT_TXT = os.path.join(SRC, "charset.txt")
 
 # ---- 1. 收集字符 ----
-text = open(INO, encoding="utf-8", errors="ignore").read()
+# 注意：要扫 **所有源文件**，不只是 .ino。crash_trace.h 这类头文件里也有
+# 中文字面量（开机诊断的阶段名表就放在头里），只扫 .ino 会漏字，
+# 结果就是界面上出现豆腐块 —— 上一轮"重启原因"后面两个字乱码就是这么来的。
+src_files = [INO] + sorted(
+    os.path.join(SRC, f) for f in os.listdir(SRC) if f.endswith(".h")
+)
+text = ""
+for p in src_files:
+    text += open(p, encoding="utf-8", errors="ignore").read()
 lits = re.findall(r'"((?:[^"\\]|\\.)*)"', text)
 chars = set()
 for s in lits:
@@ -44,14 +64,34 @@ for c in range(0x20, 0x7F):
     chars.add(chr(c))
 
 # 常用中文标点
-for ch in "，。、；：？！（）【】《》“”‘’…—·《》「」":
+for ch in "，。、；：？！（）【】《》“”‘’…—·「」":
     chars.add(ch)
 
 cs = "".join(sorted(chars))
 open(OUT_TXT, "w", encoding="utf-8").write(cs)
-print("charset size:", len(cs))
 
-# ---- 2. 调 lv_font_conv (npm 版) 生成 ----
+codes = sorted(ord(c) for c in cs)
+n_cjk = len([c for c in codes if c > 0x7F])
+print("charset size: %d  (ASCII %d / non-ASCII %d)" % (len(codes), len(codes) - n_cjk, n_cjk))
+
+# ---- 2. 把码点压成 -r 区间参数（纯 ASCII）----
+def to_ranges(sorted_codes):
+    """相邻码点合并成区间，单个码点写成一个点。输出纯 ASCII。"""
+    parts, i = [], 0
+    while i < len(sorted_codes):
+        start = sorted_codes[i]
+        end = start
+        while i + 1 < len(sorted_codes) and sorted_codes[i + 1] == end + 1:
+            i += 1
+            end = sorted_codes[i]
+        parts.append("0x%X" % start if start == end else "0x%X-0x%X" % (start, end))
+        i += 1
+    return ",".join(parts)
+
+RANGES = to_ranges(codes)
+print("range spec: %d entries, %d chars" % (RANGES.count(",") + 1, len(RANGES)))
+
+# ---- 3. 调 lv_font_conv (npm 版) 生成 ----
 # lv_font_conv 不支持 .ttc (TrueType Collection)，用单字重 ttf
 TTC = r"C:\Windows\Fonts\simhei.ttf"
 CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "node_modules", ".bin", "lv_font_conv.cmd")
@@ -64,11 +104,12 @@ cmd = [
     "--lv-include", "lvgl.h",
     "--no-compress",
     "--no-kerning",
-    "--symbol", OUT_TXT,
-    "-r", "0x20-0x7F",
+    # 汉字字形缺失时回落到 Montserrat 14，避免再冒出豆腐块
+    "--lv-fallback", "lv_font_montserrat_14",
+    "-r", RANGES,
     "-o", OUT_C,
 ]
-print("running:", " ".join(cmd))
+print("running:", " ".join(cmd)[:200], "...")
 r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 print(r.stdout[-3000:])
 print(r.stderr[-3000:])
@@ -79,4 +120,6 @@ if r.returncode == 0:
     open(OUT_C, "w", encoding="utf-8", newline="\n").write(txt)
     print("patched .user_data for LVGL 8.4")
     print("OK, size =", os.path.getsize(OUT_C))
+else:
+    print("FAILED rc =", r.returncode)
 sys.exit(r.returncode)

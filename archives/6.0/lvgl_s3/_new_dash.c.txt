@@ -1,0 +1,392 @@
+// ===========================
+// 主屏通用：顶部状态条
+// ===========================
+// 三颗锁状态灯 + 方案名，6 种风格共用。灯点用 topLockDot[] 存起来，
+// updateDynamicElements() 统一驱动，避免每种风格各写一份。
+static void dashTopBar(lv_obj_t* parent) {
+    lv_obj_t* bar = lv_obj_create(parent);
+    lv_obj_set_size(bar, 240, 28);
+    lv_obj_set_pos(bar, 0, 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bar, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    const char* names[3] = { "NUM", "CAP", "SCR" };
+    const uint32_t onColors[3] = { CLR_GREEN, CLR_ACCENT, CLR_AMBER };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* d = lv_obj_create(bar);
+        lv_obj_set_size(d, 7, 7);
+        lv_obj_align(d, LV_ALIGN_LEFT_MID, 14 + i * 44, 0);
+        lv_obj_set_style_bg_color(d, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_border_width(d, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+        topLockDot[i] = d;
+        topLockOn[i] = onColors[i];
+
+        lv_obj_t* t = lv_label_create(bar);
+        mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+        lv_label_set_text(t, names[i]);
+        lv_obj_align(t, LV_ALIGN_LEFT_MID, 25 + i * 44, 0);
+    }
+
+    topProfileLbl = lv_label_create(bar);
+    mkLabel(topProfileLbl, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(topProfileLbl, profileNamesCN[currentProfile]);
+    lv_obj_align(topProfileLbl, LV_ALIGN_RIGHT_MID, -12, 0);
+}
+
+// 小统计卡：标题 + 数值
+static lv_obj_t* statCard(lv_obj_t* parent, int cx, const char* cap,
+                          const lv_font_t* vf, uint32_t vcolor) {
+    lv_obj_t* c = lv_obj_create(parent);
+    lv_obj_set_size(c, 72, 62);
+    lv_obj_align(c, LV_ALIGN_CENTER, cx, 40);
+    mkCard(c, CLR_SURFACE, 10);
+
+    lv_obj_t* t = lv_label_create(c);
+    mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(t, cap);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t* v = lv_label_create(c);
+    mkLabel(v, vf, vcolor);
+    lv_label_set_text(v, "--");
+    lv_obj_align(v, LV_ALIGN_BOTTOM_MID, 0, -8);
+    return v;
+}
+
+// ===========================
+// 构建：极客仪表盘
+// ===========================
+static void build_style_geek(void) {
+    if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
+
+    gk_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(gk_bg, 240, 240);
+    lv_obj_set_pos(gk_bg, 0, 0);
+    lv_obj_set_style_bg_color(gk_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(gk_bg, 0, LV_PART_MAIN);
+
+    dashTopBar(gk_bg);
+
+    // 主时钟
+    gk_lbl_clock = lv_label_create(gk_bg);
+    mkLabel(gk_lbl_clock, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(gk_lbl_clock, "--:--");
+    lv_obj_align(gk_lbl_clock, LV_ALIGN_TOP_MID, 0, 44);
+
+    // 日期
+    gk_lbl_date = lv_label_create(gk_bg);
+    mkLabel(gk_lbl_date, &lv_font_montserrat_14, CLR_TEXT_DIM);
+    lv_label_set_text(gk_lbl_date, "----/--/-- --");
+    lv_obj_align(gk_lbl_date, LV_ALIGN_TOP_MID, 0, 104);
+
+    // 时钟下方一条强调线，视觉上把主区和数据区分开
+    lv_obj_t* line = lv_obj_create(gk_bg);
+    lv_obj_set_size(line, 40, 2);
+    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 128);
+    lv_obj_set_style_bg_color(line, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(line, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 三张统计卡
+    gk_lbl_temp = statCard(gk_bg, -76, "TEMP",  &lv_font_montserrat_20, CLR_AMBER);
+    gk_lbl_hum  = statCard(gk_bg,   0, "HUMI",  &lv_font_montserrat_20, CLR_ACCENT);
+    gk_lbl_keys = statCard(gk_bg,  76, "KEYS",  &lv_font_montserrat_20, CLR_VIOLET);
+}
+
+// ===========================
+// 构建：大时钟
+// ===========================
+static void build_style_bigclock(void) {
+    if (bc_bg) { lv_obj_del(bc_bg); bc_bg = nullptr; }
+
+    bc_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(bc_bg, 240, 240);
+    lv_obj_set_pos(bc_bg, 0, 0);
+    lv_obj_set_style_bg_color(bc_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(bc_bg, 0, LV_PART_MAIN);
+
+    dashTopBar(bc_bg);
+
+    bc_lbl_time = lv_label_create(bc_bg);
+    mkLabel(bc_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(bc_lbl_time, "--:--");
+    lv_obj_align(bc_lbl_time, LV_ALIGN_CENTER, 0, -18);
+
+    // 强调线
+    lv_obj_t* line = lv_obj_create(bc_bg);
+    lv_obj_set_size(line, 56, 3);
+    lv_obj_align(line, LV_ALIGN_CENTER, 0, 22);
+    lv_obj_set_style_bg_color(line, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(line, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+    bc_lbl_date = lv_label_create(bc_bg);
+    mkLabel(bc_lbl_date, &lv_font_montserrat_16, CLR_TEXT_DIM);
+    lv_label_set_text(bc_lbl_date, "----/--/-- --");
+    lv_obj_align(bc_lbl_date, LV_ALIGN_CENTER, 0, 44);
+
+    // 底部方案胶囊
+    lv_obj_t* chip = lv_obj_create(bc_bg);
+    lv_obj_set_size(chip, 116, 24);
+    lv_obj_align(chip, LV_ALIGN_BOTTOM_MID, 0, -22);
+    mkChip(chip, CLR_SURFACE, CLR_ACCENT, 12);
+    lv_obj_t* cl = lv_label_create(chip);
+    mkLabel(cl, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(cl, profileNamesCN[currentProfile]);
+    lv_obj_center(cl);
+}
+
+// ===========================
+// 构建：信息面板
+// ===========================
+static void build_style_info_panel(void) {
+    if (ip_bg) { lv_obj_del(ip_bg); ip_bg = nullptr; }
+
+    ip_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(ip_bg, 240, 240);
+    lv_obj_set_pos(ip_bg, 0, 0);
+    lv_obj_set_style_bg_color(ip_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(ip_bg, 0, LV_PART_MAIN);
+
+    dashTopBar(ip_bg);
+
+    // 时钟 + 日期主卡
+    lv_obj_t* card = lv_obj_create(ip_bg);
+    lv_obj_set_size(card, 212, 84);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    mkCard(card, CLR_SURFACE, 12);
+
+    ip_lbl_clock = lv_label_create(card);
+    mkLabel(ip_lbl_clock, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(ip_lbl_clock, "--:--");
+    lv_obj_align(ip_lbl_clock, LV_ALIGN_CENTER, 0, -10);
+
+    ip_lbl_date = lv_label_create(card);
+    mkLabel(ip_lbl_date, &lv_font_montserrat_14, CLR_TEXT_DIM);
+    lv_label_set_text(ip_lbl_date, "----/--/--");
+    lv_obj_align(ip_lbl_date, LV_ALIGN_CENTER, 0, 26);
+
+    // 三个锁状态胶囊
+    const char* lockNames[3] = { "NUM", "CAPS", "SCR" };
+    lv_obj_t* dots[3] = { nullptr, nullptr, nullptr };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* c = lv_obj_create(ip_bg);
+        lv_obj_set_size(c, 66, 30);
+        lv_obj_align(c, LV_ALIGN_TOP_MID, (i - 1) * 70, 128);
+        mkChip(c, CLR_SURFACE, CLR_TEXT_MUTE, 8);
+
+        lv_obj_t* d = lv_obj_create(c);
+        lv_obj_set_size(d, 8, 8);
+        lv_obj_align(d, LV_ALIGN_LEFT_MID, 8, 0);
+        lv_obj_set_style_bg_color(d, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_border_width(d, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+        dots[i] = d;
+
+        lv_obj_t* t = lv_label_create(c);
+        mkLabel(t, &lv_font_montserrat_12, CLR_TEXT_MUTE);
+        lv_label_set_text(t, lockNames[i]);
+        lv_obj_align(t, LV_ALIGN_RIGHT_MID, -8, 0);
+    }
+    ip_circle_num = dots[0]; ip_circle_caps = dots[1]; ip_circle_scr = dots[2];
+
+    // 底部：最近按键 + 击键数
+    lv_obj_t* card2 = lv_obj_create(ip_bg);
+    lv_obj_set_size(card2, 212, 54);
+    lv_obj_align(card2, LV_ALIGN_BOTTOM_MID, 0, -8);
+    mkCard(card2, CLR_SURFACE, 12);
+
+    lv_obj_t* cap = lv_label_create(card2);
+    mkLabel(cap, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(cap, "LAST KEY");
+    lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 14, 8);
+
+    ip_lbl_lastkey = lv_label_create(card2);
+    mkLabel(ip_lbl_lastkey, &lv_font_montserrat_20, CLR_ACCENT);
+    lv_label_set_text(ip_lbl_lastkey, "-");
+    lv_obj_align(ip_lbl_lastkey, LV_ALIGN_BOTTOM_LEFT, 14, -6);
+
+    lv_obj_t* cap2 = lv_label_create(card2);
+    mkLabel(cap2, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(cap2, "KEYS");
+    lv_obj_align(cap2, LV_ALIGN_TOP_RIGHT, -14, 8);
+
+    ip_lbl_keys = lv_label_create(card2);
+    mkLabel(ip_lbl_keys, &lv_font_montserrat_20, CLR_VIOLET);
+    lv_label_set_text(ip_lbl_keys, "0");
+    lv_obj_align(ip_lbl_keys, LV_ALIGN_BOTTOM_RIGHT, -14, -6);
+}
+
+// ===========================
+// 构建：击键监控
+// ===========================
+static void build_style_keymon(void) {
+    if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
+
+    km_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(km_bg, 240, 240);
+    lv_obj_set_pos(km_bg, 0, 0);
+    lv_obj_set_style_bg_color(km_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(km_bg, 0, LV_PART_MAIN);
+
+    dashTopBar(km_bg);
+
+    km_lbl_title = lv_label_create(km_bg);
+    mkLabel(km_lbl_title, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(km_lbl_title, "最近按键");
+    lv_obj_align(km_lbl_title, LV_ALIGN_TOP_MID, 0, 44);
+
+    // 最近按键：走 getKeyName()，显示 Space / Enter / A 而不是 20 / 1D / 04
+    km_lbl_lastkey = lv_label_create(km_bg);
+    mkLabel(km_lbl_lastkey, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(km_lbl_lastkey, "-");
+    lv_obj_set_width(km_lbl_lastkey, 220);
+    lv_label_set_long_mode(km_lbl_lastkey, LV_LABEL_LONG_DOT);
+    lv_label_set_text_static(km_lbl_lastkey, "-");
+    lv_obj_align(km_lbl_lastkey, LV_ALIGN_TOP_MID, 0, 66);
+
+    // 击键统计卡
+    lv_obj_t* card = lv_obj_create(km_bg);
+    lv_obj_set_size(card, 212, 58);
+    lv_obj_align(card, LV_ALIGN_BOTTOM_MID, 0, -34);
+    mkCard(card, CLR_SURFACE, 12);
+
+    km_lbl_keys = lv_label_create(card);
+    mkLabel(km_lbl_keys, &lv_font_montserrat_28, CLR_VIOLET);
+    lv_label_set_text(km_lbl_keys, "0");
+    lv_obj_align(km_lbl_keys, LV_ALIGN_LEFT_MID, 16, 0);
+
+    lv_obj_t* unit = lv_label_create(card);
+    mkLabel(unit, &lv_font_sontserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(unit, "TOTAL KEYS");
+    lv_obj_align(unit, LV_ALIGN_RIGHT_MID, -16, 0);
+
+    km_lbl_profile = lv_label_create(km_bg);
+    mkLabel(km_lbl_profile, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(km_lbl_profile, profileNamesCN[currentProfile]);
+    lv_obj_align(km_lbl_profile, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+// ===========================
+// 构建：律动
+// ===========================
+static void build_style_rhythm(void) {
+    if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
+
+    rh_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(rh_bg, 240, 240);
+    lv_obj_set_pos(rh_bg, 0, 0);
+    lv_obj_set_style_bg_color(rh_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(rh_bg, 0, LV_PART_MAIN);
+
+    dashTopBar(rh_bg);
+
+    // 频谱容器，柱子从底往上长
+    lv_obj_t* stage = lv_obj_create(rh_bg);
+    lv_obj_set_size(stage, 236, 110);
+    lv_obj_align(stage, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_opa(stage, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(stage, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(stage, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(stage, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 24; i++) {
+        rh_bars[i] = lv_obj_create(stage);
+        lv_obj_set_size(rh_bars[i], 6, 4);
+        lv_obj_set_pos(rh_bars[i], 2 + i * 10, 106);
+        lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(CLR_SURFACE_2), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(rh_bars[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(rh_bars[i], 3, LV_PART_MAIN);
+        lv_obj_set_style_border_width(rh_bars[i], 0, LV_PART_MAIN);
+        lv_obj_clear_flag(rh_bars[i], LV_OBJ_FLAG_SCROLLABLE);
+        rhythmBars[i] = 0;
+    }
+
+    // 基线
+    lv_obj_t* base = lv_obj_create(rh_bg);
+    lv_obj_set_size(base, 224, 1);
+    lv_obj_align(base, LV_ALIGN_TOP_MID, 0, 148);
+    lv_obj_set_style_bg_color(base, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(base, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(base, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(base, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* cap = lv_label_create(rh_bg);
+    mkLabel(cap, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(cap, "击键律动");
+    lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 156);
+
+    // 击键数卡
+    lv_obj_t* card = lv_obj_create(rh_bg);
+    lv_obj_set_size(card, 212, 44);
+    lv_obj_align(card, LV_ALIGN_BOTTOM_MID, 0, -8);
+    mkCard(card, CLR_SURFACE, 12);
+
+    rh_lbl_keys = lv_label_create(card);
+    mkLabel(rh_lbl_keys, &lv_font_montserrat_20, CLR_VIOLET);
+    lv_label_set_text(rh_lbl_keys, "0");
+    lv_obj_align(rh_lbl_keys, LV_ALIGN_LEFT_MID, 16, 0);
+
+    lv_obj_t* unit = lv_label_create(card);
+    mkLabel(unit, &lv_font_sontserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(unit, "TOTAL KEYS");
+    lv_obj_align(unit, LV_ALIGN_RIGHT_MID, -16, 0);
+}
+
+// ===========================
+// 构建：壁纸模式
+// ===========================
+static void build_style_wallpaper(void) {
+    if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
+
+    wp_bg = lv_obj_create(ensureMainScreen());
+    lv_obj_set_size(wp_bg, 240, 240);
+    lv_obj_set_pos(wp_bg, 0, 0);
+    lv_obj_set_style_bg_color(wp_bg, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(wp_bg, 0, LV_PART_MAIN);
+
+    // 壁纸铺满
+    wp_img = lv_img_create(wp_bg);
+    lv_obj_set_size(wp_img, 240, 240);
+    lv_obj_set_pos(wp_img, 0, 0);
+    lv_obj_set_style_bg_color(wp_img, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
+    lv_obj_set_style_border_width(wp_img, 0, LV_PART_MAIN);
+    // 没上传壁纸时给一块深色底，不至于全黑
+    lv_img_set_src(wp_img, NULL);
+
+    // 压一层半透明黑，保证上面的字在任意壁纸上都读得出来
+    lv_obj_t* scrim = lv_obj_create(wp_bg);
+    lv_obj_set_size(scrim, 240, 240);
+    lv_obj_set_pos(scrim, 0, 0);
+    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scrim, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 时钟叠加在正中
+    lv_obj_t* plate = lv_obj_create(wp_bg);
+    lv_obj_set_size(plate, 168, 64);
+    lv_obj_align(plate, LV_ALIGN_CENTER, 0, 0);
+    mkCard(plate, CLR_SURFACE_2, 12);
+    lv_obj_set_style_bg_opa(plate, LV_OPA_80, LV_PART_MAIN);
+
+    wp_lbl_time = lv_label_create(plate);
+    mkLabel(wp_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(wp_lbl_time, "--:--");
+    lv_obj_center(wp_lbl_time);
+}

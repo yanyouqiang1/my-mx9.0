@@ -24,9 +24,19 @@
 /*====================
    内存与对象池
    ====================*/
-#define LV_MEM_SIZE             (64U * 1024U)
+// 对象池走 PSRAM（板子是 N16R8，8MB 八线 PSRAM）。
+// 之前是 LV_MEM_CUSTOM=0 + LV_MEM_SIZE=64KB —— 那 64KB 静态占着内部 DRAM，
+// 和 BLE / FFat / 19.2KB 帧缓冲 / 任务栈抢同一块 327KB，内部堆被压到很紧，
+// 这是"用一段时间自己重启"的根因之一。
+// LVGL 在这块内存里只做指针运算和普通读写、不做 DMA，放 PSRAM 安全。
+// 分配器见 lv_mem_port.h，PSRAM 不可用时自动回落 malloc。
+#define LV_MEM_CUSTOM            1
+#define LV_MEM_CUSTOM_INCLUDE    "lv_mem_port.h"
+#define LV_MEM_CUSTOM_ALLOC      lv_port_alloc
+#define LV_MEM_CUSTOM_REALLOC    lv_port_realloc
+#define LV_MEM_CUSTOM_FREE       lv_port_free
+#define LV_MEM_SIZE             (64U * 1024U)   // LV_MEM_CUSTOM=1 时不生效，保留做文档
 #define LV_MEM_ADR              0
-#define LV_MEM_CUSTOM            0
 #define LV_USE_BUILTIN_MALLOC    1
 #define LV_MEM_MONITOR          0
 
@@ -129,12 +139,18 @@
 #define LV_USE_FONT_COMPRESSED    0
 #define LV_USE_FONT_SUBPX         0
 
-// 思源宋体 SimSun：包含 1000+ 常用 CJK 汉字（含星期用字）
+// 中文子集字体（黑体 16px，ASCII + 源码里实际用到的 300 个汉字）
+// 由 gen_font.py 生成，缺失字形回落到 Montserrat 14
 #define LV_FONT_SIMSUN_16_CJK    1
 
-// 使用 LVGL 内置 Montserrat 字体作为默认字体（ASCII 全覆盖）
-#define LV_FONT_CUSTOM_DECLARE  /* 无自定义字体 */
-#define LV_FONT_DEFAULT         &lv_font_montserrat_14
+// 把自定义字体声明给整个 LVGL（lv_font.h 会展开这一行），
+// 否则 lvgl_s3.ino 里引用 &lv_font_simsun_16_cjk 会编译不过
+#define LV_FONT_CUSTOM_DECLARE  extern const lv_font_t lv_font_simsun_16_cjk;
+
+// 默认字体用中文字体：凡是没显式指定字体的控件（theme 带的、以及漏写的）
+// 都从它取字，漏配字体的地方就再也不会显示成豆腐块/空白。
+// 它自带 ASCII，所以英文数字一样正常。
+#define LV_FONT_DEFAULT         &lv_font_simsun_16_cjk
 
 /*====================
    数学

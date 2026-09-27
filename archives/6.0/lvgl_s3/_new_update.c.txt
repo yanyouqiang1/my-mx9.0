@@ -1,0 +1,92 @@
+static void updateDynamicElements(void) {
+    time_t now = time(nullptr);
+    struct tm* ti = localtime(&now);
+    if (!ti || ti->tm_year < 124) return;
+
+    static char time_buf[16], date_buf[32], num_buf[24];
+    static const char* WEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+    strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
+    snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
+             ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+    snprintf(num_buf, sizeof(num_buf), "%u", totalKeyCount);
+
+    // 顶部条的锁灯 + 方案名（6 种风格共用）
+    const bool locks[3] = { numLock, capsLock, scrollLock };
+    for (int i = 0; i < 3; i++) {
+        if (topLockDot[i]) {
+            lv_obj_set_style_bg_color(topLockDot[i],
+                lv_color_hex(locks[i] ? topLockOn[i] : CLR_STROKE), LV_PART_MAIN);
+        }
+    }
+    setText(topProfileLbl, profileNamesCN[currentProfile]);
+
+    switch (currentDispMode) {
+        case DISP_MODE_GEEK: {
+            setText(gk_lbl_clock, time_buf);
+            setText(gk_lbl_date, date_buf);
+
+            static char tbuf[16], hbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
+            snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
+            setText(gk_lbl_temp, tbuf);
+            setText(gk_lbl_hum, hbuf);
+            setText(gk_lbl_keys, num_buf);
+            break;
+        }
+
+        case DISP_MODE_BIG_CLOCK: {
+            setText(bc_lbl_time, time_buf);
+            setText(bc_lbl_date, date_buf);
+            break;
+        }
+
+        case DISP_MODE_INFO_PANEL: {
+            setText(ip_lbl_clock, time_buf);
+            setText(ip_lbl_date, date_buf);
+            setText(ip_lbl_keys, num_buf);
+            setText(ip_lbl_lastkey, lastKeyPressed);
+            break;
+        }
+
+        case DISP_MODE_KEY_MON: {
+            setText(km_lbl_lastkey, lastKeyPressed);
+            setText(km_lbl_keys, num_buf);
+            setText(km_lbl_profile, profileNamesCN[currentProfile]);
+            break;
+        }
+
+        case DISP_MODE_RHYTHM: {
+            // 柱子从基线往上长：高度 4~100，颜色随高度从青渐变到紫
+            for (int i = 0; i < 24; i++) {
+                if (!rh_bars[i]) continue;
+                uint8_t hgt = rhythmBars[i];
+                if (hgt > 0) rhythmBars[i] = hgt - 1;
+
+                uint8_t v = (hgt > 25) ? 25 : hgt;
+                int barH = 4 + v * 4;
+                lv_obj_set_size(rh_bars[i], 6, barH);
+                lv_obj_set_pos(rh_bars[i], 2 + i * 10, 110 - barH);
+
+                if (hgt == 0) {
+                    lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(CLR_SURFACE_2), LV_PART_MAIN);
+                } else {
+                    // 颜色随高度在 青(0x22D3EE) → 紫(0xA78BFA) 之间线性插值
+                    uint16_t t = (uint16_t)(v * 255 / 25);
+                    uint8_t r = (uint8_t)(0x22 + (0xA7 - 0x22) * t / 255);
+                    uint8_t g = (uint8_t)(0xD3 + (0x8B - 0xD3) * t / 255);
+                    uint8_t b = (uint8_t)(0xEE + (0xFA - 0xEE) * t / 255);
+                    uint32_t col = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                    lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(col), LV_PART_MAIN);
+                }
+            }
+            setText(rh_lbl_keys, num_buf);
+            break;
+        }
+
+        case DISP_MODE_WALLPAPER: {
+            setText(wp_lbl_time, time_buf);
+            break;
+        }
+    }
+}
