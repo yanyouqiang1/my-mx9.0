@@ -7,6 +7,6 @@
 - [x] Task 4: 实现设置界面 (commit 84f880a)
 - [x] Task 5: 实现宏录制 (commit 9053ea1)
 - [x] Task 6: 实现通知系统 (commit 8dcf8cc)
-- [ ] Task 7: BLE指令扩展
+- [x] Task 7: BLE指令扩展 (commit 7c0b21f)
 - [ ] Task 8: 完整测试
 
