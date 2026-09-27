@@ -160,6 +160,17 @@ static uint8_t currentDispMode = DISP_MODE_GEEK;
 static uint8_t currentMode = MODE_LIGHT;
 
 // ===========================
+// 通知系统
+// ===========================
+enum AlertType { ALERT_NONE, ALERT_RED, ALERT_GREEN, ALERT_YELLOW };
+
+#define MAX_NOTIFS 8
+static uint8_t notifCount = 0;
+static AlertType notifQueue[MAX_NOTIFS];
+static char notifTexts[MAX_NOTIFS][128];
+static lv_obj_t* scr_notif = nullptr;
+
+// ===========================
 // 全局状态
 // ===========================
 
@@ -351,6 +362,12 @@ static void showScreen(lv_obj_t* target) {
 // HUD浮层
 static lv_obj_t* scr_hud = nullptr;
 
+// 通知面板
+static lv_obj_t* notif_bg = nullptr;
+static lv_obj_t* notif_label = nullptr;
+static unsigned long notifShowMs = 0;
+static unsigned long notifStartMs = 0;
+
 // 极客仪表盘
 static lv_obj_t* gk_bg = nullptr;
 static lv_obj_t* gk_lbl_clock = nullptr;
@@ -430,6 +447,8 @@ static void scanKeyboardMatrix(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
 static void triggerHud(const char* title, const char* value, uint16_t color);
+static void pushNotification(AlertType type, const String& text);
+static void drawNotifPanel(void);
 static void showScreen(lv_obj_t* target);
 static void handleMenuSelect(void);
 static void build_settings_time(void);
@@ -1085,6 +1104,88 @@ static void triggerHud(const char* title, const char* value, lv_color_t color) {
     hud.showMs = 1500;
 
     build_hud();
+}
+
+// ===========================
+// 通知系统实现
+// ===========================
+static void pushNotification(AlertType type, const String& text) {
+    if (type == ALERT_NONE) return;
+    if (notifCount >= MAX_NOTIFS) {
+        // 移除最老的通知
+        for (int i = 0; i < notifCount - 1; i++) {
+            notifQueue[i] = notifQueue[i + 1];
+            strncpy(notifTexts[i], notifTexts[i + 1], 127);
+        }
+        notifCount--;
+    }
+
+    notifQueue[notifCount] = type;
+    strncpy(notifTexts[notifCount], text.c_str(), 127);
+    notifTexts[notifCount][127] = '\0';
+    notifCount++;
+
+    drawNotifPanel();
+}
+
+static void drawNotifPanel(void) {
+    if (notifCount == 0) {
+        if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
+        return;
+    }
+
+    // 删除旧的通知面板
+    if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
+
+    scr_notif = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(scr_notif, 220, 60);
+    lv_obj_align(scr_notif, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_radius(scr_notif, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_notif, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(scr_notif);
+
+    // 根据通知类型设置颜色
+    AlertType latestType = notifQueue[notifCount - 1];
+    uint32_t borderColor, bgColor;
+
+    switch (latestType) {
+        case ALERT_RED:
+            borderColor = 0xFF4444;
+            bgColor = 0x330000;
+            break;
+        case ALERT_GREEN:
+            borderColor = 0x44FF44;
+            bgColor = 0x003300;
+            break;
+        case ALERT_YELLOW:
+            borderColor = 0xFFFF44;
+            bgColor = 0x333300;
+            break;
+        default:
+            borderColor = CLR_CYAN;
+            bgColor = CLR_DARK;
+    }
+
+    lv_obj_set_style_bg_color(scr_notif, lv_color_hex(bgColor), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr_notif, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr_notif, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(scr_notif, lv_color_hex(borderColor), LV_PART_MAIN);
+
+    // 显示最新通知的文本
+    notif_label = lv_label_create(scr_notif);
+    lv_label_set_text(notif_label, notifTexts[notifCount - 1]);
+    lv_obj_set_style_text_font(notif_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(notif_label, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_center(notif_label);
+
+    // 通知显示时间（3秒）
+    notifStartMs = millis();
+    notifShowMs = 3000;
+}
+
+static void clearNotifications(void) {
+    notifCount = 0;
+    if (scr_notif) { lv_obj_del(scr_notif); scr_notif = nullptr; }
 }
 
 // ===========================
@@ -2066,6 +2167,29 @@ static void handleCommand(const String& cmd) {
         settimeofday(&tv, NULL);
         triggerHud("Time", "Synced", lv_color_hex(0x00FF00));
     }
+    else if (cmd.startsWith("NOTIFY:")) {
+        // NOTIFY:text -> ALERT_GREEN
+        String text = cmd.substring(7);
+        pushNotification(ALERT_GREEN, text);
+    }
+    else if (cmd.startsWith("ALERT:")) {
+        String sub = cmd.substring(6);
+        if (sub == "OFF" || sub == "CLEAR") {
+            clearNotifications();
+        }
+        else if (sub.startsWith("RED")) {
+            String text = sub.startsWith("RED:") ? sub.substring(4) : "Alert";
+            pushNotification(ALERT_RED, text);
+        }
+        else if (sub.startsWith("GREEN")) {
+            String text = sub.startsWith("GREEN:") ? sub.substring(6) : "Alert";
+            pushNotification(ALERT_GREEN, text);
+        }
+        else if (sub.startsWith("YELLOW")) {
+            String text = sub.startsWith("YELLOW:") ? sub.substring(7) : "Alert";
+            pushNotification(ALERT_YELLOW, text);
+        }
+    }
     else if (cmd == "BTN:KNOB") {
         if (currentSysMode == SYS_MODE_MENU) {
             // 菜单选择
@@ -2495,6 +2619,17 @@ void loop() {
     if (hud.active && millis() - hud.startMs > hud.showMs) {
         hud.active = false;
         if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
+    }
+
+    // 通知消失（自动移除最老的通知）
+    if (notifCount > 0 && millis() - notifStartMs > notifShowMs) {
+        // 移除最老的通知
+        for (int i = 0; i < notifCount - 1; i++) {
+            notifQueue[i] = notifQueue[i + 1];
+            strncpy(notifTexts[i], notifTexts[i + 1], 127);
+        }
+        notifCount--;
+        drawNotifPanel();
     }
 
     // LVGL
