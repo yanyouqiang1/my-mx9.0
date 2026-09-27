@@ -222,9 +222,26 @@ static bool oldDeviceConnected = false;
 static unsigned long lastPingTime = 0;
 
 // ===========================
-// LVGL 对象
+// LVGL Screen 管理
 // ===========================
 static lv_obj_t* scr_main = nullptr;
+static lv_obj_t* scr_menu = nullptr;
+static lv_obj_t* scr_settings_time = nullptr;
+static lv_obj_t* scr_settings_alarm = nullptr;
+static lv_obj_t* scr_settings_timer = nullptr;
+static lv_obj_t* scr_settings_caltemp = nullptr;
+static lv_obj_t* scr_recording = nullptr;
+static lv_obj_t* currentScreen = nullptr;
+
+// Screen切换函数
+static void showScreen(lv_obj_t* target) {
+    if (target == nullptr) return;
+    if (currentScreen == target) return;
+    currentScreen = target;
+    lv_scr_load(target);
+}
+
+// HUD浮层
 static lv_obj_t* scr_hud = nullptr;
 
 // 极客仪表盘
@@ -274,6 +291,7 @@ static void scanKeyboardMatrix(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
 static void triggerHud(const char* title, const char* value, uint16_t color);
+static void showScreen(lv_obj_t* target);
 
 // ===========================
 // SHT31 温湿度
@@ -504,39 +522,52 @@ static void build_style_bigclock(void) {
 }
 
 // ===========================
-// 构建：菜单
+// 构建：菜单（预创建模式）
 // ===========================
 static void build_menu(void) {
-    // 创建新屏幕（避免删除当前屏幕导致问题）
-    lv_obj_t* new_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(new_scr, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
-    lv_scr_load(new_scr);
+    if (scr_menu == nullptr) {
+        scr_menu = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr_menu, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
 
-    // 标题
-    lv_obj_t* title = lv_label_create(new_scr);
-    lv_label_set_text(title, "MENU");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+        // 标题
+        lv_obj_t* title = lv_label_create(scr_menu);
+        lv_label_set_text(title, "MENU");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
-    // 菜单项
-    const char* items[] = { "Geek Mode", "Big Clock", "Back" };
-    for (int i = 0; i < MENU_ITEMS; i++) {
-        lv_obj_t* btn = lv_btn_create(new_scr);
-        lv_obj_set_size(btn, 180, 40);
-        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 60 + i * 50);
-        lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(i == menuSel ? CLR_CYAN : CLR_DARK), LV_PART_MAIN);
-        lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+        // 菜单项
+        const char* items[] = { "Geek Mode", "Big Clock", "Back" };
+        for (int i = 0; i < MENU_ITEMS; i++) {
+            lv_obj_t* btn = lv_btn_create(scr_menu);
+            lv_obj_set_size(btn, 180, 40);
+            lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 60 + i * 50);
+            lv_obj_set_style_radius(btn, 8, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(CLR_DARK), LV_PART_MAIN);
+            lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
 
-        lv_obj_t* lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, items[i]);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(i == menuSel ? CLR_BLACK : CLR_WHITE), LV_PART_MAIN);
-        lv_obj_center(lbl);
+            lv_obj_t* lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, items[i]);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, LV_PART_MAIN);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+            lv_obj_center(lbl);
 
-        menu_items[i] = btn;
+            menu_items[i] = btn;
+        }
     }
+
+    // 更新选中项样式
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        if (menu_items[i]) {
+            lv_obj_set_style_bg_color(menu_items[i], lv_color_hex(i == menuSel ? CLR_CYAN : CLR_DARK), LV_PART_MAIN);
+            lv_obj_t* lbl = lv_obj_get_child(menu_items[i], 0);
+            if (lbl) {
+                lv_obj_set_style_text_color(lbl, lv_color_hex(i == menuSel ? CLR_BLACK : CLR_WHITE), LV_PART_MAIN);
+            }
+        }
+    }
+
+    showScreen(scr_menu);
 }
 
 // ===========================
@@ -861,12 +892,14 @@ static void scanKeyboardMatrix(void) {
                                         currentSysMode = SYS_MODE_NORMAL;
                                         renderCurrentDisplayBase();
                                     } else {
+                                        // Back项：直接切换，不重建
                                         currentSysMode = SYS_MODE_NORMAL;
-                                        renderCurrentDisplayBase();
+                                        showScreen(scr_main);
                                     }
                                 } else if (baseKey == KEY_ESC) {
+                                    // ESC：直接切换，不重建
                                     currentSysMode = SYS_MODE_NORMAL;
-                                    renderCurrentDisplayBase();
+                                    showScreen(scr_main);
                                 }
                             } else {
                                 uint16_t mappedKey = getMappedKey(baseKey);
@@ -942,15 +975,17 @@ static void handleCommand(const String& cmd) {
                 currentSysMode = SYS_MODE_NORMAL;
                 renderCurrentDisplayBase();
             } else {
+                // Back项：直接切换，不重建
                 currentSysMode = SYS_MODE_NORMAL;
-                renderCurrentDisplayBase();
+                showScreen(scr_main);
             }
         }
     }
     else if (cmd == "BTN:LIGHT") {
         if (currentSysMode == SYS_MODE_MENU) {
+            // 直接切换，不重建
             currentSysMode = SYS_MODE_NORMAL;
-            renderCurrentDisplayBase();
+            showScreen(scr_main);
         }
     }
     else if (cmd.startsWith("ROT:")) {
@@ -1070,22 +1105,38 @@ static void updateDynamicElements(void) {
 }
 
 // ===========================
-// 主屏渲染
+// 主屏渲染（预创建模式）
 // ===========================
 static void renderCurrentDisplayBase(void) {
     init_styles();
 
-    if (scr_main) { lv_obj_del(scr_main); scr_main = nullptr; }
-    if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
+    if (scr_main == nullptr) {
+        scr_main = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr_main, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
 
-    scr_main = lv_scr_act();
-    lv_obj_set_style_bg_color(scr_main, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
-
-    if (currentDispMode == DISP_MODE_GEEK) {
-        build_style_geek();
+        if (currentDispMode == DISP_MODE_GEEK) {
+            build_style_geek();
+        } else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
+            build_style_bigclock();
+        }
     } else {
-        build_style_bigclock();
+        // 如果显示模式改变了，需要重建内容
+        static uint8_t lastDispMode = 0xFF;  // 初始值无效
+        if (lastDispMode != currentDispMode) {
+            lastDispMode = currentDispMode;
+
+            // 删除旧内容
+            if (currentDispMode == DISP_MODE_GEEK) {
+                if (bc_bg) { lv_obj_del(bc_bg); bc_bg = nullptr; }
+                build_style_geek();
+            } else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
+                if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
+                build_style_bigclock();
+            }
+        }
     }
+
+    showScreen(scr_main);
 }
 
 // ===========================
