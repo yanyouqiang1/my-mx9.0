@@ -133,9 +133,18 @@ static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
 
 // 显示模式
-#define DISP_MODE_GEEK      0
-#define DISP_MODE_BIG_CLOCK 1
-#define TOTAL_DISP_MODES    2
+#define DISP_MODE_GEEK        0
+#define DISP_MODE_BIG_CLOCK   1
+#define DISP_MODE_INFO_PANEL  2
+#define DISP_MODE_KEY_MON     3
+#define DISP_MODE_RHYTHM      4
+#define DISP_MODE_WALLPAPER   5
+#define TOTAL_DISP_MODES      6
+
+static const char* dispModeNames[TOTAL_DISP_MODES] = {
+    "极客仪表盘", "大字时钟", "信息面板", "击键监控", "律动", "壁纸"
+};
+
 static uint8_t currentDispMode = DISP_MODE_GEEK;
 
 // 控制模式
@@ -208,6 +217,7 @@ static const char* menuItemsCN[MENU_ITEMS] = {
 
 // 辅助变量
 static bool showKeystrokes = true;
+static char lastKeyPressed[8] = "-";
 
 // 灯效相关
 static const char* effectNames[] = {
@@ -297,6 +307,36 @@ static lv_obj_t* gk_lbl_profile = nullptr;
 static lv_obj_t* bc_bg = nullptr;
 static lv_obj_t* bc_lbl_time = nullptr;
 static lv_obj_t* bc_lbl_date = nullptr;
+
+// 信息面板
+static lv_obj_t* ip_bg = nullptr;
+static lv_obj_t* ip_lbl_clock = nullptr;
+static lv_obj_t* ip_lbl_date = nullptr;
+static lv_obj_t* ip_circle_num = nullptr;
+static lv_obj_t* ip_circle_caps = nullptr;
+static lv_obj_t* ip_circle_scr = nullptr;
+static lv_obj_t* ip_lbl_profile = nullptr;
+static lv_obj_t* ip_lbl_lastkey = nullptr;
+static lv_obj_t* ip_lbl_keys = nullptr;
+
+// 击键监控
+static lv_obj_t* km_bg = nullptr;
+static lv_obj_t* km_lbl_lastkey = nullptr;
+static lv_obj_t* km_lbl_keys = nullptr;
+static lv_obj_t* km_lbl_profile = nullptr;
+static lv_obj_t* km_lbl_title = nullptr;
+
+// 律动
+static lv_obj_t* rh_bg = nullptr;
+static lv_obj_t* rh_lbl_keys = nullptr;
+static lv_obj_t* rh_lbl_profile = nullptr;
+static lv_obj_t* rh_bars[24] = { nullptr };
+static uint8_t rhythmBars[24] = {0};
+
+// 壁纸
+static lv_obj_t* wp_bg = nullptr;
+static lv_obj_t* wp_img = nullptr;
+static lv_obj_t* wp_lbl_time = nullptr;
 
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
@@ -562,6 +602,229 @@ static void build_style_bigclock(void) {
 }
 
 // ===========================
+// 构建：信息面板
+// ===========================
+static void build_style_info_panel(void) {
+    if (ip_bg) { lv_obj_del(ip_bg); ip_bg = nullptr; }
+
+    ip_bg = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(ip_bg, 240, 240);
+    lv_obj_set_pos(ip_bg, 0, 0);
+    lv_obj_set_style_bg_color(ip_bg, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(ip_bg, 0, LV_PART_MAIN);
+
+    // 时钟
+    ip_lbl_clock = lv_label_create(ip_bg);
+    lv_label_set_text(ip_lbl_clock, "--:--");
+    lv_obj_set_style_text_font(ip_lbl_clock, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ip_lbl_clock, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(ip_lbl_clock, LV_ALIGN_TOP_MID, 0, 20);
+
+    // 日期
+    ip_lbl_date = lv_label_create(ip_bg);
+    lv_label_set_text(ip_lbl_date, "----/--/--");
+    lv_obj_set_style_text_font(ip_lbl_date, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ip_lbl_date, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(ip_lbl_date, LV_ALIGN_TOP_MID, 0, 58);
+
+    // 三个状态指示灯（实心圆）
+    ip_circle_num = lv_obj_create(ip_bg);
+    lv_obj_set_size(ip_circle_num, 16, 16);
+    lv_obj_set_pos(ip_circle_num, 70, 85);
+    lv_obj_set_style_radius(ip_circle_num, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ip_circle_num, lv_color_hex(0x333333), LV_PART_MAIN);
+
+    lv_obj_t* lbl_num = lv_label_create(ip_bg);
+    lv_label_set_text(lbl_num, "NUM");
+    lv_obj_set_style_text_font(lbl_num, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_num, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_num, LV_ALIGN_TOP_MID, -30, 103);
+
+    ip_circle_caps = lv_obj_create(ip_bg);
+    lv_obj_set_size(ip_circle_caps, 16, 16);
+    lv_obj_set_pos(ip_circle_caps, 112, 85);
+    lv_obj_set_style_radius(ip_circle_caps, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ip_circle_caps, lv_color_hex(0x333333), LV_PART_MAIN);
+
+    lv_obj_t* lbl_caps = lv_label_create(ip_bg);
+    lv_label_set_text(lbl_caps, "CAP");
+    lv_obj_set_style_text_font(lbl_caps, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_caps, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_caps, LV_ALIGN_TOP_MID, 0, 103);
+
+    ip_circle_scr = lv_obj_create(ip_bg);
+    lv_obj_set_size(ip_circle_scr, 16, 16);
+    lv_obj_set_pos(ip_circle_scr, 154, 85);
+    lv_obj_set_style_radius(ip_circle_scr, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ip_circle_scr, lv_color_hex(0x333333), LV_PART_MAIN);
+
+    lv_obj_t* lbl_scr = lv_label_create(ip_bg);
+    lv_label_set_text(lbl_scr, "SCR");
+    lv_obj_set_style_text_font(lbl_scr, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_scr, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_scr, LV_ALIGN_TOP_MID, 30, 103);
+
+    // 方案名
+    ip_lbl_profile = lv_label_create(ip_bg);
+    lv_label_set_text(ip_lbl_profile, profileNamesCN[currentProfile]);
+    lv_obj_set_style_text_font(ip_lbl_profile, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ip_lbl_profile, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(ip_lbl_profile, LV_ALIGN_TOP_MID, 0, 125);
+
+    // 最近按键
+    ip_lbl_lastkey = lv_label_create(ip_bg);
+    lv_label_set_text(ip_lbl_lastkey, "-");
+    lv_obj_set_style_text_font(ip_lbl_lastkey, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ip_lbl_lastkey, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(ip_lbl_lastkey, LV_ALIGN_CENTER, 0, 30);
+
+    // 击键统计
+    ip_lbl_keys = lv_label_create(ip_bg);
+    lv_label_set_text(ip_lbl_keys, "0");
+    lv_obj_set_style_text_font(ip_lbl_keys, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ip_lbl_keys, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(ip_lbl_keys, LV_ALIGN_BOTTOM_MID, 0, -20);
+
+    lv_obj_t* lbl_keys_unit = lv_label_create(ip_bg);
+    lv_label_set_text(lbl_keys_unit, "KEYS");
+    lv_obj_set_style_text_font(lbl_keys_unit, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_keys_unit, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_keys_unit, LV_ALIGN_BOTTOM_MID, 0, -5);
+}
+
+// ===========================
+// 构建：击键监控
+// ===========================
+static void build_style_keymon(void) {
+    if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
+
+    km_bg = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(km_bg, 240, 240);
+    lv_obj_set_pos(km_bg, 0, 0);
+    lv_obj_set_style_bg_color(km_bg, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(km_bg, 0, LV_PART_MAIN);
+
+    // 顶部标题栏
+    km_lbl_title = lv_label_create(km_bg);
+    lv_label_set_text(km_lbl_title, "KEY MONITOR");
+    lv_obj_set_style_text_font(km_lbl_title, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(km_lbl_title, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(km_lbl_title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 最近按键（大字显示）
+    km_lbl_lastkey = lv_label_create(km_bg);
+    lv_label_set_text(km_lbl_lastkey, "-");
+    lv_obj_set_style_text_font(km_lbl_lastkey, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(km_lbl_lastkey, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(km_lbl_lastkey, LV_ALIGN_CENTER, 0, -10);
+
+    // 分隔线
+    lv_obj_t* line = lv_line_create(km_bg);
+    static lv_point_t pts[] = {{20, 140}, {220, 140}};
+    lv_line_set_points(line, pts, 2);
+    lv_obj_set_style_line_color(line, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_line_width(line, 1, LV_PART_MAIN);
+
+    // 击键统计
+    km_lbl_keys = lv_label_create(km_bg);
+    lv_label_set_text(km_lbl_keys, "0");
+    lv_obj_set_style_text_font(km_lbl_keys, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(km_lbl_keys, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(km_lbl_keys, LV_ALIGN_BOTTOM_MID, 0, -30);
+
+    lv_obj_t* lbl_keys_unit = lv_label_create(km_bg);
+    lv_label_set_text(lbl_keys_unit, "TOTAL KEYS");
+    lv_obj_set_style_text_font(lbl_keys_unit, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_keys_unit, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_keys_unit, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    // 方案
+    km_lbl_profile = lv_label_create(km_bg);
+    lv_label_set_text(km_lbl_profile, profileNamesCN[currentProfile]);
+    lv_obj_set_style_text_font(km_lbl_profile, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(km_lbl_profile, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(km_lbl_profile, LV_ALIGN_BOTTOM_MID, 0, -65);
+}
+
+// ===========================
+// 构建：律动效果
+// ===========================
+static void build_style_rhythm(void) {
+    if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
+
+    rh_bg = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(rh_bg, 240, 240);
+    lv_obj_set_pos(rh_bg, 0, 0);
+    lv_obj_set_style_bg_color(rh_bg, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(rh_bg, 0, LV_PART_MAIN);
+
+    // 24根频谱柱（顶部区域）
+    for (int i = 0; i < 24; i++) {
+        rh_bars[i] = lv_obj_create(rh_bg);
+        lv_obj_set_size(rh_bars[i], 8, 2);
+        lv_obj_set_pos(rh_bars[i], 4 + i * 10, 110);
+        lv_obj_set_style_radius(rh_bars[i], 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+        rhythmBars[i] = 0;
+    }
+
+    // 分隔线
+    lv_obj_t* line = lv_line_create(rh_bg);
+    static lv_point_t pts[] = {{20, 115}, {220, 115}};
+    lv_line_set_points(line, pts, 2);
+    lv_obj_set_style_line_color(line, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_line_width(line, 1, LV_PART_MAIN);
+
+    // 击键统计
+    rh_lbl_keys = lv_label_create(rh_bg);
+    lv_label_set_text(rh_lbl_keys, "0");
+    lv_obj_set_style_text_font(rh_lbl_keys, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rh_lbl_keys, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(rh_lbl_keys, LV_ALIGN_CENTER, 0, 20);
+
+    lv_obj_t* lbl_keys_unit = lv_label_create(rh_bg);
+    lv_label_set_text(lbl_keys_unit, "KEYS");
+    lv_obj_set_style_text_font(lbl_keys_unit, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_keys_unit, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(lbl_keys_unit, LV_ALIGN_CENTER, 0, 45);
+
+    // 方案
+    rh_lbl_profile = lv_label_create(rh_bg);
+    lv_label_set_text(rh_lbl_profile, profileNamesCN[currentProfile]);
+    lv_obj_set_style_text_font(rh_lbl_profile, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rh_lbl_profile, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(rh_lbl_profile, LV_ALIGN_BOTTOM_MID, 0, -10);
+}
+
+// ===========================
+// 构建：壁纸模式
+// ===========================
+static void build_style_wallpaper(void) {
+    if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
+
+    wp_bg = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(wp_bg, 240, 240);
+    lv_obj_set_pos(wp_bg, 0, 0);
+    lv_obj_set_style_bg_color(wp_bg, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    lv_obj_set_style_border_width(wp_bg, 0, LV_PART_MAIN);
+
+    // 尝试加载 logo.bin 背景
+    wp_img = lv_img_create(wp_bg);
+    lv_obj_set_size(wp_img, 240, 240);
+    lv_obj_set_pos(wp_img, 0, 0);
+    lv_obj_set_style_opa(wp_img, LV_OPA_30, LV_PART_MAIN);
+    // 注意: 实际加载需要 FFat 文件系统支持，此处留空
+    lv_img_set_src(wp_img, NULL);
+
+    // 底部时钟叠加
+    wp_lbl_time = lv_label_create(wp_bg);
+    lv_label_set_text(wp_lbl_time, "--:--");
+    lv_obj_set_style_text_font(wp_lbl_time, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(wp_lbl_time, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(wp_lbl_time, LV_ALIGN_CENTER, 0, 0);
+}
+
+// ===========================
 // 菜单选择处理
 // ===========================
 static void handleMenuSelect(void) {
@@ -573,9 +836,7 @@ static void handleMenuSelect(void) {
         case 1:  // 切换主屏风格 - 循环切换
             currentDispMode = (currentDispMode + 1) % TOTAL_DISP_MODES;
             renderCurrentDisplayBase();
-            triggerHud("Style",
-                currentDispMode == DISP_MODE_GEEK ? "Geek Mode" : "Big Clock",
-                lv_color_hex(CLR_CYAN));
+            triggerHud("Style", dispModeNames[currentDispMode], lv_color_hex(CLR_CYAN));
             break;
         case 2:  // 切换配置方案 - 循环切换
             switchProfile((currentProfile + 1) % TOTAL_PROFILES);
@@ -1030,6 +1291,25 @@ static void scanKeyboardMatrix(void) {
                                 }
                             } else {
                                 uint16_t mappedKey = getMappedKey(baseKey);
+                                // 更新最近按键显示
+                                if (baseKey < 0x80) {
+                                    if (baseKey >= 0x04 && baseKey <= 0x1D) {
+                                        // 字母 A-Z
+                                        lastKeyPressed[0] = 'A' + (baseKey - 0x04);
+                                        lastKeyPressed[1] = '\0';
+                                    } else if (baseKey >= 0x1E && baseKey <= 0x27) {
+                                        // 数字 1-0
+                                        lastKeyPressed[0] = (baseKey == 0x27) ? '0' : '1' + (baseKey - 0x1E);
+                                        lastKeyPressed[1] = '\0';
+                                    } else {
+                                        snprintf(lastKeyPressed, sizeof(lastKeyPressed), "%02X", baseKey);
+                                    }
+                                } else {
+                                    snprintf(lastKeyPressed, sizeof(lastKeyPressed), "%02X", baseKey);
+                                }
+                                // 触发律动效果
+                                uint8_t barIdx = totalKeyCount % 24;
+                                rhythmBars[barIdx] = 60;
                                 kbPress((uint8_t)mappedKey);
                             }
                         }
@@ -1177,45 +1457,128 @@ static void updateDynamicElements(void) {
     char time_buf[16], date_buf[32];
     static const char* WEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 
-    if (currentDispMode == DISP_MODE_GEEK) {
-        strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
-        snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
-                 ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+    switch (currentDispMode) {
+        case DISP_MODE_GEEK: {
+            strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
+            snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
+                     ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
 
-        if (gk_lbl_clock) lv_label_set_text(gk_lbl_clock, time_buf);
-        if (gk_lbl_date) lv_label_set_text(gk_lbl_date, date_buf);
+            if (gk_lbl_clock) lv_label_set_text(gk_lbl_clock, time_buf);
+            if (gk_lbl_date) lv_label_set_text(gk_lbl_date, date_buf);
 
-        if (gk_lbl_temp) {
-            static char tbuf[16];
-            snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
-            lv_label_set_text(gk_lbl_temp, tbuf);
+            if (gk_lbl_temp) {
+                static char tbuf[16];
+                snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
+                lv_label_set_text(gk_lbl_temp, tbuf);
+            }
+            if (gk_lbl_hum) {
+                static char hbuf[16];
+                snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
+                lv_label_set_text(gk_lbl_hum, hbuf);
+            }
+            if (gk_lbl_keys) {
+                static char kbuf[16];
+                snprintf(kbuf, sizeof(kbuf), "%u", totalKeyCount);
+                lv_label_set_text(gk_lbl_keys, kbuf);
+            }
+
+            // LED 状态
+            if (gk_led_num) lv_led_set_brightness(gk_led_num, numLock ? 200 : 0);
+            if (gk_led_caps) lv_led_set_brightness(gk_led_caps, capsLock ? 200 : 0);
+            if (gk_led_scr) lv_led_set_brightness(gk_led_scr, scrollLock ? 200 : 0);
+
+            // 方案标签
+            if (gk_lbl_profile) lv_label_set_text(gk_lbl_profile, profileNamesCN[currentProfile]);
+            break;
         }
-        if (gk_lbl_hum) {
-            static char hbuf[16];
-            snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
-            lv_label_set_text(gk_lbl_hum, hbuf);
+
+        case DISP_MODE_BIG_CLOCK: {
+            strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
+            snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
+                     ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+
+            if (bc_lbl_time) lv_label_set_text(bc_lbl_time, time_buf);
+            if (bc_lbl_date) lv_label_set_text(bc_lbl_date, date_buf);
+            break;
         }
-        if (gk_lbl_keys) {
-            static char kbuf[16];
-            snprintf(kbuf, sizeof(kbuf), "%u", totalKeyCount);
-            lv_label_set_text(gk_lbl_keys, kbuf);
+
+        case DISP_MODE_INFO_PANEL: {
+            strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
+            snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
+                     ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+
+            if (ip_lbl_clock) lv_label_set_text(ip_lbl_clock, time_buf);
+            if (ip_lbl_date) lv_label_set_text(ip_lbl_date, date_buf);
+
+            // LED 状态
+            if (ip_circle_num) lv_obj_set_style_bg_color(ip_circle_num,
+                numLock ? lv_color_hex(0x00FF00) : lv_color_hex(0x333333), LV_PART_MAIN);
+            if (ip_circle_caps) lv_obj_set_style_bg_color(ip_circle_caps,
+                capsLock ? lv_color_hex(0x00FFFF) : lv_color_hex(0x333333), LV_PART_MAIN);
+            if (ip_circle_scr) lv_obj_set_style_bg_color(ip_circle_scr,
+                scrollLock ? lv_color_hex(0xFFFF00) : lv_color_hex(0x333333), LV_PART_MAIN);
+
+            // 方案
+            if (ip_lbl_profile) lv_label_set_text(ip_lbl_profile, profileNamesCN[currentProfile]);
+
+            // 最近按键
+            if (ip_lbl_lastkey) lv_label_set_text(ip_lbl_lastkey, lastKeyPressed);
+
+            // 击键数
+            if (ip_lbl_keys) {
+                static char kbuf[16];
+                snprintf(kbuf, sizeof(kbuf), "%u", totalKeyCount);
+                lv_label_set_text(ip_lbl_keys, kbuf);
+            }
+            break;
         }
 
-        // LED 状态
-        if (gk_led_num) lv_led_set_brightness(gk_led_num, numLock ? 200 : 0);
-        if (gk_led_caps) lv_led_set_brightness(gk_led_caps, capsLock ? 200 : 0);
-        if (gk_led_scr) lv_led_set_brightness(gk_led_scr, scrollLock ? 200 : 0);
+        case DISP_MODE_KEY_MON: {
+            if (km_lbl_lastkey) lv_label_set_text(km_lbl_lastkey, lastKeyPressed);
 
-        // 方案标签
-        if (gk_lbl_profile) lv_label_set_text(gk_lbl_profile, profileNamesCN[currentProfile]);
-    }
-    else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
-        strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
-        snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
-                 ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+            if (km_lbl_keys) {
+                static char kbuf[16];
+                snprintf(kbuf, sizeof(kbuf), "%u", totalKeyCount);
+                lv_label_set_text(km_lbl_keys, kbuf);
+            }
+            if (km_lbl_profile) lv_label_set_text(km_lbl_profile, profileNamesCN[currentProfile]);
+            break;
+        }
 
-        if (bc_lbl_time) lv_label_set_text(bc_lbl_time, time_buf);
-        if (bc_lbl_date) lv_label_set_text(bc_lbl_date, date_buf);
+        case DISP_MODE_RHYTHM: {
+            // 更新律动柱动画
+            for (int i = 0; i < 24; i++) {
+                if (rh_bars[i]) {
+                    uint8_t height = rhythmBars[i];
+                    if (height > 0) {
+                        rhythmBars[i] = height - 1;  // 逐渐衰减
+                        lv_obj_set_size(rh_bars[i], 8, 2 + height * 4);
+                        // 颜色渐变：从绿到红
+                        uint8_t g = (height * 10 > 255) ? 255 : height * 10;
+                        uint8_t r = (height * 10 > 255) ? 255 : height * 10;
+                        uint32_t color = (r << 16) | (g << 8);
+                        lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(color), LV_PART_MAIN);
+                    } else {
+                        lv_obj_set_size(rh_bars[i], 8, 2);
+                        lv_obj_set_style_bg_color(rh_bars[i], lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+                    }
+                }
+            }
+
+            if (rh_lbl_keys) {
+                static char kbuf[16];
+                snprintf(kbuf, sizeof(kbuf), "%u", totalKeyCount);
+                lv_label_set_text(rh_lbl_keys, kbuf);
+            }
+            if (rh_lbl_profile) lv_label_set_text(rh_lbl_profile, profileNamesCN[currentProfile]);
+            break;
+        }
+
+        case DISP_MODE_WALLPAPER: {
+            strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
+            if (wp_lbl_time) lv_label_set_text(wp_lbl_time, time_buf);
+            break;
+        }
     }
 }
 
@@ -1225,30 +1588,21 @@ static void updateDynamicElements(void) {
 static void renderCurrentDisplayBase(void) {
     init_styles();
 
-    if (scr_main == nullptr) {
-        scr_main = lv_obj_create(NULL);
-        lv_obj_set_style_bg_color(scr_main, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+    // 删除旧显示组件
+    if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
+    if (bc_bg) { lv_obj_del(bc_bg); bc_bg = nullptr; }
+    if (ip_bg) { lv_obj_del(ip_bg); ip_bg = nullptr; }
+    if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
+    if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
+    if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
 
-        if (currentDispMode == DISP_MODE_GEEK) {
-            build_style_geek();
-        } else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
-            build_style_bigclock();
-        }
-    } else {
-        // 如果显示模式改变了，需要重建内容
-        static uint8_t lastDispMode = 0xFF;  // 初始值无效
-        if (lastDispMode != currentDispMode) {
-            lastDispMode = currentDispMode;
-
-            // 删除旧内容
-            if (currentDispMode == DISP_MODE_GEEK) {
-                if (bc_bg) { lv_obj_del(bc_bg); bc_bg = nullptr; }
-                build_style_geek();
-            } else if (currentDispMode == DISP_MODE_BIG_CLOCK) {
-                if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
-                build_style_bigclock();
-            }
-        }
+    switch (currentDispMode) {
+        case DISP_MODE_GEEK: build_style_geek(); break;
+        case DISP_MODE_BIG_CLOCK: build_style_bigclock(); break;
+        case DISP_MODE_INFO_PANEL: build_style_info_panel(); break;
+        case DISP_MODE_KEY_MON: build_style_keymon(); break;
+        case DISP_MODE_RHYTHM: build_style_rhythm(); break;
+        case DISP_MODE_WALLPAPER: build_style_wallpaper(); break;
     }
 
     showScreen(scr_main);

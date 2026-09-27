@@ -2,7 +2,7 @@
 
 ## Tasks
 - [x] Task 1: Screen管理系统重构 + Bug修复 (commit 0b74d64)
-- [ ] Task 2: 扩展菜单到12项
+- [x] Task 2: 扩展菜单到12项 (commit ae7abfa)
 - [ ] Task 3: 添加6种显示风格
 - [ ] Task 4: 实现设置界面
 - [ ] Task 5: 实现宏录制
