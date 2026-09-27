@@ -3,8 +3,8 @@
 ## Tasks
 - [x] Task 1: Screen管理系统重构 + Bug修复 (commit 0b74d64)
 - [x] Task 2: 扩展菜单到12项 (commit ae7abfa)
-- [ ] Task 3: 添加6种显示风格
-- [ ] Task 4: 实现设置界面
+- [x] Task 3: 添加6种显示风格 (commit 491eb43)
+- [x] Task 4: 实现设置界面 (commit 84f880a)
 - [ ] Task 5: 实现宏录制
 - [ ] Task 6: 实现通知系统
 - [ ] Task 7: BLE指令扩展

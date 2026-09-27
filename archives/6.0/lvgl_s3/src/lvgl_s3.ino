@@ -133,6 +133,8 @@ TwoWire Wire_SHT(1);
 #define SYS_MODE_SET_ALARM 4
 #define SYS_MODE_SET_TIMER 5
 #define SYS_MODE_CAL_TEMP 6
+#define SYS_MODE_REC_SEQ  7
+#define SYS_MODE_REC_CMB  8
 #define IS_SETTING_MODE(m) ((m) >= SYS_MODE_SET_TIME && (m) <= SYS_MODE_CAL_TEMP)
 static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
@@ -203,6 +205,16 @@ static unsigned long pendingRestartMs = 0;
 // 菜单
 static uint8_t menuSel = 0;
 #define MENU_ITEMS 12
+
+// 宏录制
+#define MAX_REC_KEYS 64
+static uint16_t recKeyBuffer[MAX_REC_KEYS];
+static int recKeyCount = 0;
+static uint8_t currentRecMode = 0;  // 0=SEQ, 1=CMB
+static bool recNeedsRedraw = true;
+static lv_obj_t* rec_lbl_count = nullptr;
+static lv_obj_t* rec_lbl_keys = nullptr;
+static lv_obj_t* rec_lbl_mode = nullptr;
 
 // 菜单项（中文）
 static const char* menuItemsCN[MENU_ITEMS] = {
@@ -432,6 +444,8 @@ static void update_setting_time_display(void);
 static void update_setting_alarm_display(void);
 static void update_setting_timer_display(void);
 static void update_setting_caltemp_display(void);
+static void build_recording(void);
+static void finishMacroRecording(const String& targetKey);
 
 // ===========================
 // SHT31 温湿度
@@ -1107,7 +1121,7 @@ static void update_setting_alarm_display(void) {
         if (alarmEnabled) {
             lv_obj_add_state(set_alarm_sw, LV_STATE_CHECKED);
         } else {
-            lv_obj_remove_state(set_alarm_sw, LV_STATE_CHECKED);
+            lv_obj_clear_state(set_alarm_sw, LV_STATE_CHECKED);
         }
     }
     // 高亮当前字段
@@ -1291,7 +1305,7 @@ static void build_settings_timer(void) {
     // 时间显示
     set_timer_lbl_time = lv_label_create(scr_settings_timer);
     lv_label_set_text(set_timer_lbl_time, "00:05:00");
-    lv_obj_set_style_text_font(set_timer_lbl_time, &lv_font_montserrat_32, LV_PART_MAIN);
+    lv_obj_set_style_text_font(set_timer_lbl_time, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(set_timer_lbl_time, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
     lv_obj_align(set_timer_lbl_time, LV_ALIGN_CENTER, 0, -40);
 
@@ -1359,7 +1373,7 @@ static void build_settings_caltemp(void) {
 
     set_cal_lbl_temp = lv_label_create(scr_settings_caltemp);
     lv_label_set_text(set_cal_lbl_temp, "--.- C");
-    lv_obj_set_style_text_font(set_cal_lbl_temp, &lv_font_montserrat_32, LV_PART_MAIN);
+    lv_obj_set_style_text_font(set_cal_lbl_temp, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(set_cal_lbl_temp, lv_color_hex(0xFF8C42), LV_PART_MAIN);
     lv_obj_align(set_cal_lbl_temp, LV_ALIGN_CENTER, 0, -20);
 
@@ -1389,6 +1403,119 @@ static void build_settings_caltemp(void) {
     update_setting_caltemp_display();
     showScreen(scr_settings_caltemp);
     currentSysMode = SYS_MODE_CAL_TEMP;
+}
+
+// ===========================
+// 宏录制界面
+// ===========================
+static void build_recording(void) {
+    if (scr_recording) { lv_obj_del(scr_recording); }
+    scr_recording = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_recording, lv_color_hex(CLR_BLACK), LV_PART_MAIN);
+
+    // 标题
+    lv_obj_t* title = lv_label_create(scr_recording);
+    const char* titleText = (currentRecMode == 0) ? "REC SEQ" : "REC CMB";
+    lv_label_set_text(title, titleText);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title,
+        (currentRecMode == 0) ? lv_color_hex(0xFF8800) : lv_color_hex(0xFF00FF), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
+
+    // 模式标签
+    rec_lbl_mode = lv_label_create(scr_recording);
+    lv_label_set_text(rec_lbl_mode, (currentRecMode == 0) ? "Sequence" : "Combo");
+    lv_obj_set_style_text_font(rec_lbl_mode, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rec_lbl_mode, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(rec_lbl_mode, LV_ALIGN_TOP_MID, 0, 40);
+
+    // 计数显示
+    rec_lbl_count = lv_label_create(scr_recording);
+    static char countBuf[32];
+    snprintf(countBuf, sizeof(countBuf), "%d/%d", recKeyCount, MAX_REC_KEYS);
+    lv_label_set_text(rec_lbl_count, countBuf);
+    lv_obj_set_style_text_font(rec_lbl_count, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rec_lbl_count, lv_color_hex(CLR_CYAN), LV_PART_MAIN);
+    lv_obj_align(rec_lbl_count, LV_ALIGN_CENTER, 0, -40);
+
+    // 已录按键列表
+    lv_obj_t* keys_bg = lv_obj_create(scr_recording);
+    lv_obj_set_size(keys_bg, 200, 80);
+    lv_obj_align(keys_bg, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_color(keys_bg, lv_color_hex(CLR_DARK), LV_PART_MAIN);
+    lv_obj_set_style_radius(keys_bg, 8, LV_PART_MAIN);
+    lv_obj_set_style_border_width(keys_bg, 0, LV_PART_MAIN);
+
+    rec_lbl_keys = lv_label_create(keys_bg);
+    lv_label_set_text(rec_lbl_keys, "");
+    lv_obj_set_style_text_font(rec_lbl_keys, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rec_lbl_keys, lv_color_hex(CLR_WHITE), LV_PART_MAIN);
+    lv_obj_align(rec_lbl_keys, LV_ALIGN_TOP_MID, 0, 5);
+
+    // 更新已录按键显示
+    static char keysBuf[256] = {0};
+    keysBuf[0] = '\0';
+    for (int i = 0; i < recKeyCount && i < 10; i++) {
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "%02X ", recKeyBuffer[i]);
+        strncat(keysBuf, tmp, sizeof(keysBuf) - strlen(keysBuf) - 1);
+    }
+    if (recKeyCount > 10) {
+        strncat(keysBuf, "...", sizeof(keysBuf) - strlen(keysBuf) - 1);
+    }
+    lv_label_set_text(rec_lbl_keys, keysBuf);
+
+    // 提示文字
+    lv_obj_t* hint = lv_label_create(scr_recording);
+    lv_label_set_text(hint, "MR: toggle/cancel\nM1-M12: save macro");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hint, lv_color_hex(CLR_GRAY), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    showScreen(scr_recording);
+    currentSysMode = (currentRecMode == 0) ? SYS_MODE_REC_SEQ : SYS_MODE_REC_CMB;
+    recNeedsRedraw = false;
+}
+
+static void finishMacroRecording(const String& targetKey) {
+    if (recKeyCount == 0) {
+        triggerHud("RECORD", "Empty!", lv_color_hex(0xFF0000));
+        currentSysMode = SYS_MODE_NORMAL;
+        renderCurrentDisplayBase();
+        return;
+    }
+
+    // 构建宏数据字符串
+    String macroData;
+    if (currentRecMode == 0) {
+        // SEQ: 击键序列
+        macroData = "SEQ:";
+        for (int i = 0; i < recKeyCount; i++) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%c", (char)recKeyBuffer[i]);
+            macroData += buf;
+        }
+    } else {
+        // CMB: 组合键（同时按下的键）
+        macroData = "CMB:";
+        for (int i = 0; i < recKeyCount; i++) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02X,", recKeyBuffer[i]);
+            macroData += buf;
+        }
+    }
+
+    // 保存宏
+    char pKey[32];
+    snprintf(pKey, sizeof(pKey), "p%d_%s", currentProfile, targetKey.c_str());
+    preferences.putString(pKey, macroData);
+
+    triggerHud("SAVED", targetKey.c_str(), lv_color_hex(0x00FF00));
+
+    // 清理录制状态
+    recKeyCount = 0;
+    currentSysMode = SYS_MODE_NORMAL;
+    renderCurrentDisplayBase();
 }
 
 // ===========================
@@ -1475,7 +1602,7 @@ static void saveSettingScreen(void) {
         case SYS_MODE_SET_ALARM: {
             alarmHour = alarmEditH;
             alarmMinute = alarmEditM;
-            alarmEnabled = lv_switch_get_state(set_alarm_sw);
+            alarmEnabled = lv_obj_has_state(set_alarm_sw, LV_STATE_CHECKED);
             preferences.putUChar("alarm_h", alarmHour);
             preferences.putUChar("alarm_m", alarmMinute);
             preferences.putBool("alarm_on", alarmEnabled);
@@ -1778,6 +1905,48 @@ static void scanKeyboardMatrix(void) {
                                 executeMacro(macroName);
                             }
                         }
+                        // MR 键：录制宏
+                        if (baseKey == K_MR) {
+                            if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+                                // 录制中按MR：切换模式或取消
+                                if (fnPressed) {
+                                    // Fn+MR: 取消录制
+                                    recKeyCount = 0;
+                                    triggerHud("RECORD", "Cancelled", lv_color_hex(0xFF8800));
+                                    currentSysMode = SYS_MODE_NORMAL;
+                                    renderCurrentDisplayBase();
+                                } else {
+                                    // MR: 切换模式
+                                    currentRecMode = 1 - currentRecMode;
+                                    recKeyCount = 0;
+                                    build_recording();
+                                }
+                            } else {
+                                // 非录制模式：开始录制
+                                currentRecMode = 0;  // 默认SEQ模式
+                                recKeyCount = 0;
+                                triggerHud("RECORD", "Started", lv_color_hex(0x00FF00));
+                                build_recording();
+                            }
+                        }
+                        // 录制模式下的M1-M12按键
+                        if ((currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB)
+                            && baseKey >= K_M1 && baseKey <= K_M12) {
+                            String targetKey = getMacroNameByCode(baseKey);
+                            finishMacroRecording(targetKey);
+                        }
+                        // 录制模式下记录普通按键
+                        if ((currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB)
+                            && !(baseKey >= MACRO_BASE && baseKey < MACRO_BASE + 0x20)) {
+                            // 非宏控制键才记录
+                            if (baseKey != K_MR && baseKey != K_FN && baseKey != K_MC
+                                && baseKey != K_MA && baseKey != K_MB && baseKey != K_ME) {
+                                if (recKeyCount < MAX_REC_KEYS) {
+                                    recKeyBuffer[recKeyCount++] = baseKey;
+                                    recNeedsRedraw = true;
+                                }
+                            }
+                        }
                         // 普通按键
                         else {
                             // 菜单模式下的导航
@@ -1795,6 +1964,15 @@ static void scanKeyboardMatrix(void) {
                                     // ESC：返回主屏
                                     currentSysMode = SYS_MODE_NORMAL;
                                     showScreen(scr_main);
+                                }
+                            }
+                            // 录制模式下的ESC取消
+                            else if (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB) {
+                                if (baseKey == KEY_ESC) {
+                                    recKeyCount = 0;
+                                    triggerHud("RECORD", "Cancelled", lv_color_hex(0xFF8800));
+                                    currentSysMode = SYS_MODE_NORMAL;
+                                    renderCurrentDisplayBase();
                                 }
                             }
                             // 设置模式下的导航
@@ -2300,6 +2478,12 @@ void loop() {
     if (menuNeedsRebuild) {
         menuNeedsRebuild = false;
         build_menu();
+    }
+
+    // 录制界面更新
+    if (recNeedsRedraw && (currentSysMode == SYS_MODE_REC_SEQ || currentSysMode == SYS_MODE_REC_CMB)) {
+        recNeedsRedraw = false;
+        build_recording();
     }
 
     // 主显示
