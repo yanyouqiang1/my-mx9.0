@@ -7,7 +7,7 @@
  *   - 8MB PSRAM：framebuffer / 对象池放到 PSRAM
  *   - 屏幕：240x240 RGB565
  *   - 关闭用不到的功能（3D、Bidi、文件系统）
- *   - 字体：思源黑体 SC 子集（deps/）
+ *   - 字体：LVGL 内置 Montserrat（ASCII 全覆盖，无需外部字库）
  */
 
 #ifndef LV_CONF_H
@@ -129,13 +129,9 @@
 #define LV_USE_FONT_COMPRESSED    0
 #define LV_USE_FONT_SUBPX         0
 
-// 思源黑体 SC 子集（deps/ 目录，由 bake_fonts.ps1 烤出）
-#define LV_FONT_CUSTOM_DECLARE \
-    LV_FONT_DECLARE(lv_font_sans16);      \
-    LV_FONT_DECLARE(lv_font_sans20);      \
-    LV_FONT_DECLARE(lv_font_sans28);      \
-    LV_FONT_DECLARE(lv_font_sans_bold48)
-#define LV_FONT_DEFAULT         &lv_font_sans16
+// 使用 LVGL 内置 Montserrat 字体（ASCII 全覆盖，无需外部字库）
+#define LV_FONT_CUSTOM_DECLARE  /* 无自定义字体 */
+#define LV_FONT_DEFAULT         &lv_font_montserrat_14
 
 /*====================
    数学
