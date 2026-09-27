@@ -72,10 +72,19 @@ python check_font.py  # 确认 MISSING 为 0
   叠进子对象坐标**。于是任何"贴在 (0,0)"的子对象都会右下偏 13px，右边和下边被裁掉
   —— 表现就是"整个界面往右移了一点"、壁纸模式下尤其明显。用 `lv_obj_align()` 的
   子对象不受影响（对齐算 content 区中心，pad 对称时中心不变），所以很容易漏。
-- 顶部条（`dashTopBar()`）左三是三颗锁状态灯（NUM/CAP/SCR，只画圆点不写文字），
-  右边是方案指示：序号常显，1/2 号方案另配系统图标（Windows 四格窗 / 苹果），
-  图标全部用 `lv_obj` 基本图形拼，改样式时别去动 `topIconWin[] / topIconMac[]` 的
-  创建顺序（= 绘制顺序：果体 → 缺口 → 果柄 → 叶）。
+- 顶部条（`dashTopBar()`）左三是三颗锁状态灯（NUM/CAP/SCR，只画圆点不写文字，
+  外面套一圈同色细环，亮起时才显形），右边是方案指示：序号常显，1/2 号方案另配
+  系统图标（Windows 四格窗 / 苹果），图标全部用 `lv_obj` 基本图形拼，改样式时
+  别去动 `topIconWin[] / topIconMac[]` 的创建顺序（= 绘制顺序：果体 → 缺口 → 果柄 → 叶）。
+- 三颗锁状态**翻转的那一刻**会弹一条 HUD（`updateDynamicElements` 里用
+  `lockPrev[]` 比对上一帧）。顶栏那三颗灯太靠边，离远了看不出大写开没开，
+  光靠变色不够。`lockPrevValid` 是"界面刚重建"的标志：重建后第一帧只记录不弹窗，
+  否则每次回主屏都会一口气弹三条。
+- **Montserrat 里没有汉字，也没有到中文字库的回退**（回退是单向的：
+  `lv_font_simsun_16_cjk.fallback = &lv_font_montserrat_14`，反过来没有）。
+  挂 `lv_font_montserrat_*` 的 label 写中文 = 一片空白。要显示中文就显式换
+  `&lv_font_simsun_16_cjk`；纯 ASCII 的占位符（`--`）才可以用 Montserrat。
+- 日期统一走 `formatDateCN()`（"9月27日 星期六"）。用了它的 label 必须是中文字库。
 - **别用 `transform_zoom` / `transform_angle` 放大字号或做视觉效果**：
   LVGL 8.4 的软件渲染器对需要 alpha 的中间图层有一道闸门
   （`lv_draw_sw_layer.c`: `LV_COLOR_SCREEN_TRANSP == 0 && HAS_ALPHA → return NULL`），
@@ -88,6 +97,42 @@ python check_font.py  # 确认 MISSING 为 0
   `GSET` 的 `SW:x+SEQ:…` / `SW:x+CMB:…`，`executeMacro()` 吃按方案的
   `p<n>_<键名>`（`SEQ:` / `CMB:` 两种）。网页端 `s3-setting.html` 发的
   `SET:p0_M1:…` 名字里已经带方案号，固件端**不要再拼一层** `p<currentProfile>_`。
+- 按键编码只有**一套**在矩阵里用：Arduino 的 "0x88 + HID usage"。
+  0xE0~0xE7 在这里是**小键盘回车 / 小键盘 1~7**（0x88+0x58=0xE0=NumEnt，
+  0x88+0x5F=0xE7=Num 7），**不是**修饰键 —— 别在 kbPress 里把它们当 0xE0~0xE7
+  的 HID 修饰键处理，一处理整片小键盘就全错（7 会变成 Win 键）。
+  网页"按键映射"下拉里那几个 "🔹 Left Ctrl"=224 才是 HID 风格，它们的换算
+  统一在 `normalizeRemapKey()` 里做，只作用于 remap 表的读入/读出。
+- 同一个坑的第二个面：**别拿 Consumer 页的 usage 去比 `baseKey`**。
+  0xE2 = 0x88+0x5A = **小键盘 2**，不是静音 —— 谁在按键分发里写
+  `else if (baseKey == 0xE2)` 做 Mute，小键盘 2 就会静音且不再当数字键用。
+  静音键物理上挂在小 MCU **C3** 上，走 Serial1 的 `BTN:MUTE`
+  （`handleC3Command`），**矩阵里没有这一格**，不要试图在矩阵里加。
+
+## 灯效
+
+- 灯光设置页五个字段：背光开关 / 背光亮度 / 灯效 / 状态灯亮度 / **按键灯效**。
+- 按键灯效（`keyFxStyle`，存 NVS `key_fx`）是**叠加层**：按下任意键时
+  `triggerKeyReaction()` 置状态，`renderLightingEngine()` 每帧把 0~15 主背光
+  先压暗到 ~40%（原版 `updateKeyReaction()` 的 `*102>>8`），再把特效那几颗点亮。
+  涟漪=从正中向两侧扩散 / 发射=从末位往回扫子弹 / 堆叠=从末位往回填。
+  颜色每按一次自动换一种（原版"自动"档的配色）。
+- 叠加层必须写在基础灯效**之后**，顺序反了会被灯效盖掉；告警期间整段不走
+  （`renderLightingEngine()` 在告警分支就 return 了），16~18 锁状态灯也不受影响。
+- 主背光一共 **16 颗（0~15）**，16/17/18 是三颗锁状态灯。别再把 `0~15` 写成
+  写死的 `15`（`i < 15`）—— 那样第 16 颗主灯在常亮灯效下永远是黑的。
+
+## 息屏 / 屏保
+
+- 菜单第 12 项在 黑屏 → 壁纸轮播 → 信息面板 之间循环（存 NVS `saver_mode`）。
+- **壁纸轮播**：壁纸铺满 + 每 5 秒翻出信息面板。信息面板（时间/日期/温湿度）
+  全在 `sv_panel` 一块卡里 —— 旧版是四个 label 散在屏幕各处，配上壁纸就是
+  四处压图。没上传过壁纸时没有可轮播的图，直接常显面板。
+- 进屏保先给图片（`updateScreensaver(true)` 里 `tick = 0` + 藏面板），
+  用户最想先看到的是图。轮播计时用 tick 计数而不是时间戳：这个函数既被
+  100ms 的节拍调、也被 `enterScreensaver()` 直接调一次，时间戳会被那次调用搅乱。
+- 壁纸主屏（风格 6）的时钟在**右下角**一小块（112x40 / 28px 字），
+  遮罩是 `LV_OPA_25`。原来 168x64 的板子杵在正中、48px 字，图基本没法看。
 
 ## 文件系统与分区（别踩）
 

@@ -117,9 +117,18 @@ TwoWire Wire_SHT(1);
 #define KEY_KP_9        0x61
 #define KEY_KP_0        0x62
 #define KEY_KP_DOT      0x63
-// 静音键：矩阵里写的原始值。它属于 HID **Consumer** Usage Page（0x0C），
-// 不是 Keyboard 页，所以不能走 Keyboard.press()，要走 ConsumerControl。
-#define KEY_MUTE_USAGE  0xE2
+// ⚠ 这里**故意没有**"矩阵静音键"这个东西。
+// 静音键物理上挂在 C3 那颗小 MCU 上，走 Serial1 的 "BTN:MUTE" 文本命令
+// （handleC3Command，见文件中部"C3 串口通道"一节），矩阵里根本没有这一格。
+//
+// 曾经在这儿写过 `#define KEY_MUTE_USAGE 0xE2`，再拿 baseKey 跟它比。
+// Consumer 页的 Mute 确实是 0xE2，但**矩阵用的是另一套编码**：
+// Arduino 的 "0x88 + HID usage"。0xE2 = 0x88 + 0x5A = **小键盘 2**。
+// 于是小键盘 2 一按就变静音，而且它被那个分支吃掉了，
+// 再也落不到下面的普通键盘分支，键盘 2 这个键等于没了。
+//
+// 别再加回来：10x16 的矩阵里每个有效格子都有主（0~2、4~8 行，行 3 / 行 9 是物理空行），
+// 没有多余的键位可以给静音。
 #define K_M1   (MACRO_BASE + 1)
 #define K_M2   (MACRO_BASE + 2)
 #define K_M3   (MACRO_BASE + 3)
@@ -232,6 +241,28 @@ static uint8_t currentEffect = 1;     // 灯效编号
 static bool lightOn = true;           // 主背光总开关
 static unsigned long lastLedFrameTime = 0;
 
+// ---- 按键特效（按键触发的叠加层，从原版 s3.ino 的 triggerKeyReaction 搬回来）----
+// 原版按下任意键：0~15 主背光先整体压暗到 ~40%，再在上面跑一段动画。
+// LVGL 移植时整块丢了，所以只剩下"静态灯效"，按键毫无反馈。
+// 三种形式就是原版那三种（原版用 keypressStyle/8 选，这里拆成独立设置项）：
+//   涟漪 从灯条正中向两侧扩散 / 发射 从一端扫一排"子弹"过去 / 堆叠 从一端一格格填满
+// 颜色每按一次自动换一种 —— 原版 colorIdx==0 的"自动"档就是这个配色。
+#define KEYFX_OFF    0
+#define KEYFX_RIPPLE 1
+#define KEYFX_SHOOT  2
+#define KEYFX_STACK  3
+#define KEYFX_COUNT  4
+static const char* keyFxNames[KEYFX_COUNT] = { "关闭", "涟漪", "发射", "堆叠" };
+static uint8_t keyFxStyle = KEYFX_RIPPLE;   // 默认开涟漪（灯光设置里可关）
+#define KEYFX_MAX_SHOTS 8
+static bool     keyFxActive = false;
+static uint8_t  keyFxStep = 0;                                   // 涟漪/堆叠的推进步
+static uint8_t  keyFxStack = 0;                                  // 堆叠已经填了几格
+static int8_t   keyFxShotStep[KEYFX_MAX_SHOTS] =                  // 发射的每发子弹走到哪了
+    { -1, -1, -1, -1, -1, -1, -1, -1 };
+static uint32_t keyFxColor = 0xFF0000;
+static uint8_t  keyFxColorIdx = 0;
+
 // 锁状态
 static bool numLock = false;
 static bool capsLock = false;
@@ -295,16 +326,22 @@ static char lastKeyPressed[8] = "-";
 // 息屏 / 屏保风格
 // ===========================
 // 原来 SLEEP_TIMEOUT_MS 到了就 destroyMainScreen() 把主屏整个拆掉，屏幕全黑。
-// 现在多给两种屏保：SAVER_WALL 纯壁纸、SAVER_INFO 时间 + 温湿度。
+// 现在多给两种屏保：
+//   SAVER_WALL 壁纸铺满，和"信息面板"每隔几秒**轮播**一张 —— 一直是图片
+//              会看不到时间，一直是面板又浪费了壁纸
+//   SAVER_INFO 只显示信息面板，不轮播
+// 两种模式共用同一块 `sv_panel`（时间 / 日期 / 温湿度都收在这一块里，
+// 不再是四个散落在屏幕四角的 label）。
 // 屏保是一块独立屏幕（scr_saver），和主屏并存，唤醒时直接切回主屏即可。
 #define SAVER_OFF   0
 #define SAVER_WALL  1
 #define SAVER_INFO  2
 #define TOTAL_SAVER_MODES 3
-static const char* saverModeNames[] = { "黑屏", "壁纸", "时间温湿度" };
+static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板" };
 static uint8_t saverMode = SAVER_OFF;
 static lv_obj_t* scr_saver = nullptr;
 static lv_obj_t* sv_img = nullptr;
+static lv_obj_t* sv_panel = nullptr;      // 信息面板容器（时间/日期/温湿度都在里面）
 static lv_obj_t* sv_lbl_time = nullptr;
 static lv_obj_t* sv_lbl_date = nullptr;
 static lv_obj_t* sv_lbl_temp = nullptr;
@@ -359,16 +396,17 @@ static float calTempOriginal = 62.0f;
 static int calTempField = 0;
 
 // 灯光设置
-// 背光开关 / 背光亮度 / 灯效 / 状态灯亮度 全部收进这一个页面，
+// 背光开关 / 背光亮度 / 灯效 / 状态灯亮度 / 按键灯效 全部收进这一个页面，
 // 菜单里不再有"循环一下就走的"灯效项 —— 那玩意儿按错了根本不知道按到哪一档。
-#define LIGHT_FIELD_COUNT 4
+#define LIGHT_FIELD_COUNT 5
 static uint8_t lightFieldIdx = 0;
 static bool    lightOnOriginal = true;
 static uint8_t lightBrightOriginal = 140;
 static uint8_t lightEffectOriginal = 1;
 static uint8_t lightIndLevelOriginal = 3;
-static const char* lightFieldCN[LIGHT_FIELD_COUNT]  = { "背光开关", "背光亮度", "灯效", "状态灯亮度" };
-static const char* lightFieldEN[LIGHT_FIELD_COUNT]  = { "BACKLIGHT", "BRIGHTNESS", "EFFECT", "INDICATOR" };
+static uint8_t lightKeyFxOriginal = KEYFX_RIPPLE;
+static const char* lightFieldCN[LIGHT_FIELD_COUNT]  = { "背光开关", "背光亮度", "灯效", "状态灯亮度", "按键灯效" };
+static const char* lightFieldEN[LIGHT_FIELD_COUNT]  = { "BACKLIGHT", "BRIGHTNESS", "EFFECT", "INDICATOR", "KEY FX" };
 static const char* lightSwitchCN[2] = { "开", "关" };
 
 // 设置界面对象
@@ -623,6 +661,7 @@ static lv_obj_t* gk_lbl_date = nullptr;
 static lv_obj_t* gk_lbl_temp = nullptr;
 static lv_obj_t* gk_lbl_hum = nullptr;
 static lv_obj_t* gk_lbl_keys = nullptr;
+static lv_obj_t* gk_lbl_lastkey = nullptr;   // 中间的"最近按键"反馈
 static lv_obj_t* gk_led_num = nullptr;
 static lv_obj_t* gk_led_caps = nullptr;
 static lv_obj_t* gk_led_scr = nullptr;
@@ -711,7 +750,11 @@ static uint8_t* logoRxAlloc(uint32_t total);
 //   左边：3 颗锁状态灯，只画圆点、不写 NUM/CAP/SCR 文字
 //   右边：当前方案 —— 1/2 号方案是 Windows / macOS，直接画系统图标；3/4 只显序号
 static lv_obj_t* topLockDot[3] = { nullptr, nullptr, nullptr };
+static lv_obj_t* topLockRing[3] = { nullptr, nullptr, nullptr };   // 点亮时的外圈
 static uint32_t   topLockOn[3] = { 0, 0, 0 };
+// 上一帧的三颗锁状态，用来检测"哪一颗刚刚被切换了"（只为了弹一次 HUD）
+static bool     lockPrev[3] = { false, false, false };
+static bool     lockPrevValid = false;
 static lv_obj_t* topProfileNum = nullptr;      // 方案序号 1~4
 static lv_obj_t* topIconBox    = nullptr;      // 系统图标的槽位（14x18，本身透明）
 static lv_obj_t* topIconWin[4] = { nullptr, nullptr, nullptr, nullptr };  // Windows 四格窗
@@ -820,6 +863,7 @@ static lv_obj_t* ensureMainScreen(void) {
 static void resetStylePointers(void) {
     gk_lbl_clock = nullptr; gk_lbl_date = nullptr; gk_lbl_temp = nullptr;
     gk_lbl_hum = nullptr; gk_lbl_keys = nullptr; gk_lbl_profile = nullptr;
+    gk_lbl_lastkey = nullptr;
     gk_led_num = nullptr; gk_led_caps = nullptr; gk_led_scr = nullptr;
 
     bc_lbl_time = nullptr; bc_lbl_date = nullptr;
@@ -849,6 +893,8 @@ static void resetStylePointers(void) {
     // 是切过去之后仍在刷新上一风格的顶部条。setBgColor 的 nullptr 检查拦不住，
     // 因为它不是 nullptr，是被释放后又被复用的地址。
     for (int i = 0; i < 3; i++) topLockDot[i] = nullptr;
+    for (int i = 0; i < 3; i++) topLockRing[i] = nullptr;
+    lockPrevValid = false;
     topProfileNum = nullptr;
     topIconBox = nullptr;
     for (int i = 0; i < 4; i++) { topIconWin[i] = nullptr; topIconMac[i] = nullptr; }
@@ -932,7 +978,8 @@ static void destroyMainScreen(void);
 static void destroyScreensaver(void);
 static void enterScreensaver(void);
 static void cycleScreensaverMode(void);
-static void updateScreensaver(void);
+static void updateScreensaver(bool force);
+static void triggerKeyReaction(void);
 static void handleMenuSelect(void);
 static const char* getKeyName(uint16_t code);
 static void build_settings_time(void);
@@ -1228,6 +1275,21 @@ static lv_obj_t* iconRect(lv_obj_t* parent, lv_coord_t w, lv_coord_t h,
     return o;
 }
 
+// 中文日期："9月27日 星期六"。
+// 以前是 "%04d/%02d/%02d %s" + Sun/Mon/… 满屏中文里夹一行英文缩写很跳，
+// 中文星期也比 Sat 短，英文占的宽度纯属浪费。
+// ⚠ 这个串只能用中文字库渲染（lv_font_simsun_16_cjk）——Montserrat 里没有汉字，
+// 也没有到 CJK 的回退，挂在 montserrat_* 的 label 上会直接画成空白。
+//
+// 参数收成三个 int 而不是 `const struct tm*`：Arduino 会给 .ino 里每个函数
+// 自动生成一份原型插在"第一个函数定义"之前，签名里带自定义/结构体类型
+// 容易在那一步出问题。传三个 int 谁都不会有意见。
+static void formatDateCN(char* out, size_t n, int mon, int mday, int wday) {
+    static const char* weekCN[7] = { "日", "一", "二", "三", "四", "五", "六" };
+    if (wday < 0 || wday > 6) wday = 0;
+    snprintf(out, n, "%d月%d日 星期%s", mon, mday, weekCN[wday]);
+}
+
 // ===========================
 // 主屏通用：顶部状态条
 // ===========================
@@ -1253,9 +1315,24 @@ static void dashTopBar(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
+    // 三颗锁：外圈（亮起时才显形）+ 圆点。
+    // 圆点从 6px 提到 8px，外面再套一圈同色细环 —— 单靠"小圆点换颜色"在
+    // 240px 的屏上离远了根本看不出来，加一圈之后亮度面积翻倍。
+    // 环和点的间距只有 1px（环 12px、点 8px），靠边框自身 1px 撑开。
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     for (int i = 0; i < 3; i++) {
-        lv_obj_t* d = iconRect(bar, 6, 6, LV_ALIGN_LEFT_MID, 12 + i * 18, 0,
+        lv_obj_t* ring = lv_obj_create(bar);
+        lv_obj_set_size(ring, 12, 12);
+        lv_obj_align(ring, LV_ALIGN_LEFT_MID, 12 + i * 18, 0);
+        lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ring, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(ring, lv_color_hex(onColors[i]), LV_PART_MAIN);
+        lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(ring, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+        topLockRing[i] = ring;
+
+        lv_obj_t* d = iconRect(bar, 8, 8, LV_ALIGN_LEFT_MID, 14 + i * 18, 0,
                                CLR_STROKE, LV_RADIUS_CIRCLE);
         topLockDot[i] = d;
         topLockOn[i] = onColors[i];
@@ -1317,26 +1394,28 @@ static void updateTopBarProfile(void) {
     }
 }
 
-// 小统计卡：标题 + 数值
-static lv_obj_t* statCard(lv_obj_t* parent, int cx, const char* cap,
-                          const lv_font_t* vf, uint32_t vcolor) {
+// 极客页底部那两颗温湿度卡：贴底、更宽（104 而不是 72）、更扁（48）。
+// 数值还是 20px，"23.5C" 一行放得下不折行。
+static lv_obj_t* statCardBottom(lv_obj_t* parent, int cx, const char* cap,
+                                uint32_t vcolor) {
     lv_obj_t* c = lv_obj_create(parent);
-    lv_obj_set_size(c, 72, 62);
-    lv_obj_align(c, LV_ALIGN_CENTER, cx, 40);
+    lv_obj_set_size(c, 104, 48);
+    lv_obj_align(c, LV_ALIGN_BOTTOM_MID, cx, -6);
     mkCard(c, CLR_SURFACE, 10);
 
     lv_obj_t* t = lv_label_create(c);
     mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_MUTE);
     lv_label_set_text(t, cap);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 4);
 
     lv_obj_t* v = lv_label_create(c);
-    mkLabel(v, vf, vcolor);
+    mkLabel(v, &lv_font_montserrat_20, vcolor);
     lv_label_set_text(v, "--");
-    lv_obj_align(v, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_align(v, LV_ALIGN_CENTER, 0, 4);
     return v;
 }
 
+// 小统计卡：标题 + 数值
 // ===========================
 // 构建：极客仪表盘
 // ===========================
@@ -1347,35 +1426,61 @@ static void build_style_geek(void) {
 
     dashTopBar(gk_bg);
 
-    // 主时钟
+    // 版面（240x240，各行给的是 label 的**行盒**范围，实际字形比行盒窄）：
+    //   0..28    顶部条
+    //   30..82   时钟     montserrat_48，行高 52
+    //   86..105  中文日期 simsun_16，行高 19
+    //   112..180 按键反馈卡（200x68）
+    //              ├ 118..137 "最近按键"  simsun_16
+    //              ├ 右上角累计次数     montserrat_10
+    //              └ 144..174 键名      montserrat_28，行高 30
+    //   186..234 温湿度两张卡（104x48，贴底）
+    //
+    // 中间这块原来是"三张统计卡摆一排 + 一条强调线"，现在换成一张反馈卡：
+    // 温湿度下沉到贴底、让出中间，中间正好够放按键反馈。
+    // 强调线去掉了 —— 上下都有卡片，那条 2px 的线已经不起分隔作用，白占 6px。
     gk_lbl_clock = lv_label_create(gk_bg);
     mkLabel(gk_lbl_clock, &lv_font_montserrat_48, CLR_TEXT);
     lv_label_set_text(gk_lbl_clock, "--:--");
-    lv_obj_align(gk_lbl_clock, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(gk_lbl_clock, LV_ALIGN_TOP_MID, 0, 30);
 
-    // 日期
+    // 日期。**必须用中文字库**：formatDateCN() 出的是"9月27日 星期六"，
+    // montserrat_* 里没有汉字，也没有到 CJK 的回退，挂错了就是一整行空白。
     gk_lbl_date = lv_label_create(gk_bg);
-    mkLabel(gk_lbl_date, &lv_font_montserrat_14, CLR_TEXT_DIM);
-    lv_label_set_text(gk_lbl_date, "----/--/-- --");
-    lv_obj_align(gk_lbl_date, LV_ALIGN_TOP_MID, 0, 104);
+    mkLabel(gk_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(gk_lbl_date, "1月1日 星期一");
+    lv_obj_align(gk_lbl_date, LV_ALIGN_TOP_MID, 0, 86);
 
-    // 时钟下方一条强调线，视觉上把主区和数据区分开。
-    // y 从 128 提到 124：上面修掉 padding 那 13px 偏移之后，日期落在 104~120、
-    // 统计卡落在 129~191（statCard 用的是 CENTER 对齐，不受 padding 影响，
-    // 所以位置没变）—— 128 会和卡片顶部叠在一起，只露出 1px 的线头。
-    lv_obj_t* line = lv_obj_create(gk_bg);
-    lv_obj_set_size(line, 40, 2);
-    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 124);
-    lv_obj_set_style_bg_color(line, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(line, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    // ---- 按键反馈卡 ----
+    lv_obj_t* keycard = lv_obj_create(gk_bg);
+    lv_obj_set_size(keycard, 200, 68);
+    lv_obj_align(keycard, LV_ALIGN_TOP_MID, 0, 112);
+    mkCard(keycard, CLR_SURFACE, 12);
 
-    // 三张统计卡
-    gk_lbl_temp = statCard(gk_bg, -76, "TEMP",  &lv_font_montserrat_20, CLR_AMBER);
-    gk_lbl_hum  = statCard(gk_bg,   0, "HUMI",  &lv_font_montserrat_20, CLR_ACCENT);
-    gk_lbl_keys = statCard(gk_bg,  76, "KEYS",  &lv_font_montserrat_20, CLR_VIOLET);
+    lv_obj_t* keycap = lv_label_create(keycard);
+    mkLabel(keycap, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(keycap, "最近按键");
+    lv_obj_align(keycap, LV_ALIGN_TOP_MID, 0, 6);
+
+    // 累计击键次数缩在右上角：它是个慢变量，不该占一整行去和"刚刚按了什么"抢视线
+    gk_lbl_keys = lv_label_create(keycard);
+    mkLabel(gk_lbl_keys, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(gk_lbl_keys, "0");
+    lv_obj_align(gk_lbl_keys, LV_ALIGN_TOP_RIGHT, -10, 10);
+
+    // 键名用 getKeyName()：Space / Enter / Num 7 / M1 …
+    // 全 ASCII，所以挂 montserrat 没问题（中文只出现在"最近按键"这个 simsun 的标题上）。
+    gk_lbl_lastkey = lv_label_create(keycard);
+    mkLabel(gk_lbl_lastkey, &lv_font_montserrat_28, CLR_ACCENT);
+    lv_label_set_text(gk_lbl_lastkey, "-");
+    lv_obj_set_width(gk_lbl_lastkey, 180);
+    lv_label_set_long_mode(gk_lbl_lastkey, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(gk_lbl_lastkey, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(gk_lbl_lastkey, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+    // 温湿度贴底
+    gk_lbl_temp = statCardBottom(gk_bg, -58, "TEMP", CLR_AMBER);
+    gk_lbl_hum  = statCardBottom(gk_bg,  58, "HUMI", CLR_ACCENT);
 }
 
 // ===========================
@@ -1404,8 +1509,8 @@ static void build_style_bigclock(void) {
     lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
 
     bc_lbl_date = lv_label_create(bc_bg);
-    mkLabel(bc_lbl_date, &lv_font_montserrat_16, CLR_TEXT_DIM);
-    lv_label_set_text(bc_lbl_date, "----/--/-- --");
+    mkLabel(bc_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(bc_lbl_date, "1月1日 星期一");
     lv_obj_align(bc_lbl_date, LV_ALIGN_CENTER, 0, 44);
 
     // 底部方案胶囊
@@ -1441,8 +1546,8 @@ static void build_style_info_panel(void) {
     lv_obj_align(ip_lbl_clock, LV_ALIGN_CENTER, 0, -10);
 
     ip_lbl_date = lv_label_create(card);
-    mkLabel(ip_lbl_date, &lv_font_montserrat_14, CLR_TEXT_DIM);
-    lv_label_set_text(ip_lbl_date, "----/--/--");
+    mkLabel(ip_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(ip_lbl_date, "1月1日 星期一");
     lv_obj_align(ip_lbl_date, LV_ALIGN_CENTER, 0, 26);
 
     // 三个锁状态胶囊
@@ -1845,24 +1950,32 @@ static void build_style_wallpaper(void) {
         lv_img_set_src(wp_img, NULL);
     }
 
-    // 压一层半透明黑，保证上面的字在任意壁纸上都读得出来
+    // 压一层半透明黑，保证上面的字在任意壁纸上都读得出来。
+    // 从 LV_OPA_50(=127) 降到 LV_OPA_20(=51)：字已经缩到右下角一小块、
+    // 而且有自己的底板了，全屏遮罩再压一半，整个画面就只剩"糊"——
+    // 壁纸页的重点是图，不是字。
+    // ⚠ LV_OPA_* 只有 0/10/20/30/40/50/60/70/80/90/100 这几档
+    //   （lv_color.h，值分别是 0/25/51/76/102/127/153/178/204/229/255），
+    //   没有 LV_OPA_25 这种东西，别照着百分点去猜。
     lv_obj_t* scrim = lv_obj_create(wp_bg);
     lv_obj_set_size(scrim, 240, 240);
     lv_obj_set_pos(scrim, 0, 0);
     lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scrim, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scrim, LV_OPA_20, LV_PART_MAIN);
     lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
     lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 时钟叠加在正中
+    // 时钟挪到**右下角**一小块。
+    // 原来是 168x64 的板子杵在正中间、48px 大字 —— 图被挡掉一大块，
+    // 用户的原话是"图片都看不清了"。缩到 28px 贴右下角，只压住一个角。
     lv_obj_t* plate = lv_obj_create(wp_bg);
-    lv_obj_set_size(plate, 168, 64);
-    lv_obj_align(plate, LV_ALIGN_CENTER, 0, 0);
-    mkCard(plate, CLR_SURFACE_2, 12);
-    lv_obj_set_style_bg_opa(plate, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_set_size(plate, 112, 40);
+    lv_obj_align(plate, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    mkCard(plate, CLR_SURFACE_2, 10);
+    lv_obj_set_style_bg_opa(plate, LV_OPA_70, LV_PART_MAIN);
 
     wp_lbl_time = lv_label_create(plate);
-    mkLabel(wp_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    mkLabel(wp_lbl_time, &lv_font_montserrat_28, CLR_TEXT);
     lv_label_set_text(wp_lbl_time, "--:--");
     lv_obj_center(wp_lbl_time);
 }
@@ -1872,12 +1985,13 @@ static void build_style_wallpaper(void) {
 // ===========================
 // 屏保是一块独立的屏幕对象，和主屏并存：
 //   SAVER_OFF  沿用老行为 —— 拆掉主屏，屏幕全黑
-//   SAVER_WALL 壁纸占满，亮度压到最低（息屏就该灭灯，但还能看出图案）
-//   SAVER_INFO 时间 + 温湿度，常亮可读
+//   SAVER_WALL 壁纸铺满，和"信息面板"每 5 秒轮播一次
+//   SAVER_INFO 只显示信息面板
 // 唤醒统一走 gotoMainScreen()：先 showScreen(主屏) 再 destroyScreensaver()，
 // 顺序反了就会删掉活动屏，LVGL 8.4 会把 disp->act_scr 置成 NULL。
 static void destroyScreensaver(void) {
     sv_img = nullptr;
+    sv_panel = nullptr;
     sv_lbl_time = nullptr; sv_lbl_date = nullptr;
     sv_lbl_temp = nullptr; sv_lbl_hum = nullptr;
     if (scr_saver != nullptr) {
@@ -1887,7 +2001,42 @@ static void destroyScreensaver(void) {
     if (currentScreen == scr_saver) currentScreen = nullptr;
 }
 
-// 菜单第 12 项：黑屏 → 壁纸 → 时间温湿度 → 黑屏
+// 屏保信息面板：时间 / 日期 / 温湿度全收在**这一块**面板里。
+// 旧版是四个 label 散在屏幕各处（时间居中偏上、日期居中、温湿度各贴一个下角），
+// 配上壁纸就是四处压图 —— 轮播模式下必须收拢成一张卡，不然图片根本没得看。
+static void buildSaverPanel(void) {
+    sv_panel = lv_obj_create(scr_saver);
+    lv_obj_set_size(sv_panel, 204, 112);
+    // 壁纸轮播时贴底（让出图片的上 2/3），纯信息模式居中
+    if (saverMode == SAVER_WALL) lv_obj_align(sv_panel, LV_ALIGN_BOTTOM_MID, 0, -16);
+    else                         lv_obj_align(sv_panel, LV_ALIGN_CENTER, 0, 0);
+    mkCard(sv_panel, CLR_SURFACE, 14);
+
+    sv_lbl_time = lv_label_create(sv_panel);
+    mkLabel(sv_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(sv_lbl_time, "--:--");
+    lv_obj_align(sv_lbl_time, LV_ALIGN_TOP_MID, 0, 6);
+
+    sv_lbl_date = lv_label_create(sv_panel);
+    mkLabel(sv_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(sv_lbl_date, "1月1日 星期一");
+    lv_obj_align(sv_lbl_date, LV_ALIGN_TOP_MID, 0, 60);
+
+    // 温湿度一行，中间一根细竖线隔开（比两段文字并排更容易一眼分开）
+    iconRect(sv_panel, 1, 18, LV_ALIGN_BOTTOM_MID, 0, -8, CLR_STROKE, 0);
+
+    sv_lbl_temp = lv_label_create(sv_panel);
+    mkLabel(sv_lbl_temp, &lv_font_montserrat_16, CLR_AMBER);
+    lv_label_set_text(sv_lbl_temp, "--.-C");
+    lv_obj_align(sv_lbl_temp, LV_ALIGN_BOTTOM_MID, -52, -6);
+
+    sv_lbl_hum = lv_label_create(sv_panel);
+    mkLabel(sv_lbl_hum, &lv_font_montserrat_16, CLR_ACCENT);
+    lv_label_set_text(sv_lbl_hum, "--%");
+    lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 52, -6);
+}
+
+// 菜单第 12 项：黑屏 → 壁纸轮播 → 信息面板 → 黑屏
 static void cycleScreensaverMode(void) {
     saverMode = (saverMode + 1) % TOTAL_SAVER_MODES;
     preferences.putUChar("saver_mode", saverMode);
@@ -1918,69 +2067,75 @@ static void enterScreensaver(void) {
     lv_obj_clear_flag(scr_saver, LV_OBJ_FLAG_SCROLLABLE);
 
     if (saverMode == SAVER_WALL) {
-        // 纯壁纸：没有钟，没有角标，图片铺满整屏
+        // 壁纸铺满。原来是 lv_img_set_src(sv_img, NULL) —— 屏保里那张图
+        // **从来就没挂上去过**，不管传没传过壁纸都只是一块深色底，
+        // 这就是"睡眠的时候图片没有展示"。
         sv_img = lv_img_create(scr_saver);
         lv_obj_set_size(sv_img, 240, 240);
         lv_obj_set_pos(sv_img, 0, 0);
         lv_obj_set_style_bg_color(sv_img, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
         lv_obj_set_style_border_width(sv_img, 0, LV_PART_MAIN);
-        lv_img_set_src(sv_img, NULL);   // 还没上传壁纸时的占位底色
-    } else {
-        // 时间 + 温湿度
-        sv_lbl_time = lv_label_create(scr_saver);
-        mkLabel(sv_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
-        lv_label_set_text(sv_lbl_time, "--:--");
-        lv_obj_align(sv_lbl_time, LV_ALIGN_CENTER, 0, -22);
-
-        sv_lbl_date = lv_label_create(scr_saver);
-        mkLabel(sv_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-        lv_label_set_text(sv_lbl_date, "----/--/--");
-        lv_obj_align(sv_lbl_date, LV_ALIGN_CENTER, 0, 14);
-
-        sv_lbl_temp = lv_label_create(scr_saver);
-        mkLabel(sv_lbl_temp, &lv_font_simsun_16_cjk, CLR_ACCENT);
-        lv_label_set_text(sv_lbl_temp, "--.-C");
-        lv_obj_align(sv_lbl_temp, LV_ALIGN_BOTTOM_MID, -34, -18);
-
-        sv_lbl_hum = lv_label_create(scr_saver);
-        mkLabel(sv_lbl_hum, &lv_font_simsun_16_cjk, CLR_VIOLET);
-        lv_label_set_text(sv_lbl_hum, "--%");
-        lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 34, -18);
+        lv_img_set_src(sv_img, wpReady ? &wpImgDsc : NULL);
+        if (!wpReady) setHidden(sv_img, true);   // 没图就别留一块空底色
     }
 
-    updateScreensaver();
+    buildSaverPanel();
+    // 没上传过壁纸时没有可轮播的图，直接常显面板
+    setHidden(sv_panel, (saverMode == SAVER_WALL) && wpReady);
+
+    updateScreensaver(true);
     showScreen(scr_saver);
 }
 
 // 屏保的慢变量刷新。息屏时 currentSysMode != SYS_MODE_NORMAL，
 // updateDynamicElements() 压根不会被调用，所以这里自己按同样的节奏跑。
-static void updateScreensaver(void) {
+// force = true 时立刻刷一次（进屏保的那一瞬间不能等 100ms 才出数字）。
+static void updateScreensaver(bool force) {
     if (scr_saver == nullptr) return;
-    if (saverMode == SAVER_WALL) return;   // 纯壁纸没有会变的元素
 
     // 和 updateDynamicElements() 同样的 100ms 节奏（那边是 DYNAMIC_REFRESH_MS，
     // 那个宏定义在文件后段，这里用字面量避免前向依赖）
     static unsigned long lastRunMs = 0;
     unsigned long nowMs = millis();
-    if (nowMs - lastRunMs < 100UL) return;
+    if (!force && nowMs - lastRunMs < 100UL) return;
     lastRunMs = nowMs;
+
+    // 壁纸轮播：每 5 秒在"纯壁纸"和"信息面板"之间翻一次。
+    // 计时器用 tick 计数而不是记时间戳 —— 这个函数既被 100ms 的节拍调，
+    // 也被 enterScreensaver() 直接调一次（force），用时间戳会被那次调用搅乱。
+    if (saverMode == SAVER_WALL && wpReady) {
+        static uint8_t tick = 0;
+        if (force) {
+            tick = 0;
+            setHidden(sv_panel, true);      // 进屏保先给图片（用户最想先看到的是图）
+        } else {
+            tick++;
+            if (tick >= 50) {               // 50 × 100ms = 5s
+                tick = 0;
+                setHidden(sv_panel, !lv_obj_has_flag(sv_panel, LV_OBJ_FLAG_HIDDEN));
+            }
+        }
+    } else {
+        setHidden(sv_panel, false);
+    }
+
+    // 面板被藏起来（纯壁纸那一相）时不用白刷标签
+    if (sv_lbl_time == nullptr || lv_obj_has_flag(sv_panel, LV_OBJ_FLAG_HIDDEN)) return;
 
     time_t now = time(nullptr);
     struct tm* ti = localtime(&now);
     if (!ti || ti->tm_year < 124) return;
 
     static char tbuf[16], dbuf[32], cbuf[16], hbuf[16];
-    static const char* WEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     strftime(tbuf, sizeof(tbuf), "%H:%M", ti);
-    snprintf(dbuf, sizeof(dbuf), "%04d/%02d/%02d %s",
-             ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+    formatDateCN(dbuf, sizeof(dbuf), ti->tm_mon + 1, ti->tm_mday, ti->tm_wday);
     snprintf(cbuf, sizeof(cbuf), "%.1fC", shtTemp);
     snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
 
     setText(sv_lbl_time, tbuf);
     setText(sv_lbl_date, dbuf);
-    setText(sv_lbl_temp, shtAvailable ? cbuf : "无传感器");
-    setText(sv_lbl_hum, shtAvailable ? hbuf : "");
+    setText(sv_lbl_temp, shtAvailable ? cbuf : "--.-C");
+    setText(sv_lbl_hum, shtAvailable ? hbuf : "--%");
 }
 
 // ===========================
@@ -2579,8 +2734,11 @@ static void update_setting_light_display(void) {
         case 2:
             value = effectNames[currentEffect];
             break;
-        default:
+        case 3:
             value = indLevelNames[indLevel];
+            break;
+        default:
+            value = keyFxNames[keyFxStyle];
             break;
     }
 
@@ -2840,6 +2998,7 @@ static void build_settings_light(void) {
     lightBrightOriginal = brightness;
     lightEffectOriginal = currentEffect;
     lightIndLevelOriginal = indLevel;
+    lightKeyFxOriginal = keyFxStyle;
     lightFieldIdx = 0;
 
     if (scr_settings_light == nullptr) {
@@ -2848,14 +3007,14 @@ static void build_settings_light(void) {
 
         // 大字预览卡
         lv_obj_t* card = lv_obj_create(scr_settings_light);
-        lv_obj_set_size(card, 204, 88);
-        lv_obj_align(card, LV_ALIGN_CENTER, 0, -22);
+        lv_obj_set_size(card, 204, 80);
+        lv_obj_align(card, LV_ALIGN_CENTER, 0, -34);
         mkCard(card, CLR_SURFACE, 12);
 
         set_light_lbl_cap = lv_label_create(card);
         mkLabel(set_light_lbl_cap, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
         lv_label_set_text(set_light_lbl_cap, lightFieldCN[0]);
-        lv_obj_align(set_light_lbl_cap, LV_ALIGN_TOP_MID, 0, 12);
+        lv_obj_align(set_light_lbl_cap, LV_ALIGN_TOP_MID, 0, 8);
 
         set_light_lbl_value = lv_label_create(card);
         mkLabel(set_light_lbl_value, &lv_font_simsun_16_cjk, CLR_TEXT);
@@ -2863,19 +3022,26 @@ static void build_settings_light(void) {
         lv_obj_set_width(set_light_lbl_value, 184);
         lv_label_set_long_mode(set_light_lbl_value, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_align(set_light_lbl_value, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_align(set_light_lbl_value, LV_ALIGN_CENTER, 0, 12);
+        lv_obj_align(set_light_lbl_value, LV_ALIGN_CENTER, 0, 4);
 
         set_light_lbl_en = lv_label_create(card);
         mkLabel(set_light_lbl_en, &lv_font_montserrat_10, CLR_TEXT_MUTE);
         lv_label_set_text(set_light_lbl_en, lightFieldEN[0]);
-        lv_obj_align(set_light_lbl_en, LV_ALIGN_BOTTOM_MID, 0, -12);
+        lv_obj_align(set_light_lbl_en, LV_ALIGN_BOTTOM_MID, 0, -8);
 
-        // 四个字段胶囊排成 2x2
+        // 五个字段胶囊：前四个 2x2，第五个（按键灯效）单独占一整行。
+        // 第五个做成通栏是因为它是个"开/关型"的新开关，和上面四个调量分成两排，
+        // 视觉上不容易和"灯效"那一格看混（两者名字太像了）。
         const int chipX[2] = { -52, 52 };
-        const int chipY[2] = { 48, 76 };
+        const int chipY[3] = { 26, 53, 80 };
         for (int i = 0; i < LIGHT_FIELD_COUNT; i++) {
-            set_light_field_labels[i] = fieldChip(scr_settings_light,
-                chipX[i % 2], chipY[i / 2], 96, lightFieldCN[i], false);
+            if (i == 4) {
+                set_light_field_labels[i] = fieldChip(scr_settings_light,
+                    0, chipY[2], 204, lightFieldCN[i], false);
+            } else {
+                set_light_field_labels[i] = fieldChip(scr_settings_light,
+                    chipX[i % 2], chipY[i / 2], 96, lightFieldCN[i], false);
+            }
         }
     }
     update_setting_light_display();
@@ -3146,9 +3312,16 @@ static void adjustSettingField(int delta) {
                     currentEffect = (uint8_t)((currentEffect + (delta > 0 ? 1 : MAX_EFFECTS - 1))
                                               % MAX_EFFECTS);
                     break;
-                default:
+                case 3:
                     indLevel = (uint8_t)constrain((int)indLevel + delta, 0, IND_LEVEL_COUNT - 1);
                     indBrightness = indLevelValues[indLevel];
+                    break;
+                default:
+                    // 按键灯效：循环量，关掉时顺手把正在跑的动画停掉，
+                    // 否则下次开回来会接着上一条没收完的波纹继续跑
+                    keyFxStyle = (uint8_t)((keyFxStyle + (delta > 0 ? 1 : KEYFX_COUNT - 1))
+                                           % KEYFX_COUNT);
+                    if (keyFxStyle == KEYFX_OFF) keyFxActive = false;
                     break;
             }
             update_setting_light_display();
@@ -3202,6 +3375,7 @@ static void saveSettingScreen(void) {
             preferences.putUChar("brightness", brightness);
             preferences.putUChar("effect", currentEffect);
             preferences.putUChar("ind_level", indLevel);
+            preferences.putUChar("key_fx", keyFxStyle);
             triggerHud("灯光", "已保存", lv_color_hex(CLR_GREEN));
             break;
         }
@@ -3226,12 +3400,14 @@ static void cancelSettingScreen(void) {
             triggerHud("温度校准", "已取消", lv_color_hex(CLR_AMBER));
             break;
         case SYS_MODE_SET_LIGHT:
-            // 四项全部原样还回去：灯效/亮度这类循环量不记原值就退不回去了
+            // 五项全部原样还回去：灯效/亮度这类循环量不记原值就退不回去了
             lightOn = lightOnOriginal;
             brightness = lightBrightOriginal;
             currentEffect = lightEffectOriginal;
             indLevel = lightIndLevelOriginal;
             indBrightness = indLevelValues[indLevel];
+            keyFxStyle = lightKeyFxOriginal;
+            if (keyFxStyle == KEYFX_OFF) keyFxActive = false;
             triggerHud("灯光", "已取消", lv_color_hex(CLR_AMBER));
             break;
     }
@@ -3241,6 +3417,10 @@ static void cancelSettingScreen(void) {
 // ===========================
 // Profile 管理
 // ===========================
+// 定义在下面的"键盘工具函数"一节。这里先声明：loadRemapsFromStorage() 读 NVS
+// 时就要它把老配置里 224~231 那套 HID 编码折算成 Arduino 风格。
+static inline uint16_t normalizeRemapKey(uint16_t code);
+
 void loadRemapsFromStorage() {
     for (int p = 0; p < TOTAL_PROFILES; p++) {
         char key[16];
@@ -3251,8 +3431,10 @@ void loadRemapsFromStorage() {
             char itemKey[20];
             snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", p, i);
             uint32_t val = preferences.getUInt(itemKey, 0);
-            profileRemaps[p][i].fromKey = (uint16_t)(val >> 16);
-            profileRemaps[p][i].toKey = (uint16_t)(val & 0xFFFF);
+            // 读出来也过一遍 normalize：以前存进去的规则里 toKey 可能是 224~231
+            // 那套 HID 编码，不折算的话老配置改完固件照样发不出修饰键。
+            profileRemaps[p][i].fromKey = normalizeRemapKey((uint16_t)(val >> 16));
+            profileRemaps[p][i].toKey = normalizeRemapKey((uint16_t)(val & 0xFFFF));
         }
     }
 }
@@ -3270,23 +3452,33 @@ void switchProfile(uint8_t profIdx) {
 // ===========================
 // 键盘工具函数
 // ===========================
-// 修饰键有**两套**编码，两个都要认：
-//   0x80~0x87 = Arduino 风格（KEY_LEFT_CTRL…），按键矩阵和网页"组合键"用的是这套
-//   0xE0~0xE7 = USB HID 风格，网页"按键映射"里的修饰键下拉给的是这套
-//                （见 s3-setting.html 的 KEY_OPTIONS："🔹 Left Ctrl": 224）
-// 以前只认前者，HID 风格的值会被直接喂给 Keyboard.press()：它按 ">= 0x88 就是
-// 非打印键" 处理，0xE0 落到 (0xE0 - 0x88) = 0x88 这个不存在的 usage 上 ——
-// 主机收到的既不是 Ctrl 也不是任何一个键。
+// 修饰键有**两套**编码——注意这里只能认 Arduino 那一套：
+//   0x80~0x87 = Arduino 风格（KEY_LEFT_CTRL=128…KEY_RIGHT_GUI=135），
+//               按键矩阵、网页"组合键"复选框用的都是这套，需要 +0x60 转成 HID usage。
+//   0xE0~0xE7 = 网页"按键映射"下拉里那几个 "🔹 Left Ctrl"（见 s3-setting.html 的
+//               KEY_OPTIONS: 224~231）。**这一套绝不能在这里认**：矩阵里的 0xE0~0xE7
+//               走的是 Arduino 的 "0x88 + usage" 约定，是**小键盘**键位 ——
+//                  0xE0=小键盘回车 0xE1~0xE7=小键盘 1~7
+//               （Row0[1..3]=0xE9/0xE8/0xE7 是小键盘 9/8/7，Row1[10..15] 是小键盘 3~6…）
+//               一旦在这里把 0xE0~0xE7 当修饰键，小键盘 7 就会变成 Win 键（0xE7→右 GUI）、
+//               1~6 变成 Shift/Alt/Ctrl —— 整片小键盘全错。
+//               那套值的转换放在 remap 表读入处做（见 normalizeRemapKey）。
 static inline void kbPress(uint8_t code) {
-    if (code >= 0xE0 && code < 0xE8) Keyboard.pressRaw(code);
-    else if (code >= 0x80 && code < 0x88) Keyboard.pressRaw((uint8_t)(code + 0x60));
+    if (code >= 0x80 && code < 0x88) Keyboard.pressRaw((uint8_t)(code + 0x60));
     else Keyboard.press(code);
 }
 
 static inline void kbRelease(uint8_t code) {
-    if (code >= 0xE0 && code < 0xE8) Keyboard.releaseRaw(code);
-    else if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
+    if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
     else Keyboard.release(code);
+}
+
+// 网页"按键映射"下拉里的修饰键给的是 HID 风格 224~231，而 Keyboard.press() 按
+// ">= 0x88 就是非打印键" 处理，会算成 (224-0x88)=0x88 这个不存在的 usage ——
+// 主机收到的既不是 Ctrl 也不是别的键。在写进 remap 表之前统一折算成 Arduino 风格，
+// 这样下游 kbPress/getMappedKey 都不用再管这套编码。
+static inline uint16_t normalizeRemapKey(uint16_t code) {
+    return (code >= 0xE0 && code <= 0xE7) ? (uint16_t)(code - 0x60) : code;
 }
 
 // ===========================
@@ -3295,9 +3487,18 @@ static inline void kbRelease(uint8_t code) {
 // 之前这里是直接 snprintf("%02X") 十六进制码，界面上就是一串数字 —— 空格显示 20、
 // 字母显示 6B，纯粹没法看。照搬 s3.ino 原版的 getKeyName()。
 static const char* getKeyName(uint16_t code) {
-    if (code >= 'a' && code <= 'z') { static char b[2]; b[0] = (char)(code - 32); b[1] = 0; return b; }
-    if (code >= 'A' && code <= 'Z') { static char b[2]; b[0] = (char)code; b[1] = 0; return b; }
-    if (code >= '0' && code <= '9') { static char b[2]; b[0] = (char)code; b[1] = 0; return b; }
+    // 可打印 ASCII 原样成字符。字母/数字/符号键在矩阵里存的就是 ASCII
+    // （'/'=47、';'=59、'.'=46 …），所以一条就够了。
+    // ⚠ 必须排在下面的 switch 之前：那里面 `case 0x2F: return "["` 一类用的是
+    // **HID usage 码**，和 ASCII 撞车（0x2E 既是 HID 的 '='、又是 ASCII 的 '.'），
+    // 撞上就会把 '.' 显示成 '='。矩阵里存的是 ASCII，以 ASCII 为准。
+    if (code == ' ') return "Space";
+    if (code >= 32 && code <= 126) {
+        static char b[2];
+        b[0] = (char)code;
+        b[1] = 0;
+        return b;
+    }
     switch (code) {
         case KEY_LEFT_CTRL: case KEY_RIGHT_CTRL:   return "Ctrl";
         case KEY_LEFT_SHIFT: case KEY_RIGHT_SHIFT: return "Shift";
@@ -3336,6 +3537,30 @@ static const char* getKeyName(uint16_t code) {
             return b;
         }
         case KEY_KP_DOT:      return "Num .";
+        // 上面这组 KEY_KP_*(0x53~0x63)、KEY_NUM_LOCK 是 **HID usage 码**，
+        // 网页的按键下拉和 s3.ino 原版都按这套写的，保留给它们用。
+        // 但**按键矩阵里存的不是这套**：矩阵用的是 Arduino 的 "0x88 + usage"，
+        // 小键盘实际落在 0xDB~0xEB 这一段（0x88+0x53=0xDB = NumLock，
+        // 0x88+0x58=0xE0 = 小键盘回车，0x88+0x5F=0xE7 = 小键盘 7 …）。
+        // 不补下面这几行的话，"最近按键"和录制列表里小键盘会显示成 Ctl1B / E7 这种鬼东西。
+        case 0xCE: return "PrtSc";    // 0x88+0x46
+        case 0xCF: return "Scrlk";    // 0x88+0x47
+        case 0xD0: return "Pause";    // 0x88+0x48
+        case 0xDB: return "NumLk";    // 0x88+0x53
+        case 0xDC: return "Num /";    // 0x88+0x54
+        case 0xDD: return "Num *";    // 0x88+0x55
+        case 0xDE: return "Num -";    // 0x88+0x56
+        case 0xDF: return "Num +";    // 0x88+0x57
+        case 0xE0: return "NumEnt";   // 0x88+0x58
+        case 0xEA: return "Num 0";    // 0x88+0x62
+        case 0xEB: return "Num .";    // 0x88+0x63
+        case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5:
+        case 0xE6: case 0xE7: case 0xE8: case 0xE9: {   // 0x88+0x59~0x61 = 小键盘 1~9
+            static char b[7];
+            snprintf(b, sizeof(b), "Num %u", (unsigned)(code - 0xE0));
+            return b;
+        }
+        case 0xED: return "Menu";     // 0x88+0x65 应用/菜单键
         // 下面这组符号键 USBHIDKeyboard.h 里没有宏，直接用 HID Usage ID
         case 0x2F: return "[";       // [
         case 0x30: return "]";       // ]
@@ -3701,6 +3926,11 @@ static void scanKeyboardMatrix(void) {
                         totalKeyCount++;
                         lastActivityTime = millis();
 
+                        // 按键灯效：任何键都算，包括界面态里的菜单导航和宏键 ——
+                        // 界面里按方向键也该有反馈，不然会以为没按上。
+                        // 这里只置状态，真正的绘制在 20ms 的灯效节拍里做。
+                        triggerKeyReaction();
+
                         // 唤醒
                         if (currentSysMode == SYS_MODE_SLEEP) {
                             gotoMainScreen();
@@ -3792,19 +4022,10 @@ static void scanKeyboardMatrix(void) {
                             else if (baseKey == K_MR) {
                                 enterRecording();
                             }
-                            // 静音键（Consumer 页 0xE2）：先给主机发静音，再处理本机告警
-                            else if (baseKey == KEY_MUTE_USAGE) {
-                                // 0xE2 属于 HID Consumer Usage Page，不是 Keyboard。
-                                // 以前它落进下面的"普通键盘"分支走 Keyboard.press(0xE2)，
-                                // 主机那边收到的根本不是静音，等于这个键白配了。
-                                ConsumerControl.press(CONSUMER_CONTROL_MUTE);
-                                ConsumerControl.release();
-                                currentMode = MODE_MUTE;   // 旋钮跟着切到音量
-                                if (!acknowledgeAlert()) {
-                                    triggerHud("静音", "无待处理通知", lv_color_hex(CLR_TEXT_DIM));
-                                }
-                            }
                             // 宏按键
+                            // 小键盘整片（0xDB~0xEB，含 0xE2=小键盘 2）都不在这里拦，
+                            // 全部落到最后的"普通键盘"分支走 kbPress —— 这是对的。
+                            // 静音键在 C3 上（BTN:MUTE），别在这儿加分支。
                             else if (baseKey >= MACRO_BASE) {
                                 if (baseKey == K_LOGO) {
                                     // LOGO 短按 = 切换主屏风格；Fn+LOGO 仍然保留重启
@@ -4030,8 +4251,8 @@ static void handleCommand(const String& cmd) {
                         String rule = (semicolon > 0) ? rules.substring(start, semicolon) : rules.substring(start);
                         int comma = rule.indexOf(',');
                         if (comma > 0) {
-                            profileRemaps[prof][remapCounts[prof]].fromKey = (uint16_t)rule.substring(0, comma).toInt();
-                            profileRemaps[prof][remapCounts[prof]].toKey = (uint16_t)rule.substring(comma + 1).toInt();
+                            profileRemaps[prof][remapCounts[prof]].fromKey = normalizeRemapKey((uint16_t)rule.substring(0, comma).toInt());
+                            profileRemaps[prof][remapCounts[prof]].toKey = normalizeRemapKey((uint16_t)rule.substring(comma + 1).toInt());
 
                             char itemKey[20];
                             snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, remapCounts[prof]);
@@ -4424,7 +4645,10 @@ static void clearAllLeds() {
 }
 
 static void setMainLedsColor(uint8_t r, uint8_t g, uint8_t b) {
-    for (int i = 0; i < 15; i++) setLedRGB(i, r, g, b);
+    // 上界是 NUM_MAIN_LEDS（16），不是写死的 15 —— 原版 s3.ino 这里用的就是
+    // NUM_MAIN_LEDS，移植时被改成 15，于是 0 号之外的第 16 颗主灯（下标 15）
+    // 在"纯红/纯绿/纯白"这些常亮灯效下永远是黑的。彗星/双彗星/彩虹也有同样的问题。
+    for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, r, g, b);
 }
 
 // 三颗状态指示灯（对应 C3 上 16/17/18 号物理灯位）
@@ -4450,6 +4674,80 @@ static void drawBreathing(uint8_t maxR, uint8_t maxG, uint8_t maxB) {
     if (ratio < 0.0) ratio = 0.0;
     setMainLedsColor(maxR * ratio, maxG * ratio, maxB * ratio);
     effectFrame++;
+}
+
+// ---- 按键特效 ----
+// triggerKeyReaction() 在键盘扫描里"按键按下"时调一次，只是把状态置起来；
+// 真正的绘制在 renderLightingEngine() 里做（那边才有 20ms 的稳定节拍）。
+// 这样按键扫描那条热路径上只多一次赋值，不会因为画灯而拖慢扫描。
+static void triggerKeyReaction(void) {
+    if (keyFxStyle == KEYFX_OFF) return;
+
+    // 颜色每按一次换一种。原版 s3.ino 的"自动"档就是这个配色表。
+    static const uint32_t autoColors[6] = {
+        0xFF0000, 0x0000FF, 0x00FF00, 0xB400FF, 0x00FFFF, 0xFFFFFF
+    };
+    keyFxColor = autoColors[keyFxColorIdx];
+    keyFxColorIdx = (uint8_t)((keyFxColorIdx + 1) % 6);
+
+    if (keyFxStyle == KEYFX_SHOOT) {
+        // 找一发空闲的"子弹"；全都在飞就把第 0 发重置（原版就是这个兜底）
+        bool spawned = false;
+        for (int i = 0; i < KEYFX_MAX_SHOTS; i++) {
+            if (keyFxShotStep[i] < 0) { keyFxShotStep[i] = 0; spawned = true; break; }
+        }
+        if (!spawned) keyFxShotStep[0] = 0;
+    } else if (keyFxStyle == KEYFX_STACK) {
+        // 已经堆了几格就保留几格，新按的这一发从那一格开始往里推
+        if (keyFxStep > 0) keyFxStack = (uint8_t)((keyFxStack + 1) % NUM_MAIN_LEDS);
+        keyFxStep = 0;
+    } else {
+        keyFxStep = 0;
+    }
+    keyFxActive = true;
+}
+
+// 画一帧按键特效，返回 false 表示这一段播完了（调用方把 keyFxActive 清掉）。
+// 语义完全照抄原版 updateKeyReaction()：涟漪从中间向两侧扩散、
+// 发射从最后一颗往第一颗扫、堆叠从最后一颗往回填。
+static bool applyKeyReaction(void) {
+    uint8_t cr = (uint8_t)((keyFxColor >> 16) & 0xFF);
+    uint8_t cg = (uint8_t)((keyFxColor >>  8) & 0xFF);
+    uint8_t cb = (uint8_t)( keyFxColor        & 0xFF);
+
+    if (keyFxStyle == KEYFX_RIPPLE) {
+        int left  = (NUM_MAIN_LEDS / 2 - 1) - keyFxStep;
+        int right = (NUM_MAIN_LEDS / 2)     + keyFxStep;
+        if (left >= 0) setLedRGB(left, cr, cg, cb);
+        if (right < NUM_MAIN_LEDS) setLedRGB(right, cr, cg, cb);
+        keyFxStep++;
+        if (keyFxStep > NUM_MAIN_LEDS / 2) return false;
+
+    } else if (keyFxStyle == KEYFX_SHOOT) {
+        bool any = false;
+        for (int i = 0; i < KEYFX_MAX_SHOTS; i++) {
+            if (keyFxShotStep[i] < 0) continue;
+            int pos = (NUM_MAIN_LEDS - 1) - keyFxShotStep[i];
+            if (pos >= 0 && pos < NUM_MAIN_LEDS) setLedRGB(pos, cr, cg, cb);
+            keyFxShotStep[i]++;
+            if (keyFxShotStep[i] >= NUM_MAIN_LEDS) keyFxShotStep[i] = -1;
+            else any = true;
+        }
+        if (!any) return false;
+
+    } else if (keyFxStyle == KEYFX_STACK) {
+        for (int i = 0; i < keyFxStack; i++) setLedRGB(i, cr, cg, cb);
+        if (keyFxStep < NUM_MAIN_LEDS - keyFxStack) {
+            setLedRGB((NUM_MAIN_LEDS - 1) - keyFxStep, cr, cg, cb);
+        }
+        keyFxStep++;
+        if (keyFxStep >= NUM_MAIN_LEDS - keyFxStack) {
+            keyFxStack++;
+            if (keyFxStack >= NUM_MAIN_LEDS) keyFxStack = 0;
+            return false;
+        }
+    }
+    return true;
 }
 
 static void renderLightingEngine(void) {
@@ -4499,11 +4797,11 @@ static void renderLightingEngine(void) {
         case 10: { // 彗星
             static uint16_t effectFrame = 0;
             clearAllLeds();
-            int totalSteps = 28;  // (15-1)*2
+            int totalSteps = (NUM_MAIN_LEDS - 1) * 2;
             int step = effectFrame % totalSteps;
-            int pos = (step < 15) ? step : (totalSteps - step);
+            int pos = (step < NUM_MAIN_LEDS) ? step : (totalSteps - step);
             setLedRGB(pos, 255, 0, 50);
-            for (int i = 0; i < 15; i++) {
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) {
                 int diff = abs(i - pos);
                 if (diff == 1) setLedRGB(i, 80, 0, 15);
                 else if (diff == 2) setLedRGB(i, 20, 0, 3);
@@ -4514,13 +4812,14 @@ static void renderLightingEngine(void) {
         case 11: { // 双彗星
             static uint16_t effectFrame = 0;
             clearAllLeds();
-            int totalSteps = 28;
+            int totalSteps = (NUM_MAIN_LEDS - 1) * 2;
             int step = effectFrame % totalSteps;
-            int pos1 = (step < 15) ? step : (totalSteps - step);
-            int pos2 = (step < 15) ? (14 - step) : (step - 14);
+            int pos1 = (step < NUM_MAIN_LEDS) ? step : (totalSteps - step);
+            int pos2 = (step < NUM_MAIN_LEDS) ? (NUM_MAIN_LEDS - 1 - step)
+                                              : (step - NUM_MAIN_LEDS + 1);
             setLedRGB(pos1, 180, 0, 255);
             setLedRGB(pos2, 0, 180, 255);
-            for (int i = 0; i < 15; i++) {
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) {
                 if (abs(i - pos1) == 1) setLedRGB(i, 50, 0, 80);
                 if (abs(i - pos2) == 1) setLedRGB(i, 0, 50, 80);
             }
@@ -4529,14 +4828,28 @@ static void renderLightingEngine(void) {
         }
         case 12: { // 彩虹流光
             static uint16_t effectFrame = 0;
-            for (int i = 0; i < 15; i++) {
-                uint32_t col = colorHSV(effectFrame + (i * 65536L / 15), 255, 255);
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) {
+                uint32_t col = colorHSV(effectFrame + (i * 65536L / NUM_MAIN_LEDS), 255, 255);
                 setLedRGB(i, (col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF);
             }
             effectFrame += 256;
             break;
         }
         default: clearAllLeds(); break;
+        }
+
+        // ---- 按键特效叠加层 ----
+        // 必须压在**上面这套基础灯效之后**：先把 0~15 整体压暗到 ~40%，
+        // 再把特效那几颗点亮，特效才压得住底。顺序反了会被灯效盖掉。
+        // 40% 是原版 s3.ino updateKeyReaction() 里的 *102>>8，照抄。
+        // 告警期间走不到这里（上面已经 return），16~18 锁状态灯也不受影响。
+        if (keyFxActive && keyFxStyle != KEYFX_OFF) {
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) {
+                ledRgb[i][0] = (uint8_t)((ledRgb[i][0] * 102) >> 8);
+                ledRgb[i][1] = (uint8_t)((ledRgb[i][1] * 102) >> 8);
+                ledRgb[i][2] = (uint8_t)((ledRgb[i][2] * 102) >> 8);
+            }
+            if (!applyKeyReaction()) keyFxActive = false;
         }
     }
 
@@ -4587,18 +4900,29 @@ static void updateDynamicElements(void) {
     if (!ti || ti->tm_year < 124) return;
 
     static char time_buf[16], date_buf[32], num_buf[24];
-    static const char* WEEK[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 
     strftime(time_buf, sizeof(time_buf), "%H:%M", ti);
-    snprintf(date_buf, sizeof(date_buf), "%04d/%02d/%02d %s",
-             ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, WEEK[ti->tm_wday]);
+    // 主屏日期统一走中文（formatDateCN）。
+    formatDateCN(date_buf, sizeof(date_buf), ti->tm_mon + 1, ti->tm_mday, ti->tm_wday);
     snprintf(num_buf, sizeof(num_buf), "%u", totalKeyCount);
 
     // 顶部条的锁灯 + 方案指示（6 种风格共用）
+    // 三颗锁只占左上角 60px，离远了看不出"大写是不是开着"，所以除了圆点+外圈
+    // 变色，状态**刚翻转**的那一颗再弹一条 HUD，给一个明确的中文提示。
     const bool locks[3] = { numLock, capsLock, scrollLock };
+    static const char* lockNamesCN[3] = { "数字锁定", "大写锁定", "滚动锁定" };
     for (int i = 0; i < 3; i++) {
         setBgColor(topLockDot[i], locks[i] ? topLockOn[i] : CLR_STROKE);
+        setHidden(topLockRing[i], !locks[i]);
+        // lockPrevValid == false 表示界面刚重建过：这一帧只记录不弹窗，
+        // 否则重建后锁状态一样也会被判成"刚翻转"，回一次主屏弹三条提示。
+        if (lockPrevValid && locks[i] != lockPrev[i]) {
+            triggerHud(lockNamesCN[i], locks[i] ? "开启" : "关闭",
+                       lv_color_hex(locks[i] ? lockLedColor[i] : CLR_TEXT_MUTE));
+        }
+        lockPrev[i] = locks[i];
     }
+    lockPrevValid = true;
 
     // 方案指示：序号常显，系统图标只有方案 1(Windows) / 2(macOS) 才有；
     // 3/4 不是按系统分的方案，光看序号即可。
@@ -4614,7 +4938,11 @@ static void updateDynamicElements(void) {
             snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
             setText(gk_lbl_temp, tbuf);
             setText(gk_lbl_hum, hbuf);
+            // 累计次数是卡片右上角的角标，纯数字就够，不用再加单位
             setText(gk_lbl_keys, num_buf);
+            // 中间的按键反馈，跟"按键回显开关"走（"--" 而不是中文，
+            // 这个 label 是 montserrat_28，画不出汉字）
+            setText(gk_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
             break;
         }
 
@@ -4628,8 +4956,12 @@ static void updateDynamicElements(void) {
             setText(ip_lbl_clock, time_buf);
             setText(ip_lbl_date, date_buf);
             setText(ip_lbl_keys, num_buf);
-            // 菜单第 4 项「按键回显开关」控制的就是这里：关掉后不再显示具体按键名
-            setText(ip_lbl_lastkey, showKeystrokes ? lastKeyPressed : "已关闭");
+            // 菜单第 4 项「按键回显开关」控制的就是这里：关掉后不再显示具体按键名。
+            // 关闭态用 "--" 而不是中文"已关闭"：这个 label 挂的是 montserrat_48，
+            // 而 Montserrat 里没有汉字也没有 CJK 回退（CJK 字体的 fallback 是单向的
+            // —— simsun→montserrat 有，montserrat→simsun 没有），
+            // 写中文上去就是一片空白，看着像坏了。
+            setText(ip_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
             // 锁状态三层一起变：圆点亮语义色、文字提到主文字色、整颗胶囊底色抬起来。
             // 之前 ip_circle_* 建完之后根本没人刷新，三颗灯从头到尾都是灭的。
             // setBgColor/setTextColor 会先读回比对，值没变就不写 —— 这是关键，
@@ -4644,7 +4976,9 @@ static void updateDynamicElements(void) {
         }
 
         case DISP_MODE_KEY_MON: {
-            setText(km_lbl_lastkey, showKeystrokes ? lastKeyPressed : "已关闭");
+            // "--" 而不是"已关闭"：同 INFO_PANEL 分支，这个 label 是 montserrat_48，
+            // 画不出汉字。
+            setText(km_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
             setText(km_lbl_keys, num_buf);
             setText(km_lbl_profile, profileNamesCN[currentProfile]);
             break;
@@ -5001,13 +5335,15 @@ void setup() {
     currentProfile = preferences.getUChar("curr_prof", 0);
     totalKeyCount = preferences.getUInt("keyCount", 0);
 
-    // 灯光四项：与"灯光设置"页一一对应，回车保存时才写 NVS
+    // 灯光五项：与"灯光设置"页一一对应，回车保存时才写 NVS
     lightOn       = preferences.getBool("light_on", true);
     brightness    = preferences.getUChar("brightness", 140);
     currentEffect = preferences.getUChar("effect", 1);
     indLevel      = preferences.getUChar("ind_level", 3);
+    keyFxStyle    = preferences.getUChar("key_fx", KEYFX_RIPPLE);
     if (currentEffect >= MAX_EFFECTS) currentEffect = 1;
     if (indLevel >= IND_LEVEL_COUNT) indLevel = 3;
+    if (keyFxStyle >= KEYFX_COUNT) keyFxStyle = KEYFX_RIPPLE;
     indBrightness = indLevelValues[indLevel];
 
     shtTempOffset = preferences.getFloat("sht_offset", 62.0f);
@@ -5206,7 +5542,7 @@ void loop() {
         tickRhythm();
     } else if (currentSysMode == SYS_MODE_SLEEP) {
         // 息屏期间 updateDynamicElements() 不跑，屏保的时钟/温湿度自己刷
-        updateScreensaver();
+        updateScreensaver(false);
     }
 
     // HUD 消失
