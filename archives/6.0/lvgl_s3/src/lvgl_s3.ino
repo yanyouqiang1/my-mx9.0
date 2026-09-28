@@ -3599,29 +3599,42 @@ void switchProfile(uint8_t profIdx) {
 //               1~6 变成 Shift/Alt/Ctrl —— 整片小键盘全错。
 //               那套值的转换放在 remap 表读入处做（见 normalizeRemapKey）。
 //
-// 0x53~0x63 这段是 HID 小键盘 usage：网页 CMB 现在直接发这一段（见 s3-setting.html
-// 里的 Num /, Num *, Num 1 等）。落到 Keyboard.press() 会被 _asciimap 当成大写字母/
-// 符号（0x54='T' 0x55='U' 0x59='Y'），所以这一段必须直接走 pressRaw。不用 0x88+offset
-// 形式是因为那一段会落进 [0xE0,0xE7] 跟 HID 修饰键撞车（见 normalizeRemapKey）。
+// 0x53~0x63 这段原本被当成 HID 小键盘 usage 走 pressRaw(因为 _asciimap[0x54]='T' 等),
+// 但 ASCII 'a'/'b'/'c' = 0x61/0x62/0x63 跟 HID Num9/Num0/Num. 是**同一个数字**,
+// baseMatrix 里这些 ASCII 字母走这条分支会被发成小键盘数字 ——
+// 这是基础键盘按 A 出 9、按 B 出 0、按 C 出 . 的根因。
+//
+// 修法:把 CMB 小键盘的编码从 HID Usage(0x53-0x63)统一改成 ASCII,这样
+//   Num / = '/' = 0x2F    _asciimap[0x2F] = 0x38 → HID /
+//   Num * = '*' = 0x2A    _asciimap[0x2A] = 0x25|SHIFT → SHIFT+8 → '*'
+//   Num - = '-' = 0x2D    _asciimap[0x2D] = 0x2D → HID -
+//   Num + = '+' = 0x2B    _asciimap[0x2B] = 0x2e|SHIFT → SHIFT+= → '+'
+//   Num Enter = '\n'=0x0A  _asciimap[0x0A] = 0x28 → HID Enter
+//   Num 1-9 = '1'-'9'     _asciimap[0x31..0x39] = 0x1E-0x26 → HID 1-9
+//   Num 0 = '0'           _asciimap[0x30] = 0x27 → HID 0
+//   Num . = '.'           _asciimap[0x2E] = 0x37 → HID .
+// 全部走 Keyboard.press() 就好,数值歧义彻底没了。
+//
+// 这条修法的关键证据是 s3-setting.html:1056 那条已知 bug 注释,
+// 之前一直没修是因为没看出 0x53-0x63 跟 ASCII 'a'-'c' 的数值撞车。
 static inline void kbPress(uint8_t code) {
     // [DEBUG a→9] 临时诊断:打出实际走的分支,定位 baseKey 是多少、走的是哪条路径
     const char* path = "press";
     if (code >= 0x80 && code < 0x88) {
         path = "pressRaw(mod+0x60)";
         Keyboard.pressRaw((uint8_t)(code + 0x60));
-    } else if (code >= 0x53 && code <= 0x63) {
-        path = "pressRaw(numpad)";
-        Keyboard.pressRaw(code);
-    } else {
+    } else if (code != 0) {
+        path = "press(_asciimap)";
         Keyboard.press(code);
+    } else {
+        path = "skip(null)";
     }
     LOG_PORT.printf("[KB] press code=0x%02X path=%s\n", code, path);
 }
 
 static inline void kbRelease(uint8_t code) {
     if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
-    else if (code >= 0x53 && code <= 0x63) Keyboard.releaseRaw(code);
-    else Keyboard.release(code);
+    else if (code != 0) Keyboard.release(code);
 }
 
 // 网页"按键映射"下拉里的修饰键给的是 HID 风格 224~231，而 Keyboard.press() 按
@@ -4281,6 +4294,10 @@ static void scanKeyboardMatrix(void) {
                                 // [DEBUG a→9] 临时诊断:确认 baseKey 和 remap 后实际送 kbPress 的码点
                             LOG_PORT.printf("[KB] base=0x%04X mapped=0x%04X cnt=%d\n",
                                 baseKey, mappedKey, remapCounts[currentProfile]);
+                            // 强制重置节流,确保 kbPress 里那条 [KB] press code=... 不会被吞掉。
+                            // 按键两条日志挨着(<1ms),正常 100ms 节流会把第二条丢了,
+                            // 那样就看不到 kbPress 走哪个分支,定位就缺一半证据。
+                            logLastNotifyMs = 0;
                             kbPress((uint8_t)mappedKey);
                             }
                         }

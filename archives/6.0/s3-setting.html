@@ -460,16 +460,16 @@
         "'": 52, "`": 53, ",": 54, ".": 55, "/": 56,
         "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
         "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
-        // 小键盘：发的是裸 HID usage（0x54-0x63），固件 kbPress 识别后会直接
-        // pressRaw，不走 _asciimap（_asciimap 会把 0x54 翻成 'T'、0x59 翻成 'Y'）。
-        // 故意没用 0x88+usage 的 offset 形式：0x88+0x59=0xE1 落在 [0xE0,0xE7]，
-        // remap 表加载时的 normalizeRemapKey 会把它认成 HID 修饰键 (0xE1→0x81)，
-        // "→ Num 1" 就会被静默改成 "→ Left Shift"。raw usage 0x54-0x63 不在
-        // normalizeRemapKey 的过滤范围，remap 路径也安全。
-        "Num Lock": 83, "Num /": 84, "Num *": 85, "Num -": 86, "Num +": 87, "Num Enter": 88,
-        "Num 1": 89, "Num 2": 90, "Num 3": 91, "Num 4": 92, "Num 5": 93,
-        "Num 6": 94, "Num 7": 95, "Num 8": 96, "Num 9": 97,
-        "Num 0": 98, "Num .": 99,
+        // 小键盘：改用 ASCII 编码(0x0A / 0x2A-0x2F / 0x30-0x39),固件 kbPress 走 _asciimap
+        // 自然翻成对应 HID usage。原来用 HID 0x53-0x63 时,ASCII 'a'/'b'/'c' = 0x61-0x63
+        // 落在同一段,基础键盘按 a/b/c 会被发成 Num 9/Num 0/Num . —— 这是 A→9/B→0/C→. 的根因。
+        // ASCII 编码后,a/b/c 走 _asciimap[0x61..0x63] = 0x04/0x05/0x06 (HID a/b/c),
+        // 小键盘 '1'-'9'/'0'/'/'/'*'/'-'/'+'/'.' 也各自有 _asciimap 条目正确翻译。
+        // Num Lock 没有 ASCII 等价(它是 toggle 键),从下拉里移除;Num Enter 用 '\n'(0x0A)。
+        "Num /": 47, "Num *": 42, "Num -": 45, "Num +": 43, "Num Enter": 10,
+        "Num 1": 49, "Num 2": 50, "Num 3": 51, "Num 4": 52, "Num 5": 53,
+        "Num 6": 54, "Num 7": 55, "Num 8": 56, "Num 9": 57,
+        "Num 0": 48, "Num .": 46,
         // REMAP 专用修饰键（HID 标准 0xE0-0xE7）
         "🔹 Left Ctrl": 224, "🔹 Left Shift": 225, "🔹 Left Alt": 226, "🔹 Left GUI/Win": 227,
         "🔹 Right Ctrl": 228, "🔹 Right Shift": 229, "🔹 Right Alt": 230, "🔹 Right GUI/Win": 231
