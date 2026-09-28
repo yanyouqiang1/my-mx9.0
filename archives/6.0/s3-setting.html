@@ -42,6 +42,11 @@
         /* 紧凑列表样式 */
         .rule-row { display: flex; gap: 8px; align-items: center; padding: 8px; background: #334155; border-radius: 4px; margin-bottom: 6px; }
         .rule-row .arrow { color: #38bdf8; font-weight: bold; }
+
+        /* 宏面板互斥：当前模式面板正常显示，另一个面板整体灰掉且不可点。
+           两个面板同框可见，让用户一眼看到"两种模式只能用一种"。 */
+        .macro-panel { transition: opacity 0.15s; }
+        .panel-disabled { opacity: 0.35; pointer-events: none; user-select: none; }
     </style>
 </head>
 <body>
@@ -64,8 +69,10 @@
             <div style="display: flex; gap: 15px; align-items: center;">
                 <button class="btn" id="connectBtn">连接键盘蓝牙</button>
                 <span id="status" style="font-weight: bold; color: #f87171;">未连接</span>
-                <button class="btn btn-green" id="syncTimeBtn" style="margin-left: auto;">同步电脑时间</button>
+                <button class="btn btn-orange" id="readAllBtn" style="margin-left: auto;" disabled title="连上后才能读">📥 一次性预加载全部(可选)</button>
+                <button class="btn btn-green" id="syncTimeBtn">同步电脑时间</button>
             </div>
+            <div class="hint" id="readAllProgress" style="margin-top: 6px; color: #38bdf8;"></div>
             <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
                 <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
                 <div class="alert-bar">
@@ -139,6 +146,7 @@
                 </select>
                 <button class="btn btn-tag" id="remapLoadBtn">📥 从键盘读取</button>
                 <button class="btn btn-red" id="remapClearBtn">🗑️ 清空此方案</button>
+                <button class="btn btn-red" id="remapResetAllBtn" title="一键清掉所有方案的按键映射,解决老 REMAP 残留(按 A 变 9 这类)">⚠️ 清空全部 4 方案映射</button>
             </div>
 
             <div class="grid-3" style="margin-top: 12px;">
@@ -203,21 +211,30 @@
                     </select>
 
                     <label style="margin-top: 6px; display:block;">② 附加组合键 / 打字效果：</label>
-                    <div class="chk-group">
-                        <label><input type="checkbox" id="globalkCtrl"> Ctrl</label>
-                        <label><input type="checkbox" id="globalkAlt"> Alt</label>
-                        <label><input type="checkbox" id="globalkShift"> Shift</label>
-                        <label><input type="checkbox" id="globalkWin"> Win/Cmd</label>
+                    <div class="mode-tabs">
+                        <label><input type="radio" name="globalkMode" value="CMB" checked onchange="toggleGlobalkMode()"> ⚡ 组合快捷键 (同时按下并释放)</label>
+                        <label><input type="radio" name="globalkMode" value="SEQ" onchange="toggleGlobalkMode()"> 🔤 打字效果 (连续击键流)</label>
                     </div>
-                    <div style="display: flex; gap: 8px;">
-                        <select id="globalkKeySelect" style="flex: 2;"></select>
-                        <input type="text" id="globalkCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
+
+                    <div id="globalkCmbPanel" class="macro-panel" style="background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
+                        <div class="hint">所有键将同时按下并释放。可加多个普通键（Num* + Num1 + Num2 全部一起按）</div>
+                        <div class="chk-group" style="margin-top: 6px;">
+                            <label><input type="checkbox" id="globalkCtrl"> Ctrl</label>
+                            <label><input type="checkbox" id="globalkAlt"> Alt</label>
+                            <label><input type="checkbox" id="globalkShift"> Shift</label>
+                            <label><input type="checkbox" id="globalkWin"> Win/Cmd</label>
+                        </div>
+                        <div class="hint" style="margin: 8px 0 4px;">普通键列表（按下时全部一起按）：</div>
+                        <div class="hint" style="font-size: 0.8rem; color: #94a3b8;">字母键发的是小写 a-z，要大写字母请勾上面 Shift；标点 [ ] \ ; ' ` , . / 直接选对应的键。</div>
+                        <div id="globalkCmbKeysList"></div>
+                        <button class="btn-tag" onclick="addGlobalkComboKey()" style="margin-top: 4px;">+ 添加普通键</button>
+                        <div id="globalkCmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 还没添加任何普通键，CMB 没法执行</div>
                     </div>
-                    <div style="margin-top: 6px;">
-                        <button class="btn-tag" onclick="setGlobalkMode('CMB')">⚡ 组合快捷键 (同时按下)</button>
-                        <button class="btn-tag" onclick="setGlobalkMode('SEQ')">🔤 打字效果 (连续击键)</button>
+
+                    <div id="globalkSeqPanel" class="macro-panel" style="background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
+                        <div class="hint">逐个字符发送（连续输入），可插入 [ENTER]/[TAB]/[ESC]/[BACKSPACE]/SLEEP(ms)</div>
+                        <textarea id="globalkSeqInput" rows="2" placeholder="例：ls -la[ENTER]sudo apt update[ENTER]"></textarea>
                     </div>
-                    <textarea id="globalkSeqInput" rows="2" placeholder="打字模式在此填字符序列（与上方组合键互斥）：例：ls -la[ENTER]"></textarea>
 
                     <button class="btn btn-green" id="saveGlobalkBtn" style="width: 100%; margin-top: 10px;">保存全局动作</button>
                     <button class="btn btn-tag" id="clearGlobalkBtn" style="width: 100%; margin-top: 6px;">🗑️ 清除此键全局配置</button>
@@ -269,7 +286,8 @@
                     <label><input type="radio" name="macroMode" value="CMB" onchange="toggleMacroMode()"> ⚡ 组合快捷键 (同时按下并释放)</label>
                 </div>
 
-                <div id="seqPanel">
+                <div id="seqPanel" class="macro-panel" style="background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
+                    <div class="hint">逐个字符发送（连续输入），可插入 [ENTER]/[TAB]/[ESC]/[BACKSPACE]/SLEEP(ms)</div>
                     <div style="margin: 5px 0;">
                         <button class="btn-tag" onclick="insertMacroTag('[ENTER]')">回车 [ENTER]</button>
                         <button class="btn-tag" onclick="insertMacroTag('[TAB]')">Tab [TAB]</button>
@@ -281,21 +299,27 @@
                     <textarea id="seqInput" rows="3" placeholder="例：sudo apt update[ENTER]SLEEP(500)sudo apt upgrade -y[ENTER]"></textarea>
                 </div>
 
-                <div id="cmbPanel" style="display: none; background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
-                    <div class="hint">选择修饰键与按键，按下时将同时按下并释放（如 Ctrl + Shift + Esc）：</div>
-                    <div class="chk-group" style="margin-top: 8px;">
+                <div id="cmbPanel" class="macro-panel" style="background: #334155; padding: 12px; border-radius: 6px; margin: 6px 0;">
+                    <div class="hint">所有键将同时按下并释放。可加多个普通键（Num* + Num1 + Num2 + Num3 全部一起按）</div>
+
+                    <div class="hint" style="margin: 8px 0 4px;">修饰键（可勾选 0~4 个）：</div>
+                    <div class="chk-group">
                         <label><input type="checkbox" id="macroCtrl"> Ctrl</label>
                         <label><input type="checkbox" id="macroAlt"> Alt</label>
                         <label><input type="checkbox" id="macroShift"> Shift</label>
                         <label><input type="checkbox" id="macroWin"> Win/Cmd</label>
                     </div>
-                    <div style="display: flex; gap: 8px; margin-top: 6px;">
-                        <select id="macroKeySelect" style="flex: 2;"></select>
-                        <input type="text" id="macroCustomChar" maxlength="1" placeholder="或单字符" style="flex: 1;">
-                    </div>
+
+                    <div class="hint" style="margin: 8px 0 4px;">普通键列表（按下时全部一起按）：</div>
+                    <div class="hint" style="font-size: 0.8rem; color: #94a3b8;">字母键发的是小写 a-z，要大写字母请勾上面 Shift；标点 [ ] \ ; ' ` , . / 直接选对应的键。</div>
+                    <div id="cmbKeysList"></div>
+                    <button class="btn-tag" onclick="addComboKey()" style="margin-top: 4px;">+ 添加普通键</button>
+                    <div id="cmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 还没添加任何普通键，CMB 没法执行</div>
                 </div>
 
                 <button class="btn btn-green" id="saveMacroBtn" style="width: 100%; margin-top: 8px;">保存宏配置到当前方案</button>
+                <button class="btn btn-tag" id="clearMacroBtn" style="width: 100%; margin-top: 6px;">🗑️ 清空当前键宏（清掉键盘里存的所有内容）</button>
+                <button class="btn btn-red" id="resetAllMacrosBtn" style="width: 100%; margin-top: 6px;">⚠️ 清空所有宏（M1~M12 × 4 方案 + MA + MB）</button>
             </div>
         </div>
     </div>
@@ -375,23 +399,78 @@
             </div>
             <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
         </div>
+
+        <!-- 5. BLE 日志通道（USB HID 模式下的调试退路） -->
+        <div class="card">
+            <h2>4. BLE 实时日志通道</h2>
+            <div class="hint">
+                刷成 USB Keyboard 后 UART0 在大多数电脑上没法再读串口了,
+                <b>所有 LOG_PORT.printf 的字节改走 BLE notify</b> 回传到这里。
+                设计很简单:固件按行推,网页按行收,自动滚到底。
+                <br><br>
+                <b>开流</b>:实时刷新,适合"我按一下键看路径"。最多 ~50 行/秒,免得把 NimBLE 队列灌爆。
+                <br>
+                <b>拉历史</b>:把固件 8KB PSRAM 环形缓冲整段拉回来(约 ~80 行最近日志),
+                缓冲在固件里持久保留到下次开机或点"清空"。
+                <br>
+                <b>清空</b>:清固件缓冲。注意关流后缓冲**继续在落**,只是不再实时推。
+            </div>
+            <div style="display: flex; gap: 8px; margin-top: 10px;">
+                <button class="btn btn-green" id="logOnBtn" style="flex: 1;">▶ 开流</button>
+                <button class="btn btn-tag" id="logOffBtn" style="flex: 1;">■ 关流</button>
+                <button class="btn btn-orange" id="logDumpBtn" style="flex: 1;">📥 拉历史</button>
+                <button class="btn btn-red" id="logClearBtn" style="flex: 1;">🗑 清空</button>
+            </div>
+            <div id="logStatus" style="font-size: 0.85rem; color: #94a3b8; margin-top: 8px;">
+                状态:未连接
+            </div>
+            <pre id="logBox" style="margin-top: 8px; max-height: 320px; overflow-y: auto;
+                 background: #0b1220; color: #a7f3d0; padding: 10px; border-radius: 6px;
+                 font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem;
+                 white-space: pre-wrap; word-break: break-all; line-height: 1.4;
+                 border: 1px solid #1e293b;">（还没有日志。按"开流"开始接收实时日志,或"拉历史"一次性拉回最近 80 行）</pre>
+        </div>
     </div>
 
 <script>
-    // 键码字典：数字 = HID Usage ID，与固件 getKeyName() 的标准值一致。
+    // 键码字典：数字 = HID Keyboard Usage ID（USB HID 1.11 spec, Page 7）。
+    // 固件 kbPress() 按这套处理：
+    //   · 0x80-0x87 修饰键 (Arduino KEY_* 风格,会被 +0x60 转成 HID 0xE0-0xE7)
+    //   · 0x53-0x63 小键盘 usage,直接 pressRaw
+    //   · 其它 走 Keyboard.press(),被 _asciimap 翻成大写字母+SHIFT
+    //
+    // 之前这套字典 A-Z=97-122、0-9=48-57 是按 ASCII 写的,落进 0x53-0x63
+    // 范围的那几位会被固件当成小键盘数字 ("A"=97→Num9、"B"=98→Num0、
+    // "C"=99→Num.)。[] 这类标点也根本没有列出来,设了等于映射到未知键。
+    // 现在全部按 HID Usage ID 写,字母是 0x04-0x1D、标点是 0x2D-0x38、小键盘是
+    // 0x53-0x63,所有范围都跟固件对上。大写字母键需要单独勾 Shift 修饰键才会
+    // 出大写(HID usage 就是小写 a-z,不会自动加 SHIFT)。
     const KEY_OPTIONS = {
         "无按键": 0,
-        "A": 97, "B": 98, "C": 99, "D": 100, "E": 101, "F": 102, "G": 103,
-        "H": 104, "I": 105, "J": 106, "K": 107, "L": 108, "M": 109, "N": 110,
-        "O": 111, "P": 112, "Q": 113, "R": 114, "S": 115, "T": 116, "U": 117,
-        "V": 118, "W": 119, "X": 120, "Y": 121, "Z": 122,
-        "0": 48, "1": 49, "2": 50, "3": 51, "4": 52, "5": 53, "6": 54, "7": 55, "8": 56, "9": 57,
+        "A": 4, "B": 5, "C": 6, "D": 7, "E": 8, "F": 9, "G": 10,
+        "H": 11, "I": 12, "J": 13, "K": 14, "L": 15, "M": 16, "N": 17,
+        "O": 18, "P": 19, "Q": 20, "R": 21, "S": 22, "T": 23, "U": 24,
+        "V": 25, "W": 26, "X": 27, "Y": 28, "Z": 29,
+        "1": 30, "2": 31, "3": 32, "4": 33, "5": 34,
+        "6": 35, "7": 36, "8": 37, "9": 38, "0": 39,
         "F1": 194, "F2": 195, "F3": 196, "F4": 197, "F5": 198, "F6": 199,
         "F7": 200, "F8": 201, "F9": 202, "F10": 203, "F11": 204, "F12": 205,
-        "Enter 回车": 176, "Esc": 177, "Backspace 退格": 178, "Tab": 179, "Space 空格": 32,
+        "Enter 回车": 40, "Esc": 41, "Backspace 退格": 42, "Tab": 43, "Space 空格": 44,
+        "-": 45, "=": 46, "[": 47, "]": 48, "\\": 49, ";": 51,
+        "'": 52, "`": 53, ",": 54, ".": 55, "/": 56,
         "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
         "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
-        // REMAP 专用修饰键（HID 标准）
+        // 小键盘：发的是裸 HID usage（0x54-0x63），固件 kbPress 识别后会直接
+        // pressRaw，不走 _asciimap（_asciimap 会把 0x54 翻成 'T'、0x59 翻成 'Y'）。
+        // 故意没用 0x88+usage 的 offset 形式：0x88+0x59=0xE1 落在 [0xE0,0xE7]，
+        // remap 表加载时的 normalizeRemapKey 会把它认成 HID 修饰键 (0xE1→0x81)，
+        // "→ Num 1" 就会被静默改成 "→ Left Shift"。raw usage 0x54-0x63 不在
+        // normalizeRemapKey 的过滤范围，remap 路径也安全。
+        "Num Lock": 83, "Num /": 84, "Num *": 85, "Num -": 86, "Num +": 87, "Num Enter": 88,
+        "Num 1": 89, "Num 2": 90, "Num 3": 91, "Num 4": 92, "Num 5": 93,
+        "Num 6": 94, "Num 7": 95, "Num 8": 96, "Num 9": 97,
+        "Num 0": 98, "Num .": 99,
+        // REMAP 专用修饰键（HID 标准 0xE0-0xE7）
         "🔹 Left Ctrl": 224, "🔹 Left Shift": 225, "🔹 Left Alt": 226, "🔹 Left GUI/Win": 227,
         "🔹 Right Ctrl": 228, "🔹 Right Shift": 229, "🔹 Right Alt": 230, "🔹 Right GUI/Win": 231
     };
@@ -412,10 +491,10 @@
     }
 
     function populateAll() {
-        populateSelect(document.getElementById('globalkKeySelect'), KEY_OPTIONS_NO_MODS);
-        populateSelect(document.getElementById('macroKeySelect'), KEY_OPTIONS_NO_MODS);
         populateSelect(document.getElementById('remapFromSel'), KEY_OPTIONS);
         populateSelect(document.getElementById('remapToSel'), KEY_OPTIONS);
+        // 宏键 / 全局键的普通键列表都是动态生成的（addComboKey / addGlobalkComboKey
+        // → renderComboKeys / renderGlobalkComboKeys），不在这里预先 populate。
     }
     populateAll();
 
@@ -451,15 +530,42 @@
             }
             document.getElementById('status').innerText = "已连接 ✅";
             document.getElementById('status').style.color = "#4ade80";
+            // 连接成功后启用"预加载全部"按钮(可选)。默认按需取,选键时单条拉。
+            const rBtn = document.getElementById('readAllBtn');
+            if (rBtn) { rBtn.disabled = false; rBtn.title = "可选:一次性预加载全部配置,后续切键免等"; }
         } catch(e) {
             alert("连接失败: " + e.message);
+        }
+    });
+
+    // 一次性预加载全部:54 条 BLE 指令,串行 800ms timeout 一条,跑完会刷 UI。
+    // 默认是按需取(选键/选方案时自动拉那一条),这个按钮只给想一次性浏览的人用。
+    document.getElementById('readAllBtn').addEventListener('click', async () => {
+        const btn = document.getElementById('readAllBtn');
+        const pBox = document.getElementById('readAllProgress');
+        btn.disabled = true;
+        btn.innerText = "⏳ 预加载中...";
+        try {
+            await readAllConfig((done, label) => {
+                pBox.innerText = `预加载进度: ${done}/54 (${label})`;
+            });
+            pBox.innerText = "✅ 预加载完成,后续切键不再需要等";
+        } catch (e) {
+            pBox.innerText = "❌ 读取失败: " + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.innerText = "📥 一次性预加载全部(可选)";
         }
     });
 
     // 键盘回话通道：固件会用它 notify 上传结果（LOGOSTATUS:）和映射规则回读（REMAPDUMP:）。
     // 之前特征只有 WRITE，键盘没有任何回话通道，网页上就"发完即当成功"。
     let bleNotifyLines = [];
-    let bleNotifyHandler = null;
+    // 多 waiter 队列：每次 waitBleNotify 把 {prefix, resolve, timer} 推进 pendingWaits，
+    // 来一行 notify 就 FIFO 找第一个前缀匹配的,消费掉。
+    // 旧版用单 handler 链式:MA → MB → M1 三连击时,MA 的响应回来后 handler 被重置成 null,
+    // 后续 MB/M1 的响应没人接收,800ms 后全部超时 UI 显示空。改队列后每个 waiter 独立跟踪。
+    let pendingWaits = [];
 
     function onBleNotify(e) {
         const dv = e.target.value;
@@ -474,21 +580,46 @@
             const t = line.trim();
             if (!t) continue;
             LOG_PORT_UI("← " + t);
-            if (bleNotifyHandler) bleNotifyHandler(t);
+            // BLE 日志通道:固件按行推 LOG:<text> / LOGDUMP:<chunk> / LOGDUMP:END
+            // / LOG:STREAM_ON / LOG:STREAM_OFF / LOG:CLEARED。 LOG:STREAM_OFF/
+            // LOGDUMP:END 是控制面消息,不显示;LOG: 和 LOGDUMP: 落到日志面板。
+            // 注意 LOG: 优先级最高,要在 waitBleNotify 之前消费,
+            // 否则 "LOG:xx" 会被某个 "LOG" 前缀的 waiter 截胡。
+            if (t.startsWith("LOGDUMP:")) {
+                handleLogDumpLine(t.substring(8));
+                continue;
+            }
+            if (t === "LOGDUMP:END") { handleLogDumpEnd(); continue; }
+            if (t === "LOG:STREAM_ON")  { updateLogStatus("状态:实时开流中..."); continue; }
+            if (t === "LOG:STREAM_OFF") { updateLogStatus("状态:关流(缓冲仍在落)"); continue; }
+            if (t === "LOG:CLEARED")    { logBuffer.length = 0; renderLogBox(); updateLogStatus("状态:缓冲已清空"); continue; }
+            if (t.startsWith("LOG:")) {
+                appendLogLine(t.substring(4));
+                continue;
+            }
+            // FIFO 匹配:最早的 waiter 先消费。固件命令处理是单线程顺序执行,
+            // notify 顺序跟 send 顺序一致,FIFO 匹配结果正确。
+            for (let i = 0; i < pendingWaits.length; i++) {
+                if (t.startsWith(pendingWaits[i].prefix)) {
+                    clearTimeout(pendingWaits[i].timer);
+                    const w = pendingWaits[i];
+                    pendingWaits.splice(i, 1);
+                    w.resolve(t);
+                    break;
+                }
+            }
         }
     }
 
     // 等键盘回一句话（带超时）。键盘主动 notify，不回来的就返回 null。
     function waitBleNotify(prefix, timeoutMs) {
         return new Promise((resolve) => {
-            const prev = bleNotifyHandler;
-            const timer = setTimeout(() => { bleNotifyHandler = prev; resolve(null); }, timeoutMs);
-            bleNotifyHandler = (line) => {
-                if (!line.startsWith(prefix)) { if (prev) prev(line); return; }
-                clearTimeout(timer);
-                bleNotifyHandler = prev;
-                resolve(line);
-            };
+            const entry = { prefix, resolve };
+            entry.timer = setTimeout(() => {
+                pendingWaits = pendingWaits.filter(e => e !== entry);
+                resolve(null);
+            }, timeoutMs);
+            pendingWaits.push(entry);
         });
     }
 
@@ -519,6 +650,311 @@
         const t = new Date().toLocaleTimeString();
         box.innerHTML = (box.innerHTML + `<div>[${t}] ${msg}</div>`).split('\n').slice(-60).join('\n');
         box.scrollTop = box.scrollHeight;
+    }
+
+    // ========== BLE 日志通道：实时流 + 历史回拉 ==========
+    // 协议:固件 LOG:on 后每行日志 notify `LOG:<text>`(50Hz 节流,丢是常态)。
+    //      LOG:dump 把 8KB PSRAM 缓冲按整行分片 notify 一串 `LOGDUMP:<chunk>`,
+    //      最后一条 `LOGDUMP:END` 表示完毕。
+    // 这里只做:接收 + 拼行 + 显示,不做解析。文本就是 raw 字节。
+    let logBuffer = [];           // 已落地的日志行
+    let logDumpBuf = "";          // LOG:dump 拉回来的拼接中片段
+    const LOG_MAX_LINES = 2000;   // 浏览器端上限,超过丢最老
+
+    function appendLogLine(text) {
+        const t = (text || "").replace(/</g, "&lt;");
+        logBuffer.push(t);
+        if (logBuffer.length > LOG_MAX_LINES) {
+            logBuffer = logBuffer.slice(logBuffer.length - LOG_MAX_LINES);
+        }
+        renderLogBox();
+    }
+
+    function handleLogDumpLine(chunk) {
+        // LOGDUMP: 把缓冲的若干 \n 分隔行整片塞过来(固件按整行切),
+        // 可能一片里有多个 \n,这边拆成多行追加。
+        logDumpBuf += chunk;
+        let idx;
+        while ((idx = logDumpBuf.indexOf('\n')) >= 0) {
+            const line = logDumpBuf.substring(0, idx);
+            logDumpBuf = logDumpBuf.substring(idx + 1);
+            if (line.length > 0) appendLogLine(line);
+        }
+    }
+
+    function handleLogDumpEnd() {
+        if (logDumpBuf.length > 0) { appendLogLine(logDumpBuf); logDumpBuf = ""; }
+        updateLogStatus(`状态:已拉回 ${logBuffer.length} 行历史`);
+    }
+
+    function updateLogStatus(s) {
+        const el = document.getElementById('logStatus');
+        if (el) el.innerText = s;
+    }
+
+    function renderLogBox() {
+        const box = document.getElementById('logBox');
+        if (!box) return;
+        if (logBuffer.length === 0) {
+            box.innerText = "（还没有日志。按\"开流\"开始接收实时日志,或\"拉历史\"一次性拉回最近 80 行）";
+            return;
+        }
+        box.innerText = logBuffer.join('\n');
+        // 自动滚到底,除非用户在往上翻看历史(简单判定:已经离底部 30 像素以内才滚)
+        const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+        if (nearBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    // 连接成功后,自动改一下状态栏(只有在系统 Tab 才会显示,所以下面再用 connectBtn 那条链改)
+    // 开流按钮
+    document.getElementById('logOnBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        const ok = await sendBLE("LOG:on");
+        if (ok) updateLogStatus("状态:已请求开流,等固件回应 LOG:STREAM_ON...");
+    });
+    document.getElementById('logOffBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        await sendBLE("LOG:off");
+    });
+    document.getElementById('logDumpBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        logDumpBuf = "";
+        logBuffer = [];    // 清空当前显示,只看刚拉到的历史
+        renderLogBox();
+        updateLogStatus("状态:正在拉历史...");
+        await sendBLE("LOG:dump");
+    });
+    document.getElementById('logClearBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        await sendBLE("LOG:clear");
+        logBuffer = []; renderLogBox();
+    });
+
+    // 连接成功时同步把状态栏刷新一下,免得一直停在"未连接"
+    // (connectBtn 的成功分支里加这一行太碎,直接在 init 末尾检查 myCharacteristic 不太合适,
+    //  改成 listen 一下)
+    // 简洁做法: connectBtn 成功之后我们没有钩子,这里在 user 切到 system tab 时兜底刷一次。
+    // (简单点就这样,够用)
+
+    // ========== 批量读回所有配置 ==========
+    // configCache 装从键盘读回的所有 NVS 配置(remap / 宏 / 全局动作),切键时按需喂给 UI。
+    // ME 文本故意不在这里读:ME 内容可能十几 KB,BLE notify 单条上限 BLE_CMD_BUF_SIZE=256,
+    // 而且网页本来就有"我自己要改"的选择,读回来意义不大。
+    const configCache = {
+        remaps: {},     // { 0: [{from,to}, ...], 1: [...], ... }
+        macros: {},     // { "p0_M1": "SEQ:abc...", "p0_M2": "CMB:128,4", ... }   null/NONE = 未设
+        gkeys: {}       // { "MA": "SW:1+CMB:128,4", "MB": "NONE" }
+    };
+
+    // 单条读宏,800ms timeout。返回值是 raw body(去掉前缀的 "SEQ:..." / "CMB:..." / "NONE"),
+    // 失败返回 null。串行发即可,蓝牙 WRITE 不能并发。
+    async function readMacroConfig(prof, mKey) {
+        const key = `p${prof}_${mKey}`;
+        const p = `MACRODUMP:${key}:`;
+        const pr = waitBleNotify(p, 800);
+        await sendBLE(`MACRODUMP:${key}`);
+        const line = await pr;
+        if (!line) return null;
+        return line.substring(p.length);
+    }
+
+    async function readGlobalkConfig(key) {
+        const p = `GKEYDUMP:${key}:`;
+        const pr = waitBleNotify(p, 800);
+        await sendBLE(`GKEYDUMP:${key}`);
+        const line = await pr;
+        if (!line) return null;
+        return line.substring(p.length);
+    }
+
+    // 批量预加载:4 方案 × REMAP(4 条) + M1-M12(48 条) + MA/MB(2 条) = 54 条。
+    // 默认走按需取(ensureXxx),这个只在用户主动点"一次性预加载"按钮时跑。
+    // 串行 + 短 timeout,实测 30 秒内能跑完。读回后自动刷新当前显示的 UI。
+    async function readAllConfig(onProgress) {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        const startMs = Date.now();
+        let total = 0, ok = 0;
+
+        // 1. REMAP 4 个方案
+        for (let p = 0; p < 4; p++) {
+            total++;
+            const rules = await readRemap(p);
+            configCache.remaps[p] = rules || [];
+            if (rules !== null) ok++;
+            if (onProgress) onProgress(total, `REMAP 方案${p + 1}`);
+        }
+
+        // 2. 方案专属宏 4 × 12
+        for (let p = 0; p < 4; p++) {
+            for (let m = 1; m <= 12; m++) {
+                total++;
+                const data = await readMacroConfig(p, m);
+                configCache.macros[`p${p}_M${m}`] = data;
+                if (data !== null) ok++;
+                if (onProgress) onProgress(total, `方案${p + 1} M${m}`);
+            }
+        }
+
+        // 3. 全局键 MA / MB
+        for (const k of ['MA', 'MB']) {
+            total++;
+            const data = await readGlobalkConfig(k);
+            configCache.gkeys[k] = data;
+            if (data !== null) ok++;
+            if (onProgress) onProgress(total, `全局 ${k}`);
+        }
+
+        const sec = ((Date.now() - startMs) / 1000).toFixed(1);
+        LOG_PORT_UI(`[读回] 完成,${total} 条 / ${ok} 收到回话,${sec}秒`);
+        // 立即刷新当前选中的键（async:会先清 UI 再回填,跟 onchange 走同一条路径）
+        await loadMacroFromCache();
+        await loadGlobalkFromCache();
+        await loadRemapFromCache();
+    }
+
+    // 按需取单条:cache 命中直接返,未命中才向键盘拉一次,拉完缓存。
+    // 取不到(null)不缓存,下次切换会再试 —— 区分"没设过"(NONE)和"刚才没拉到"。
+    async function ensureMacroLoaded(prof, mKey) {
+        const cacheKey = `p${prof}_${mKey}`;
+        if (configCache.macros[cacheKey] !== undefined) return configCache.macros[cacheKey];
+        if (!myCharacteristic) return null;
+        LOG_PORT_UI(`[取] 方案 ${Number(prof) + 1} ${mKey}`);
+        const data = await readMacroConfig(prof, mKey);
+        if (data === null) return null;
+        configCache.macros[cacheKey] = data;
+        return data;
+    }
+
+    async function ensureGlobalkLoaded(key) {
+        if (configCache.gkeys[key] !== undefined) return configCache.gkeys[key];
+        if (!myCharacteristic) return null;
+        LOG_PORT_UI(`[取] 全局 ${key}`);
+        const data = await readGlobalkConfig(key);
+        if (data === null) return null;
+        configCache.gkeys[key] = data;
+        return data;
+    }
+
+    async function ensureRemapLoaded(prof) {
+        if (configCache.remaps[prof] !== undefined) return configCache.remaps[prof];
+        if (!myCharacteristic) return null;
+        LOG_PORT_UI(`[取] REMAP 方案 ${Number(prof) + 1}`);
+        const rules = await readRemap(prof);
+        if (rules === null) return null;
+        configCache.remaps[prof] = rules;
+        return rules;
+    }
+
+    // 按当前下拉选项回填 UI:先清掉旧值(防看到上一键残留),再按需取,再填充。
+    // async 等到时,若用户已切到别的键则放弃这次回填 —— 防止快速切换时被旧响应覆盖。
+    async function loadMacroFromCache() {
+        const prof = document.getElementById('activeProfile').value;
+        const mKey = document.getElementById('macroKey').value;
+
+        // 先清空 UI
+        document.getElementById('seqInput').value = '';
+        document.getElementById('macroCtrl').checked = false;
+        document.getElementById('macroAlt').checked = false;
+        document.getElementById('macroShift').checked = false;
+        document.getElementById('macroWin').checked = false;
+        comboKeys = [];
+        renderComboKeys();
+
+        const data = await ensureMacroLoaded(prof, mKey);
+
+        // fetch 期间用户已切到别处就放弃 —— 下一键的 fetch 会自己回填
+        if (document.getElementById('activeProfile').value !== prof ||
+            document.getElementById('macroKey').value !== mKey) return;
+
+        if (!data || data === 'NONE') {
+            // 默认切回 SEQ,UI 清空就好
+            const seqRadio = document.querySelector('input[name="macroMode"][value="SEQ"]');
+            if (seqRadio) seqRadio.checked = true;
+            toggleMacroMode();
+            return;
+        }
+
+        if (data.startsWith('SEQ:')) {
+            document.querySelector('input[name="macroMode"][value="SEQ"]').checked = true;
+            toggleMacroMode();
+            document.getElementById('seqInput').value = data.substring(4);
+        } else if (data.startsWith('CMB:')) {
+            document.querySelector('input[name="macroMode"][value="CMB"]').checked = true;
+            toggleMacroMode();
+            const codes = data.substring(4).split(',').map(Number).filter(c => c > 0);
+            document.getElementById('macroCtrl').checked = codes.includes(128);
+            document.getElementById('macroAlt').checked = codes.includes(130);
+            document.getElementById('macroShift').checked = codes.includes(129);
+            document.getElementById('macroWin').checked = codes.includes(131);
+            // 普通键(HID < 128 是字母数字标点,> 131 是 REMAP 风格的 0xE0+)
+            // 但 M1-M12 宏场景里修饰键就是 128-131,普通键范围更宽。直接按"非修饰键"过滤即可
+            const modSet = new Set([128, 129, 130, 131]);
+            comboKeys = codes.filter(c => !modSet.has(c)).map(c => ({ code: c }));
+        }
+        renderComboKeys();
+    }
+
+    async function loadGlobalkFromCache() {
+        const key = document.getElementById('globalkKeySel').value;
+
+        // 先清空
+        document.getElementById('globalkSwAction').value = 'NONE';
+        document.getElementById('globalkCtrl').checked = false;
+        document.getElementById('globalkAlt').checked = false;
+        document.getElementById('globalkShift').checked = false;
+        document.getElementById('globalkWin').checked = false;
+        document.getElementById('globalkSeqInput').value = '';
+        globalkComboKeys = [];
+        renderGlobalkComboKeys();
+
+        const data = await ensureGlobalkLoaded(key);
+
+        if (document.getElementById('globalkKeySel').value !== key) return;
+
+        if (!data || data === 'NONE') {
+            const cmbRadio = document.querySelector('input[name="globalkMode"][value="CMB"]');
+            if (cmbRadio) cmbRadio.checked = true;
+            toggleGlobalkMode();
+            return;
+        }
+
+        // 解析 payload: "SW:1+CMB:128,4" / "CMB:128,4" / "SEQ:abc" / "SW:1+SEQ:abc"
+        let mode = 'CMB';
+        const parts = data.split('+');
+        const modSet = new Set([128, 129, 130, 131]);
+        for (const part of parts) {
+            if (part.startsWith('SW:')) {
+                document.getElementById('globalkSwAction').value = part.substring(3);
+            } else if (part.startsWith('SEQ:')) {
+                mode = 'SEQ';
+                document.getElementById('globalkSeqInput').value = part.substring(4);
+            } else if (part.startsWith('CMB:')) {
+                mode = 'CMB';
+                const codes = part.substring(4).split(',').map(Number).filter(c => c > 0);
+                document.getElementById('globalkCtrl').checked = codes.includes(128);
+                document.getElementById('globalkAlt').checked = codes.includes(130);
+                document.getElementById('globalkShift').checked = codes.includes(129);
+                document.getElementById('globalkWin').checked = codes.includes(131);
+                globalkComboKeys = codes.filter(c => !modSet.has(c)).map(c => ({ code: c }));
+            }
+        }
+        document.querySelector(`input[name="globalkMode"][value="${mode}"]`).checked = true;
+        toggleGlobalkMode();
+        renderGlobalkComboKeys();
+    }
+
+    async function loadRemapFromCache() {
+        const prof = document.getElementById('remapProfile').value;
+        // 先显示空,等待回话再填 —— 不然快速切方案时会看到上一方案的规则残留
+        remapRules = [];
+        remapRefreshList();
+
+        const rules = await ensureRemapLoaded(prof);
+
+        if (document.getElementById('remapProfile').value !== prof) return;
+
+        remapRules = rules || [];
+        remapRefreshList();
     }
 
     // ========== 1. ME 键文本（存盘，按 ME 键才发） ==========
@@ -615,6 +1051,20 @@
         }
     });
 
+    // 一键清掉所有 4 个方案的按键映射:走固件 REMAP_RESET 命令,逐 key remove rmp_cnt_<p> + rmp_<p>_<i>。
+    // 主要给老 HTML 时期 ASCII 编码(97=A、98=B、99=C)留下的脏规则用 —— 那套映射落进
+    // kbPress 的 0x53~0x63 区间会发成 Num9/Num0/Num.,按 A 出来是 9。
+    document.getElementById('remapResetAllBtn').addEventListener('click', async () => {
+        if (!confirm("⚠️ 真的要清空全部 4 个方案的按键映射?\n\n会清掉:\n  • 所有方案的按键映射 (REMAP)\n\n保留:\n  • 宏 (M1~M12 × 4 方案)\n  • 全局动作 (MA / MB)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光 / 壁纸\n\n此操作不可撤销,确定继续?")) return;
+        if (!confirm("再确认一次:真的要清空吗?")) return;
+        await sendBLE("REMAP_RESET");
+        // 本地视图也清掉 4 个方案的 cache
+        configCache.remaps = {};
+        remapRules = [];
+        remapRefreshList();
+        alert("已下发清空指令。键盘会逐条清 NVS,几秒后屏幕弹「映射已全部清空」卡片即代表完成。");
+    });
+
     // 读回：让键盘把该方案现有的规则 notify 上来。
     // 以前"从键盘读取"读不出来，是因为特征根本没有 NOTIFY，键盘没法回话。
     function readRemap(prof, timeoutMs) {
@@ -667,45 +1117,98 @@
     });
 
     document.getElementById('remapProfile').addEventListener('change', () => {
-        // 切方案时清空内存里的列表，避免误把方案 A 的规则当方案 B 保存
-        remapRules = [];
-        remapRefreshList();
+        // 切方案:从 cache 加载该方案的规则。没点过读回时 cache 是空的,就保持空。
+        loadRemapFromCache();
     });
 
-    document.getElementById('remapLoadBtn').addEventListener('click', () => {
-        alert("当前 BLE 协议不提供读回接口。请在添加规则时自己记录——保存到键盘会覆盖同名规则的 from 端。");
+    // remapLoadBtn 在新流程里变成"只读当前方案"快捷,不再弹"协议不提供"的旧提示
+    document.getElementById('remapLoadBtn').addEventListener('click', async () => {
+        const prof = document.getElementById('remapProfile').value;
+        const back = await readRemap(prof, 2000);
+        configCache.remaps[prof] = back || [];
+        loadRemapFromCache();
+        if (back !== null) alert(`已读取方案 ${Number(prof) + 1} 的 ${back.length} 条映射。`);
+        else alert("键盘没回话,请确认固件是最新版");
     });
+
+    // 切宏键 / 切方案:从 cache 加载该键的宏
+    document.getElementById('macroKey').addEventListener('change', loadMacroFromCache);
+    document.getElementById('activeProfile').addEventListener('change', loadMacroFromCache);
 
     // ========== 3. 全局动作 MA / MB / M1-M12 合并 ==========
-    let globalkMode = 'CMB';  // 'CMB' 或 'SEQ'
+    // 跟宏键那边一样的多键组合 + CMB/SEQ 互斥可视化（见 toggleGlobalkMode）。
+    let globalkComboKeys = [];
+
+    function addGlobalkComboKey() {
+        globalkComboKeys.push({ code: 0 });
+        renderGlobalkComboKeys();
+    }
+
+    function removeGlobalkComboKey(idx) {
+        globalkComboKeys.splice(idx, 1);
+        renderGlobalkComboKeys();
+    }
+
+    function renderGlobalkComboKeys() {
+        const list = document.getElementById('globalkCmbKeysList');
+        const empty = document.getElementById('globalkCmbKeysEmpty');
+        if (!list) return;
+        list.innerHTML = '';
+        globalkComboKeys.forEach((k, idx) => {
+            const row = document.createElement('div');
+            row.className = 'item-row';
+            const sel = document.createElement('select');
+            sel.style.flex = '1';
+            for (const name in KEY_OPTIONS_NO_MODS) {
+                const opt = document.createElement('option');
+                opt.value = KEY_OPTIONS_NO_MODS[name];
+                opt.textContent = name;
+                if (KEY_OPTIONS_NO_MODS[name] === k.code) opt.selected = true;
+                sel.appendChild(opt);
+            }
+            sel.addEventListener('change', () => { globalkComboKeys[idx].code = parseInt(sel.value); });
+            row.appendChild(sel);
+            const rm = document.createElement('span');
+            rm.className = 'remove-btn';
+            rm.textContent = '✕ 删除';
+            rm.onclick = () => removeGlobalkComboKey(idx);
+            row.appendChild(rm);
+            list.appendChild(row);
+        });
+        empty.style.display = globalkComboKeys.length === 0 ? 'block' : 'none';
+    }
+
+    function toggleGlobalkMode() {
+        const mode = document.querySelector('input[name="globalkMode"]:checked').value;
+        const seqPanel = document.getElementById('globalkSeqPanel');
+        const cmbPanel = document.getElementById('globalkCmbPanel');
+        if (mode === 'SEQ') {
+            seqPanel.classList.remove('panel-disabled');
+            cmbPanel.classList.add('panel-disabled');
+        } else {
+            seqPanel.classList.add('panel-disabled');
+            cmbPanel.classList.remove('panel-disabled');
+        }
+    }
+    toggleGlobalkMode();   // 页面刚加载跑一次，按默认 CMB 模式走
 
     function buildGlobalkPayload() {
         const sw = document.getElementById('globalkSwAction').value;
         const seqText = document.getElementById('globalkSeqInput').value;
-
-        // 优先用 SEQ 模式（如果用户填了非空文本）
-        let useMode = globalkMode;
-        if (useMode === 'SEQ' && !seqText) {
-            // SEQ 但文本空，回退看 CMB 复选框
-            useMode = 'CMB';
-        }
+        const mode = document.querySelector('input[name="globalkMode"]:checked').value;
 
         let extra = '';
-        if (useMode === 'SEQ') {
-            extra = 'SEQ:' + seqText;
+        if (mode === 'SEQ') {
+            // SEQ 但文本空就不带 SEQ 段（不强转回 CMB，旧版有这逻辑，但用户切到 SEQ
+            // 模式就是要填文本 —— 留空让他看到 "extra 为空 = NONE" 比悄悄改模式好懂）
+            if (seqText) extra = 'SEQ:' + seqText;
         } else {
             const codes = [];
             if (document.getElementById('globalkCtrl').checked) codes.push(128);
             if (document.getElementById('globalkAlt').checked) codes.push(130);
             if (document.getElementById('globalkShift').checked) codes.push(129);
             if (document.getElementById('globalkWin').checked) codes.push(131);
-            const customChar = document.getElementById('globalkCustomChar').value.trim();
-            if (customChar.length > 0) {
-                codes.push(customChar.toLowerCase().charCodeAt(0));
-            } else {
-                const keyVal = parseInt(document.getElementById('globalkKeySelect').value);
-                if (keyVal > 0) codes.push(keyVal);
-            }
+            globalkComboKeys.forEach(k => { if (k.code > 0) codes.push(k.code); });
             if (codes.length > 0) extra = 'CMB:' + codes.join(',');
         }
 
@@ -715,20 +1218,10 @@
         return extra || 'NONE';
     }
 
-    function setGlobalkMode(mode) {
-        globalkMode = mode;
-        document.getElementById('globalkSeqInput').style.display = (mode === 'SEQ') ? 'block' : 'none';
-    }
-
     function onGlobalkKeyChange() {
-        // 切换键名时清空所有输入（避免误操作）
-        document.getElementById('globalkSwAction').value = 'NONE';
-        document.getElementById('globalkCtrl').checked = false;
-        document.getElementById('globalkAlt').checked = false;
-        document.getElementById('globalkShift').checked = false;
-        document.getElementById('globalkWin').checked = false;
-        document.getElementById('globalkCustomChar').value = '';
-        document.getElementById('globalkSeqInput').value = '';
+        // 切换键名时优先从 cache 加载该键已有的配置;
+        // cache 没数据(没点过"读取所有配置")就保持空,让用户从空白开始填
+        loadGlobalkFromCache();
     }
 
     document.getElementById('saveGlobalkBtn').addEventListener('click', async () => {
@@ -746,25 +1239,73 @@
     });
 
     // ========== 4. 方案专属宏 M1-M12 ==========
+    // CMB/SEQ 同框互斥：当前选中的面板正常显示，另一个面板用 .panel-disabled
+    // 灰掉并禁止交互（CSS 里 opacity:0.35 + pointer-events:none）。这样用户
+    // 能一眼看到两种模式都在，但当前只能填一边。
     function toggleMacroMode() {
-        let mode = document.querySelector('input[name="macroMode"]:checked').value;
-        document.getElementById('seqPanel').style.display = (mode === 'SEQ') ? 'block' : 'none';
-        document.getElementById('cmbPanel').style.display = (mode === 'CMB') ? 'block' : 'none';
+        const mode = document.querySelector('input[name="macroMode"]:checked').value;
+        const seqPanel = document.getElementById('seqPanel');
+        const cmbPanel = document.getElementById('cmbPanel');
+        if (mode === 'SEQ') {
+            seqPanel.classList.remove('panel-disabled');
+            cmbPanel.classList.add('panel-disabled');
+        } else {
+            seqPanel.classList.add('panel-disabled');
+            cmbPanel.classList.remove('panel-disabled');
+        }
+    }
+    toggleMacroMode();   // 页面刚加载就根据默认选中的模式跑一次
+
+    // 宏键多键组合：每个元素是 {code: number}，渲染成一 [select][✕] 行。
+    // 不预置一行空键 —— "⚠ 还没添加" 的红色提示让用户自己知道要点 + 添加键。
+    let comboKeys = [];
+
+    function addComboKey() {
+        comboKeys.push({ code: 0 });
+        renderComboKeys();
     }
 
-    function buildComboCodes(ctrlId, altId, shiftId, winId, selectId, customCharId) {
+    function removeComboKey(idx) {
+        comboKeys.splice(idx, 1);
+        renderComboKeys();
+    }
+
+    function renderComboKeys() {
+        const list = document.getElementById('cmbKeysList');
+        const empty = document.getElementById('cmbKeysEmpty');
+        if (!list) return;
+        list.innerHTML = '';
+        comboKeys.forEach((k, idx) => {
+            const row = document.createElement('div');
+            row.className = 'item-row';
+            const sel = document.createElement('select');
+            sel.style.flex = '1';
+            for (const name in KEY_OPTIONS_NO_MODS) {
+                const opt = document.createElement('option');
+                opt.value = KEY_OPTIONS_NO_MODS[name];
+                opt.textContent = name;
+                if (KEY_OPTIONS_NO_MODS[name] === k.code) opt.selected = true;
+                sel.appendChild(opt);
+            }
+            sel.addEventListener('change', () => { comboKeys[idx].code = parseInt(sel.value); });
+            row.appendChild(sel);
+            const rm = document.createElement('span');
+            rm.className = 'remove-btn';
+            rm.textContent = '✕ 删除';
+            rm.onclick = () => removeComboKey(idx);
+            row.appendChild(rm);
+            list.appendChild(row);
+        });
+        empty.style.display = comboKeys.length === 0 ? 'block' : 'none';
+    }
+
+    function buildMacroComboCodes() {
         const codes = [];
-        if (document.getElementById(ctrlId).checked) codes.push(128);
-        if (document.getElementById(altId).checked) codes.push(130);
-        if (document.getElementById(shiftId).checked) codes.push(129);
-        if (document.getElementById(winId).checked) codes.push(131);
-        const customChar = document.getElementById(customCharId).value.trim();
-        if (customChar.length > 0) {
-            codes.push(customChar.toLowerCase().charCodeAt(0));
-        } else {
-            const keyVal = parseInt(document.getElementById(selectId).value);
-            if (keyVal > 0) codes.push(keyVal);
-        }
+        if (document.getElementById('macroCtrl').checked) codes.push(128);
+        if (document.getElementById('macroAlt').checked) codes.push(130);
+        if (document.getElementById('macroShift').checked) codes.push(129);
+        if (document.getElementById('macroWin').checked) codes.push(131);
+        comboKeys.forEach(k => { if (k.code > 0) codes.push(k.code); });
         return codes;
     }
 
@@ -786,11 +1327,36 @@
             await sendBLE(`SET:p${prof}_${mKey}:SEQ:${txt}`);
             alert(`已保存打字/延时宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
         } else {
-            const codes = buildComboCodes('macroCtrl', 'macroAlt', 'macroShift', 'macroWin', 'macroKeySelect', 'macroCustomChar');
-            if (codes.length === 0) return alert("请至少指定一个按键！");
+            const codes = buildMacroComboCodes();
+            if (codes.length === 0) return alert("请至少勾选一个修饰键或添加一个普通键！");
             await sendBLE(`SET:p${prof}_${mKey}:CMB:${codes.join(',')}`);
-            alert(`已保存组合键宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
+            alert(`已保存组合键宏到方案 ${Number(prof) + 1} 的 ${mKey}！（${codes.length} 个键）`);
         }
+    });
+
+    // 清空当前键宏：发 SET:p{prof}_{mKey}: (value 空字符串)。
+    // 固件 preferences.putString 写空,executeMacro 读 macroData.length()==0 直接 return,
+    // 等于把这个键的宏彻底关掉。跟 GSET:KEY:NONE 那个清全局动作是同一个套路。
+    document.getElementById('clearMacroBtn').addEventListener('click', async () => {
+        const prof = document.getElementById('activeProfile').value;
+        const mKey = document.getElementById('macroKey').value;
+        if (!confirm(`确定要清空方案 ${Number(prof) + 1} 的 ${mKey} 宏?\n键盘里之前存的所有内容都会被覆盖为空。`)) return;
+        await sendBLE(`SET:p${prof}_${mKey}:`);
+        // 本地视图也清掉,免得下次切换看到一堆旧条目以为还在
+        document.getElementById('seqInput').value = '';
+        comboKeys = [];
+        renderComboKeys();
+        alert(`方案 ${Number(prof) + 1} 的 ${mKey} 宏已清空。`);
+    });
+
+    // 一键清空所有宏：所有方案 × M1-M12 + MA + MB(共 50 个键),保留 remap/灯光/时钟等。
+    // 固件侧走 MACROS_RESET 命令逐 key remove,完成会 notify "已清空所有宏"。
+    document.getElementById('resetAllMacrosBtn').addEventListener('click', async () => {
+        if (!confirm("⚠️ 真的要清空所有宏?\n\n会清掉:\n  • 4 个方案 × M1~M12 = 48 个方案专属宏\n  • MA / MB 全局动作\n\n保留:\n  • 按键映射 (REMAP)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光配置\n  • 屏幕壁纸\n\n此操作不可撤销,确定继续?")) return;
+        // 二次确认,防误点
+        if (!confirm("再确认一次:真的要清空吗?")) return;
+        await sendBLE("MACROS_RESET");
+        alert("已下发清空指令。键盘会逐条清 NVS,几秒后屏幕弹「已清空所有宏」卡片即代表完成。");
     });
 
     // ========== 系统设置：时间 / 闹钟 / 倒计时 / 显示 / 回显 / 灯光 ==========

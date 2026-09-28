@@ -29,7 +29,81 @@
 // USB-CDC 的第一个描述符握手完成之后才会枚举出来，Windows 往往要十几秒
 // 才认这个口，而这期间所有日志都丢了 —— 表现为"监听 90 秒一行都没有"。
 // UART0 是烧录口，一直在线，插上就能抓。
-#define LOG_PORT Serial0
+//
+// 但刷成 HID Keyboard 后**两个 USB 口都被占用**(或者烧录用的 USB-TTL
+// 在很多笔记本上根本不亮 COM 口)，调试时基本看不到任何日志。退路是
+// LogMirror：把 LOG_PORT 包成 Print 代理，所有 printf 字节既写到 UART0，
+// 又按行落进 PSRAM 环形缓冲，再通过 BLE notify (`LOG:<text>` /
+// `LOGDUMP:<chunk>`) 实时回传到网页日志面板。详见 pushLogLine /
+// handleCommand 里 LOG:on / LOG:off / LOG:dump / LOG:clear 四个分支。
+// 这里只声明 LogMirror 并把 LOG_PORT 指向它，全文 LOG_PORT.printf 不动。
+//
+// BLE 一条 notify 包的上限（含 \0）。必须在 LogMirror 之前定义,
+// 否则类体里的 char lineBuf[BLE_CMD_BUF_SIZE] 编译不过。
+// 这个宏原本放在 BLE 段(第 593 行附近),挪上来只是换个位置,含义没变。
+#define BLE_CMD_BUF_SIZE   256
+
+// LogMirror::write() 收完一行就调 pushLogLine()。后者函数体在 BLE 全局段
+// 之后(因为要用 pCharacteristic / deviceConnected),这里先前置声明。
+static void pushLogLine(const char* line);
+
+class LogMirror : public Print {
+    HardwareSerial* real;
+    char    lineBuf[BLE_CMD_BUF_SIZE];
+    size_t  lineLen;
+public:
+    LogMirror(HardwareSerial* r) : real(r), lineLen(0) {}
+
+    // Serial0.begin() 这种成员转发：LOG_PORT.begin(115200) 必须能落到 UART0
+    void begin(unsigned long baud) { if (real) real->begin(baud); }
+    void end() { if (real) real->end(); }
+
+    size_t write(uint8_t c) override {
+        if (real) real->write(c);
+        if (c == '\n') {
+            // 遇到 \n 才提交一行；\r 单独出现也提交一次（兼容 println 的 \r\n）
+            lineBuf[lineLen] = '\0';
+            pushLogLine(lineBuf);
+            lineLen = 0;
+        } else if (c == '\r') {
+            // 忽略，\n 那一拍已经处理过
+        } else if (lineLen < sizeof(lineBuf) - 2) {
+            lineBuf[lineLen++] = (char)c;
+        } else {
+            // 行太长，截断并把当前缓冲当成完整一行推出去（兜底，防止 lineLen 溢到下一行）
+            lineBuf[sizeof(lineBuf) - 2] = '\0';
+            pushLogLine(lineBuf);
+            lineBuf[0] = (char)c;
+            lineLen = 1;
+        }
+        return 1;
+    }
+
+    size_t write(const uint8_t* buf, size_t size) override {
+        if (real && size) real->write(buf, size);
+        for (size_t i = 0; i < size; i++) write(buf[i]);
+        return size;
+    }
+};
+
+// 全局唯一代理：所有 LOG_PORT 都走它，再转发到 Serial0 + 落环形缓冲
+static LogMirror LogPortProxy(&Serial0);
+#undef  LOG_PORT
+#define LOG_PORT LogPortProxy
+
+// === BLE 日志通道缓冲 ===
+// PSRAM 上分一块 8KB 环形缓冲（按行存，超出时丢最老的整行）。
+// 板子是 N16R8 = 8MB OPI PSRAM，8KB 占比 0.1%，随便用。
+#define LOG_BUF_CAP     8192
+static char*  logRingBuf   = nullptr;   // ps_malloc，setup() 里建
+static size_t logRingLen   = 0;
+static bool   logStreamOn  = false;     // LOG:on / LOG:off 控制
+static unsigned long logLastNotifyMs = 0;  // 节流：50Hz 上限
+
+// 推一行进环形缓冲；若 LOG:on 已开，按行做一次 BLE notify（带节流）
+// 函数体在文件下方 BLE 全局变量之后定义（需要 pCharacteristic / deviceConnected），
+// 这里先声明供 LogMirror::write 调用。
+static void pushLogLine(const char* line);
 
 // USB HID
 #include "USB.h"
@@ -42,6 +116,7 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
+#include <BLE2902.h>
 
 #include "lvgl_st7789_driver.h"
 #include "lv_conf.h"
@@ -267,6 +342,14 @@ static uint8_t  keyFxColorIdx = 0;
 static bool numLock = false;
 static bool capsLock = false;
 static bool scrollLock = false;
+// USB HID LED 事件回调里只置位，loop() 里看到就立即推一帧 LED + 跑一次屏幕刷新。
+// 之所以不能直接在回调里调 renderIndicators()/sendLedFrameToC3()：
+//   1. ARDUINO_USB_HID_KEYBOARD_LED_EVENT 走的是 USB 任务/中断上下文；
+//   2. Serial1.write 是阻塞的，硬塞进去会和 USB 任务抢时间；
+//   3. LVGL 这边更不能在中断里碰（screen 对象指针 + 互斥问题）。
+// 而且原来的 20ms 灯效节拍 + 100ms 屏幕节拍，最坏要 100ms 才看到屏幕变，
+// 对"刚按了一下 Caps Lock"的反馈来说太慢 —— 这个脏位把延迟压到下一轮 loop()。
+static volatile bool lockStateDirty = false;
 // 播放/暂停交替显示（按 PLAY 时翻转）
 static bool mediaPlaying = false;
 
@@ -468,10 +551,62 @@ static bool deviceConnected = false;
 static bool oldDeviceConnected = false;
 static unsigned long lastPingTime = 0;
 
+// 推一行进环形缓冲；若 LOG:on 已开，按行做一次 BLE notify（带节流）。
+// 这里是 LogMirror::write 会调到的"主行处理"——
+// 函数体放在 BLE 全局之后，这样 pCharacteristic / deviceConnected 都在作用域里。
+//
+// **末尾必须带 \n**：网页端 onBleNotify 按 \n 切行分发，没 \n 就直接被
+// parts.pop() 整个吞进 rest,for 循环空跑,日志框永远不显示 ——
+// 这是第一版"开流没反应"的根因。所有 notify 一律包末尾加 \n。
+//
+// 节流：100ms / 10Hz。BLE 写一次 attribute + notify 约 7~15ms,
+// 50Hz 节流在 NimBLE 那边的发送队列里还是会堆几十包,流转发 5 秒就把
+// 队列填满,后面 REMAPDUMP / LOGOSTATUS 等关键响应发不出。
+// 10Hz 留出充裕的"空档",丢一些日志无所谓,关键时刻(按键路径)能挤进来。
+static void pushLogLine(const char* line) {
+    if (line == nullptr || line[0] == '\0') return;
+    if (logRingBuf == nullptr) return;     // setup() 还没分配好缓冲
+    size_t n = strlen(line);
+    if (n == 0) return;
+
+    // 满时丢最老的整行，循环直到能塞下
+    while (logRingLen + n + 1 > LOG_BUF_CAP) {
+        size_t drop = 0;
+        while (drop < logRingLen && logRingBuf[drop] != '\n') drop++;
+        if (drop < logRingLen) drop++;          // 把那个 \n 也吞掉
+        if (drop == 0 || drop > logRingLen) {   // 极端：单行比缓冲还大，强制清零
+            logRingLen = 0;
+            break;
+        }
+        memmove(logRingBuf, logRingBuf + drop, logRingLen - drop);
+        logRingLen -= drop;
+    }
+
+    memcpy(logRingBuf + logRingLen, line, n);
+    logRingBuf[logRingLen + n] = '\n';
+    logRingLen += n + 1;
+
+    // 流转发：节流 10Hz（100ms/条），每条 notify 末尾加 \n
+    if (logStreamOn && pCharacteristic != nullptr && deviceConnected) {
+        unsigned long now = millis();
+        if ((unsigned long)(now - logLastNotifyMs) >= 100) {
+            logLastNotifyMs = now;
+            char out[BLE_CMD_BUF_SIZE];
+            int m = snprintf(out, sizeof(out) - 2, "LOG:%s", line);  // 留 2 字节给 \n\0
+            if (m > 0 && m < (int)sizeof(out) - 2) {
+                out[m]     = '\n';
+                out[m + 1] = '\0';
+                pCharacteristic->setValue((uint8_t*)out, (size_t)(m + 1));
+                pCharacteristic->notify();
+            }
+        }
+    }
+}
+
 // 主机指令队列（生产者 = NimBLE 主机任务，消费者 = loop()）。
 // onWrite 只负责入队，绝不碰 LVGL —— 原因见 MyCallbacks::onWrite 的注释。
+// BLE_CMD_BUF_SIZE 已在前面 LogMirror 之前定义。
 #define BLE_CMD_QUEUE_LEN 8
-#define BLE_CMD_BUF_SIZE   256
 static QueueHandle_t bleCmdQueue = nullptr;
 static void handleCommand(const String& cmd);   // 真正定义在文件后段的命令解析入口
 
@@ -3463,13 +3598,29 @@ void switchProfile(uint8_t profIdx) {
 //               一旦在这里把 0xE0~0xE7 当修饰键，小键盘 7 就会变成 Win 键（0xE7→右 GUI）、
 //               1~6 变成 Shift/Alt/Ctrl —— 整片小键盘全错。
 //               那套值的转换放在 remap 表读入处做（见 normalizeRemapKey）。
+//
+// 0x53~0x63 这段是 HID 小键盘 usage：网页 CMB 现在直接发这一段（见 s3-setting.html
+// 里的 Num /, Num *, Num 1 等）。落到 Keyboard.press() 会被 _asciimap 当成大写字母/
+// 符号（0x54='T' 0x55='U' 0x59='Y'），所以这一段必须直接走 pressRaw。不用 0x88+offset
+// 形式是因为那一段会落进 [0xE0,0xE7] 跟 HID 修饰键撞车（见 normalizeRemapKey）。
 static inline void kbPress(uint8_t code) {
-    if (code >= 0x80 && code < 0x88) Keyboard.pressRaw((uint8_t)(code + 0x60));
-    else Keyboard.press(code);
+    // [DEBUG a→9] 临时诊断:打出实际走的分支,定位 baseKey 是多少、走的是哪条路径
+    const char* path = "press";
+    if (code >= 0x80 && code < 0x88) {
+        path = "pressRaw(mod+0x60)";
+        Keyboard.pressRaw((uint8_t)(code + 0x60));
+    } else if (code >= 0x53 && code <= 0x63) {
+        path = "pressRaw(numpad)";
+        Keyboard.pressRaw(code);
+    } else {
+        Keyboard.press(code);
+    }
+    LOG_PORT.printf("[KB] press code=0x%02X path=%s\n", code, path);
 }
 
 static inline void kbRelease(uint8_t code) {
     if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
+    else if (code >= 0x53 && code <= 0x63) Keyboard.releaseRaw(code);
     else Keyboard.release(code);
 }
 
@@ -3726,30 +3877,66 @@ static void executeMacro(String keyName) {
     // 做不到，hex 走一遍协议才能把 UTF-8 字节原样送到主机。
     if (keyName == "ME") {
         LOG_PORT.println("[ME] key pressed");
-        if (SPIFFS.exists("/me_hex.txt")) {
-            File f = SPIFFS.open("/me_hex.txt", FILE_READ);
-            if (f) {
-                LOG_PORT.printf("[ME] sending %u bytes\n", (unsigned)f.size());
-                Keyboard.print("[HEXS]");
-                delay(20);
-                while (f.available()) {
-                    int c = f.read();
-                    if (c < 0) break;
-                    Keyboard.print((char)c);
-                    delay(1);
-                    esp_task_wdt_reset();   // 大文件逐字打印时喂狗，别中途重启
-                }
-                f.close();
-                delay(20);
-                Keyboard.print("[HEXE]");
-                triggerHud("ME 文本", "已发送", lv_color_hex(CLR_GREEN));
-                return;
-            }
-            LOG_PORT.println("[ME] open /me_hex.txt FAILED");
-        } else {
+        if (!SPIFFS.exists("/me_hex.txt")) {
             LOG_PORT.println("[ME] /me_hex.txt not found");
+            triggerHud("ME 文本", "尚未设置", lv_color_hex(CLR_TEXT_DIM));
+            return;
         }
-        triggerHud("ME 文本", "尚未设置", lv_color_hex(CLR_TEXT_DIM));
+        File f = SPIFFS.open("/me_hex.txt", FILE_READ);
+        if (!f) {
+            LOG_PORT.println("[ME] open /me_hex.txt FAILED");
+            triggerHud("ME 文本", "打开失败", lv_color_hex(CLR_RED));
+            return;
+        }
+        const size_t total = f.size();
+        LOG_PORT.printf("[ME] sending %u bytes, freeHeap=%u\n",
+                        (unsigned)total, (unsigned)ESP.getFreeHeap());
+        Keyboard.print("[HEXS]");
+        delay(20);
+        size_t sent = 0;
+        size_t skipped = 0;
+        uint32_t lastReportMs = millis();
+        while (f.available()) {
+            int c = f.read();
+            if (c < 0) break;
+            // ★ 关键安全修：跳过所有 >= 0x80 的字节。
+            // Keyboard.print((char)c) 走的是 USBHIDKeyboard::press()，
+            // 对 0x80~0xFF 会进入 `modifiers |= (1 << (k-0x80))` 分支。
+            // 当 k-0x80 >= 8（即 k >= 0x88）时，左移数超过 modifier byte 位宽
+            // 是 C/C++ 未定义行为 —— Xtensa 上 5K+ 中文 UTF-8 字节（0xE4/0xB8/0xAD
+            // 这种）反复触发，踩坏堆就会重启。中文 ME 真正能发的通道是另开的
+            // BLE notify raw byte，不是这次的范围 —— 安全起见先一律跳过。
+            if (c >= 0x80) { skipped++; sent++; continue; }
+            Keyboard.print((char)c);
+            sent++;
+            // 每 64 字节额外让一次时间片 + 喂一次狗 —— 1ms delay() 不够给 USB host
+            // 留 ACK 时间片，端点缓冲吃紧时 SendReport 可能短暂阻塞。
+            if ((sent & 0x3F) == 0) {
+                esp_task_wdt_reset();
+                delay(2);
+            }
+            // 每 ~500ms 报一次进度，万一真崩了能看出崩在哪一段
+            if (millis() - lastReportMs > 500) {
+                esp_task_wdt_reset();
+                LOG_PORT.printf("[ME] %u/%u (skip=%u) freeHeap=%u\n",
+                                (unsigned)sent, (unsigned)total,
+                                (unsigned)skipped, (unsigned)ESP.getFreeHeap());
+                lastReportMs = millis();
+            }
+        }
+        f.close();
+        delay(20);
+        Keyboard.print("[HEXE]");
+        LOG_PORT.printf("[ME] done %u/%u (skip=%u) freeHeap=%u\n",
+                        (unsigned)sent, (unsigned)total,
+                        (unsigned)skipped, (unsigned)ESP.getFreeHeap());
+        if (skipped > 0) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "已发 %u 跳过 %u", (unsigned)(sent - skipped), (unsigned)skipped);
+            triggerHud("ME 文本(部分)", buf, lv_color_hex(CLR_AMBER));
+        } else {
+            triggerHud("ME 文本", "已发送", lv_color_hex(CLR_GREEN));
+        }
         return;
     }
 
@@ -3794,9 +3981,18 @@ static void executeGlobalKey(String gKey) {
 static void usbHidKeyboardEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
     if (id == ARDUINO_USB_HID_KEYBOARD_LED_EVENT) {
         auto* led_data = (arduino_usb_hid_keyboard_event_data_t*)data;
-        numLock = led_data->numlock;
-        capsLock = led_data->capslock;
-        scrollLock = led_data->scrolllock;
+        if (led_data == nullptr) return;
+        // 只在状态真的翻转时置脏位。主机每帧 LED 报告都广播一遍当前值，
+        // 不做差分的话 lockStateDirty 一直为真，每次 loop 都白跑一次推帧。
+        bool newNum = led_data->numlock;
+        bool newCaps = led_data->capslock;
+        bool newScr  = led_data->scrolllock;
+        if (newNum != numLock || newCaps != capsLock || newScr != scrollLock) {
+            numLock    = newNum;
+            capsLock   = newCaps;
+            scrollLock = newScr;
+            lockStateDirty = true;   // 让 loop() 立刻推一帧 LED + 跑一次屏幕刷新
+        }
     }
 }
 
@@ -4072,7 +4268,20 @@ static void scanKeyboardMatrix(void) {
                                 // 触发律动效果：峰值柱 + 两侧余晖（pulseRhythm 里定义波形的形状）
                                 pulseRhythm();
                                 hostKeyHeld[r][c] = true;
-                                kbPress((uint8_t)mappedKey);
+                                // Caps Lock 本地兜底：USB HID LED 事件（ARDUINO_USB_HID_KEYBOARD_LED_EVENT）
+                                // 在某些主机 / 复合 HID 接口下根本不来，靠它就完全无反应。
+                                // 按下 KEY_CAPS_LOCK 这一刻我们已经知道"用户想翻转大写"，
+                                // 本地先翻一次让屏/灯立刻跟上，host 那边返回的 LED 报告就算延迟、
+                                // 不来、或者延后很多帧，最终也是同一个值，不会冲突。
+                                // Num/Scroll 没有物理按键，仍只能等 LED 报告。
+                                if (baseKey == KEY_CAPS_LOCK) {
+                                    capsLock = !capsLock;
+                                    lockStateDirty = true;
+                                }
+                                // [DEBUG a→9] 临时诊断:确认 baseKey 和 remap 后实际送 kbPress 的码点
+                            LOG_PORT.printf("[KB] base=0x%04X mapped=0x%04X cnt=%d\n",
+                                baseKey, mappedKey, remapCounts[currentProfile]);
+                            kbPress((uint8_t)mappedKey);
                             }
                         }
                     } else {
@@ -4300,6 +4509,51 @@ static void handleCommand(const String& cmd) {
         snprintf(buf, sizeof(buf), "读取到 %d 条", (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0);
         triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
     }
+    // MACRODUMP:p{N}_{MKey} - 把方案 N 的 MKey 宏回读给网页
+    // 协议:`MACRODUMP:p0_M1:SEQ:abc...` / `MACRODUMP:p0_M1:CMB:128,4` /
+    //       `MACRODUMP:p0_M1:NONE`(未设置)
+    // 注意:BLE notify 受 BLE_CMD_BUF_SIZE=256 限制,SEQ 击键流超过 ~240 字节会被截断。
+    // 实际击键流(尤其是带 [ENTER] 的)很少超 100 字节,但极长字符串会丢尾,网页要明确提示。
+    else if (cmd.startsWith("MACRODUMP:")) {
+        String key = cmd.substring(10);
+        String val = preferences.getString(key.c_str(), "");
+        // 拼成 `MACRODUMP:<key>:<val>`,val 为空时显式 NONE 让网页知道"该键无宏"
+        char out[BLE_CMD_BUF_SIZE];
+        bool truncated = false;
+        if (val.length() == 0) {
+            snprintf(out, sizeof(out), "MACRODUMP:%s:NONE", key.c_str());
+        } else {
+            // 留 1 字节给 '\0',val 太长则截断并标 TRUNC
+            size_t keyLen = strlen("MACRODUMP:") + key.length() + 1;  // "MACRODUMP:" + key + ":"
+            if (keyLen + val.length() >= sizeof(out) - 8) {
+                truncated = true;
+                val = val.substring(0, sizeof(out) - 8 - keyLen - 1);
+            }
+            snprintf(out, sizeof(out), "MACRODUMP:%s:%s%s",
+                     key.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
+        }
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)out, strlen(out));
+            pCharacteristic->notify();
+        }
+        LOG_PORT.printf("[MACRODUMP] %s len=%u truncated=%d\n",
+                        key.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
+    }
+    // GKEYDUMP:KEY - 把全局键 (MA/MB) 配置回读给网页
+    // 协议:`GKEYDUMP:MA:SW:1+CMB:128,4` / `GKEYDUMP:MA:NONE`
+    else if (cmd.startsWith("GKEYDUMP:")) {
+        String key = cmd.substring(9);
+        String gKey = "g_" + key;
+        String val = preferences.getString(gKey.c_str(), "");
+        char out[BLE_CMD_BUF_SIZE];
+        snprintf(out, sizeof(out), "GKEYDUMP:%s:%s", key.c_str(),
+                 val.length() ? val.c_str() : "NONE");
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)out, strlen(out));
+            pCharacteristic->notify();
+        }
+        LOG_PORT.printf("[GKEYDUMP] %s len=%u\n", key.c_str(), (unsigned)val.length());
+    }
     // SET:name:value - Macro definition
     //
     // 名字里已经带方案号时**不能再套一层**。网页发的是 `SET:p0_M1:SEQ:…`
@@ -4341,6 +4595,143 @@ static void handleCommand(const String& cmd) {
             preferences.putString(gKey, value);
             triggerHud("已写入全局键", name.c_str(), lv_color_hex(CLR_ACCENT));
         }
+    }
+    // MACROS_RESET: 清掉所有方案的 M1-M12 + 全局 MA/MB。
+    // 保留 remap 规则 / 时钟 / 闹钟 / 灯光 / 壁纸 / SPIFFS 等其他 NVS 键，
+    // 只删 p?\d_M?\d+\d 这种格式(方案专属宏)和 g_MA / g_MB(全局动作)。
+    // ESP32 Preferences 没有按前缀删,只能逐 key remove。
+    // 旧版错存的双层前缀 `p?\d_p?\d_M?\d`(见 SET: 那段的根因)也在范围里 —— 留着不删反而
+    // 会让"清完后按 M1 仍然有反应"这种残留事件更难看,顺手清掉。
+    else if (cmd == "MACROS_RESET") {
+        int removed = 0;
+        // 方案专属宏: 4 个方案 × 12 个 M 键
+        for (int p = 0; p < 4; p++) {
+            for (int m = 1; m <= 12; m++) {
+                char pk[16];
+                snprintf(pk, sizeof(pk), "p%d_M%d", p, m);
+                if (preferences.remove(pk)) removed++;
+                // 历史 bug: 部分键错存成 p?\d_p?\d_M?\d 形态
+                snprintf(pk, sizeof(pk), "p%d_p%d_M%d", p, p, m);
+                preferences.remove(pk);
+            }
+        }
+        // 全局动作
+        if (preferences.remove("g_MA")) removed++;
+        if (preferences.remove("g_MB")) removed++;
+        LOG_PORT.printf("[MACROS_RESET] removed %d keys\n", removed);
+        char info[24];
+        snprintf(info, sizeof(info), "%d 项已清", removed);
+        triggerHud("宏已全部清空", info, lv_color_hex(CLR_GREEN));
+    }
+    // REMAP_RESET: 清掉所有方案的按键映射 (REMAP)。
+    // 跟 MACROS_RESET 一样保留灯光/时钟/壁纸/ME 文本,只删 rmp_cnt_<p> + rmp_<p>_<i>。
+    // 主要给"网页里 ASCII 编码时代留下的脏规则"用:比如老 HTML 把 A 编成 97,
+    // 按 A 走 remap 出来就是 97 → kbPress 落进 0x53~0x63 → pressRaw 发成 Num9。
+    // 宏和 remap 是两套独立存储,所以 MACROS_RESET 不会碰这些。
+    else if (cmd == "REMAP_RESET") {
+        int removed = 0;
+        for (int p = 0; p < 4; p++) {
+            char key[16];
+            snprintf(key, sizeof(key), "rmp_cnt_%d", p);
+            if (preferences.remove(key)) removed++;
+            for (int i = 0; i < MAX_REMAP_RULES; i++) {
+                char itemKey[20];
+                snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", p, i);
+                if (preferences.remove(itemKey)) removed++;
+            }
+            remapCounts[p] = 0;
+        }
+        LOG_PORT.printf("[REMAP_RESET] removed %d keys\n", removed);
+        char info[24];
+        snprintf(info, sizeof(info), "%d 项已清", removed);
+        triggerHud("映射已全部清空", info, lv_color_hex(CLR_GREEN));
+    }
+    // === BLE 日志通道控制 ===
+    // 为什么单独拎出来:USB HID 模式下 UART0 基本看不到,调试被掐断,
+    // 这里把 LOG_PORT.printf 的所有字节搬上 BLE 实时回传到网页日志面板。
+    // 设计:
+    //   LOG:on     - 打开实时流(新日志按行 notify `LOG:<text>\n`,10Hz 节流)
+    //   LOG:off    - 关掉流转发(缓冲仍然在落,只是不 notify 了)
+    //   LOG:dump   - 把环形缓冲整段按行 notify `LOGDUMP:<chunk>\n` ... `LOGDUMP:END\n`
+    //   LOG:clear  - 清空环形缓冲(不影响流转发开关)
+    // 网页侧 onBleNotify 已经按 \n 拼行分发,加 LOG: / LOGDUMP: 两条分支即可显示。
+    // **所有响应末尾必须带 \n**:网页端的 split('\n') 才能切出完整行给 LOG_PORT_UI /
+    // appendLogLine,不然会被 parts.pop() 整个吞进 rest,for 循环空跑。
+    else if (cmd == "LOG:on") {
+        logStreamOn = true;
+        logLastNotifyMs = 0;            // 立即允许第一条(开流响应那条不卡)
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)"LOG:STREAM_ON\n", 15);
+            pCharacteristic->notify();
+        }
+        LOG_PORT.println("[LOG] stream ON");
+    }
+    else if (cmd == "LOG:off") {
+        logStreamOn = false;
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)"LOG:STREAM_OFF\n", 16);
+            pCharacteristic->notify();
+        }
+        LOG_PORT.println("[LOG] stream OFF");
+    }
+    else if (cmd == "LOG:clear") {
+        logRingLen = 0;
+        if (pCharacteristic) {
+            pCharacteristic->setValue((uint8_t*)"LOG:CLEARED\n", 12);
+            pCharacteristic->notify();
+        }
+        LOG_PORT.println("[LOG] buffer cleared");
+    }
+    else if (cmd == "LOG:dump") {
+        if (pCharacteristic && logRingBuf) {
+            // 单包上限 BLE_CMD_BUF_SIZE - "LOGDUMP:" 前缀开销(~8字节) -
+            // 末尾\0 - 留点余量 -> 一片不超过 220 字节。
+            // 按整行切(不要在行中间断),保证网页那边拼起来是一行一行。
+            // 末尾必加 \n:网页按 \n 切行,缺一个整片就废了。
+            const size_t chunkMax = 220;
+            size_t pos = 0;
+            bool sent = false;
+            while (pos < logRingLen) {
+                size_t end = pos;
+                while (end < logRingLen && end - pos < chunkMax) {
+                    if (logRingBuf[end] == '\n') { end++; break; }
+                    end++;
+                }
+                if (end == pos) { end++; }   // 兜底:行比 chunkMax 还长就硬切
+                char out[BLE_CMD_BUF_SIZE];
+                int m = snprintf(out, sizeof(out) - 2, "LOGDUMP:");
+                int n = 0;
+                if (m > 0 && m < (int)sizeof(out) - 2) {
+                    n = snprintf(out + m, sizeof(out) - 2 - m, "%.*s",
+                                 (int)(end - pos), logRingBuf + pos);
+                }
+                int total = (n > 0) ? m + n : m;
+                if (total < (int)sizeof(out) - 2) {
+                    out[total++] = '\n';     // 末尾必加 \n
+                    out[total]   = '\0';
+                }
+                if (total > 0) {
+                    pCharacteristic->setValue((uint8_t*)out, (size_t)total);
+                    pCharacteristic->notify();
+                    sent = true;
+                }
+                pos = end;
+                // 让 NimBLE 任务跑一下,处理刚才发出的 notify。
+                // delay(5) 在每包之间堵 5ms,8KB 缓冲全 dump 完会卡 200ms+,
+                // 屏幕和键盘扫描都会肉眼可见地抖。yield() 等价于
+                // vTaskDelay(1),NimBLE 任务抢到时间片继续发包,
+                // 但 loop() 这边差不多 1ms 内又回来 —— 实际效果接近不卡。
+                yield();
+            }
+            if (!sent) {
+                // 缓冲空也要回一个,免得网页干等
+                pCharacteristic->setValue((uint8_t*)"LOGDUMP:\n", 9);
+                pCharacteristic->notify();
+            }
+            pCharacteristic->setValue((uint8_t*)"LOGDUMP:END\n", 13);
+            pCharacteristic->notify();
+        }
+        LOG_PORT.printf("[LOG] dump %u bytes\n", (unsigned)logRingLen);
     }
     // ME 键文本：网页端把 UTF-8 文本转成 hex 后分片下发，这里只负责落盘。
     // 按下 ME 键时才由 executeMacro("ME") 读出来发给电脑（见那里的 [HEXS] 协议），
@@ -4892,12 +5283,20 @@ static void sendLedFrameToC3(void) {
 static void updateDynamicElements(void) {
     static unsigned long lastRunMs = 0;
     unsigned long nowMs = millis();
-    if (nowMs - lastRunMs < DYNAMIC_REFRESH_MS) return;
+    // 锁状态刚翻转：跳过 100ms 节拍，立刻跑一次屏幕刷新。
+    // 不这么做的话，刚按 Caps Lock 要等最坏 100ms 才看到顶部条/信息面板的灯变，
+    // 体感上就是"按了没反应"。
+    if (!lockStateDirty && nowMs - lastRunMs < DYNAMIC_REFRESH_MS) return;
     lastRunMs = nowMs;
 
     time_t now = time(nullptr);
     struct tm* ti = localtime(&now);
-    if (!ti || ti->tm_year < 124) return;
+    // 时间还没校准（NTP 没拿到 / savedEpoch 是 0）—— 把锁脏位先放掉，
+    // 不放的话下面这个 early return 会让 lockStateDirty 一直为真，
+    // 下一轮 loop 又会进这里白跑一次 time()/localtime()，CPU 空转。
+    // 锁 UI 这一帧确实没刷到，但 loop() 上半段已经把 LED 帧推上去了，
+    // 肉眼上 Caps Lock 灯还是亮起来的；屏幕图标等时间校准后再由 100ms 节拍补上。
+    if (!ti || ti->tm_year < 124) { lockStateDirty = false; return; }
 
     static char time_buf[16], date_buf[32], num_buf[24];
 
@@ -4997,6 +5396,11 @@ static void updateDynamicElements(void) {
             break;
         }
     }
+
+    // 三层锁指示（顶部条圆点/外圈、INFO_PANEL 圆点/文字/胶囊）这一帧都写完了，
+    // 锁脏位可以放掉。如果这里不 clear，下次 loop() 会再无条件跑一遍
+    // updateDynamicElements()，白跑 time()/localtime()。
+    lockStateDirty = false;
 }
 
 // ===========================
@@ -5288,6 +5692,19 @@ void setup() {
     delay(500);
     Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
 
+    // 早分配 PSRAM 日志环形缓冲:越早越好,从这里开始的所有 LOG_PORT.printf
+    // 都能进缓冲,后面网页发 LOG:dump 能一次性拉到。失败降级到不缓冲
+    // (Serial0 仍正常,只是网页看不到日志而已,不至于死锁)
+    if (logRingBuf == nullptr) {
+        logRingBuf = (char*)ps_malloc(LOG_BUF_CAP);
+        if (logRingBuf) {
+            memset(logRingBuf, 0, LOG_BUF_CAP);
+            LOG_PORT.println("[LOG] ring buffer ready (PSRAM 8KB)");
+        } else {
+            LOG_PORT.println("[LOG] ps_malloc failed, BLE log disabled");
+        }
+    }
+
     setenv("TZ", "CST-8", 1);
     tzset();
 
@@ -5380,6 +5797,11 @@ void setup() {
     pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID,
         BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
     pCharacteristic->setCallbacks(new MyCallbacks());
+    // 必须显式 addDescriptor(BLE2902),不然 CCCD 描述符不在 GATT 数据库里,
+    // 客户端(Chrome Web Bluetooth)调 startNotifications() 时往 CCCD 写订阅位会
+    // 直接返回 "GATT Error: Not supported",网页上 read-back 全超时 —— 表现就是
+    // "切了键啥也不显示"。NimBLE 不会自动加 CCCD,得手动。
+    pCharacteristic->addDescriptor(new BLE2902());
     pService->start();
     BLEDevice::startAdvertising();
 
@@ -5509,7 +5931,16 @@ void loop() {
         scanKeyboardMatrix();
     }
 
-    // 灯效
+    // 锁状态脏：不等 20ms 灯效节拍，立刻推一帧纯指示灯帧。
+// renderLightingEngine() 每帧尾巴也会调 renderIndicators()，
+// 这条分支只是把"按 Caps Lock → 看到屏幕/灯变化"的延迟从最坏 20ms 压到下一轮 loop。
+// 状态灯帧不依赖主背光的 currentEffect / lightOn，所以单独跑一次也没副作用。
+if (lockStateDirty) {
+    renderIndicators();
+    sendLedFrameToC3();
+}
+
+// 灯效
     if (millis() - lastLedFrameTime >= 20) {
         lastLedFrameTime = millis();
         ct_mark(CT_S_LED);
