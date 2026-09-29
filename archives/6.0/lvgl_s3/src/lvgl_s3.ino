@@ -245,16 +245,17 @@ static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
 
 // 显示模式
-#define DISP_MODE_GEEK        0
-#define DISP_MODE_BIG_CLOCK   1
-#define DISP_MODE_INFO_PANEL  2
-#define DISP_MODE_KEY_MON     3
-#define DISP_MODE_RHYTHM      4
-#define DISP_MODE_WALLPAPER   5
-#define TOTAL_DISP_MODES      6
+#define DISP_MODE_GEEK            0
+#define DISP_MODE_BIG_CLOCK       1
+#define DISP_MODE_INFO_PANEL      2
+#define DISP_MODE_KEY_MON         3
+#define DISP_MODE_RHYTHM          4
+#define DISP_MODE_WALLPAPER       5
+#define DISP_MODE_HIGH_CONTRAST   6
+#define TOTAL_DISP_MODES          7
 
 static const char* dispModeNames[TOTAL_DISP_MODES] = {
-    "极客仪表盘", "大字时钟", "信息面板", "击键监控", "律动", "壁纸"
+    "极客仪表盘", "大字时钟", "信息面板", "击键监控", "律动", "壁纸", "高对比度"
 };
 
 static uint8_t currentDispMode = DISP_MODE_GEEK;
@@ -841,6 +842,24 @@ static lv_obj_t* wp_bg = nullptr;
 static lv_obj_t* wp_img = nullptr;
 static lv_obj_t* wp_lbl_time = nullptr;
 
+// 高对比度（纯黑 + 三段式：锁柱 / 时-日-键 / 方案温湿字数）
+static lv_obj_t* hc_bg = nullptr;
+// 中段：时间 / 日期 / 大红键名（键名无标题）
+static lv_obj_t* hc_lbl_time = nullptr;
+static lv_obj_t* hc_lbl_date = nullptr;
+static lv_obj_t* hc_lbl_lastkey = nullptr;
+// 顶部 3 列锁柱（每列宽 80px），3 根竖条 + 3 个文字标
+static lv_obj_t* hc_lockBar[3]   = { nullptr, nullptr, nullptr };
+static lv_obj_t* hc_lbl_lock[3]  = { nullptr, nullptr, nullptr };
+static uint32_t  hc_lockOn[3]    = { 0, 0, 0 };
+// 底段：方案名 / 温度 / 湿度
+static lv_obj_t* hc_lbl_profile = nullptr;
+static lv_obj_t* hc_lbl_temp = nullptr;
+static lv_obj_t* hc_lbl_hum = nullptr;
+// 右下：累计字数（label + 数字）
+static lv_obj_t* hc_lbl_charsLbl  = nullptr;  // "字数"小灰字
+static lv_obj_t* hc_lbl_charsNum  = nullptr;  // 数字本体
+
 // ===========================
 // 壁纸：JPEG 上传 + 解码缓冲
 // ===========================
@@ -967,14 +986,16 @@ static bool mainContentValid = false;
 // 整组停用后整机恢复正常 -> 卡死来自风格渲染，这里改成位掩码逐个试，
 // 一次只放开一两种就能定位到具体是哪个 build_style_* 把机器拖死。
 // 六个位全打开 = 完全恢复原来的 6 种主屏风格。
-#define STYLE_BIT_GEEK        (1u << DISP_MODE_GEEK)
-#define STYLE_BIT_BIG_CLOCK   (1u << DISP_MODE_BIG_CLOCK)
-#define STYLE_BIT_INFO_PANEL  (1u << DISP_MODE_INFO_PANEL)
-#define STYLE_BIT_KEY_MON     (1u << DISP_MODE_KEY_MON)
-#define STYLE_BIT_RHYTHM      (1u << DISP_MODE_RHYTHM)
-#define STYLE_BIT_WALLPAPER   (1u << DISP_MODE_WALLPAPER)
-#define STYLE_BIT_ALL         (STYLE_BIT_GEEK | STYLE_BIT_BIG_CLOCK | STYLE_BIT_INFO_PANEL | \
-                               STYLE_BIT_KEY_MON | STYLE_BIT_RHYTHM | STYLE_BIT_WALLPAPER)
+#define STYLE_BIT_GEEK            (1u << DISP_MODE_GEEK)
+#define STYLE_BIT_BIG_CLOCK       (1u << DISP_MODE_BIG_CLOCK)
+#define STYLE_BIT_INFO_PANEL      (1u << DISP_MODE_INFO_PANEL)
+#define STYLE_BIT_KEY_MON         (1u << DISP_MODE_KEY_MON)
+#define STYLE_BIT_RHYTHM          (1u << DISP_MODE_RHYTHM)
+#define STYLE_BIT_WALLPAPER       (1u << DISP_MODE_WALLPAPER)
+#define STYLE_BIT_HIGH_CONTRAST   (1u << DISP_MODE_HIGH_CONTRAST)
+#define STYLE_BIT_ALL             (STYLE_BIT_GEEK | STYLE_BIT_BIG_CLOCK | STYLE_BIT_INFO_PANEL | \
+                                   STYLE_BIT_KEY_MON | STYLE_BIT_RHYTHM | STYLE_BIT_WALLPAPER | \
+                                   STYLE_BIT_HIGH_CONTRAST)
 // 六种风格全开。之前的"全开就整机卡死"不是风格本身重，是 topLockDot[] 这组
 // 共用指针在切换时没清干净，updateDynamicElements() 一直在写已释放的内存
 // （详见 resetStylePointers 里的注释）。这个坑填掉之后掩码就不再是必需品了。
@@ -1016,6 +1037,12 @@ static void resetStylePointers(void) {
 
     wp_img = nullptr; wp_lbl_time = nullptr;
 
+    // 高对比度
+    hc_lbl_time = nullptr; hc_lbl_date = nullptr; hc_lbl_lastkey = nullptr;
+    for (int i = 0; i < 3; i++) { hc_lockBar[i] = nullptr; hc_lbl_lock[i] = nullptr; }
+    hc_lbl_profile = nullptr; hc_lbl_temp = nullptr; hc_lbl_hum = nullptr;
+    hc_lbl_charsLbl = nullptr; hc_lbl_charsNum = nullptr;
+
     // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
     // 之前漏在这里清理，就踩了和 ipLockDot[] 一模一样的坑，而且这次更隐蔽：
     //
@@ -1037,6 +1064,7 @@ static void resetStylePointers(void) {
 static void destroyMainScreen(void) {
     gk_bg = nullptr; bc_bg = nullptr; ip_bg = nullptr;
     km_bg = nullptr; rh_bg = nullptr; wp_bg = nullptr;
+    hc_bg = nullptr;
     resetStylePointers();   // 顶部条指针在这里一并清掉
 
     if (scr_main != nullptr) {
@@ -2113,6 +2141,125 @@ static void build_style_wallpaper(void) {
     mkLabel(wp_lbl_time, &lv_font_montserrat_28, CLR_TEXT);
     lv_label_set_text(wp_lbl_time, "--:--");
     lv_obj_center(wp_lbl_time);
+}
+
+// ===========================
+// 构建：高对比度（纯黑 + 大字 + 大红键名）
+// ===========================
+// 版面（240x240，全屏坐标）：
+//   0..6       顶部留 6px 喘息
+//   6..32      顶部 3 颗大锁灯 + 右上系统图标（不再有底色条）
+//   40..96     中间大时钟（montserrat_48，行高 52）
+//   104..168   中间大红色按键名（montserrat_48，行高 52，**无标题**）
+//   180..220   底部 3 项 + 字数
+//              ├ 184..200 方案名（simsun_16，CLR_ACCENT）
+//              ├ 184..200 温度值（montserrat_20）
+//              ├ 184..200 湿度值（montserrat_20）
+//              └ 218..230 右下角字数
+//
+// 设计要点：
+//   · 不要 6 种风格共用的 dashTopBar() —— 那个是"小灯 + 文字图标 + 文字方案序号"，
+//     主题色全是低对比度的蓝灰。这版要"高对比度"，所以锁灯做成**纯黑背景上的大色点**：
+//     点 16px（dashTopBar 是 8px），亮起时整点变绿/青/琥珀、灭态时灰到几乎不可见。
+//     没有底色条、没有边框、没有文字图标 —— 顶栏就是三个点 + 一个图标。
+//   · 按键反馈按用户要求"那几个字就不要了"：没有"最近按键"标题，直接一个
+//     montserrat_48 的红字键名 Space / Enter / A 杵在中间。montserrat_48 没有 CJK，
+//     所以**显示的就是 ASCII 键名**，CJK 控件绕过它了。
+//   · 底部 3 个数据并排放：方案名 + 温度 + 湿度。中间留空 → 视觉上自然分三块。
+//   · 字数 = totalKeyCount（项目里只有"累计击键"，没有单独的"字符计数"，
+//     把它映射到"输了多少字"是合理的近似，标签写"字数"而不是"击键"，
+//     用户的措辞是"输了多少字"，照着走）。
+static void build_style_high_contrast(void) {
+    if (hc_bg) { lv_obj_del(hc_bg); hc_bg = nullptr; }
+
+    hc_bg = makeRootPanel(ensureMainScreen(), 0x000000);   // 纯黑
+
+    // ===========================================================
+    // 上段（y=0..56）：3 等分，每列一根竖条表达一个锁态
+    //   列宽 = 240/3 = 80px
+    //   列内：顶部小字标 NUM|CAPS|SCR（y≈4..14），竖条（y≈18..52）
+    //   亮：填充 lockLedColor[i]（绿/青/琥珀）
+    //   灭：填充 #1F1F1F（深灰，几乎隐形）
+    // ===========================================================
+    const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
+    static const char* lockNames[3] = { "NUM", "CAPS", "SCR" };
+    for (int i = 0; i < 3; i++) {
+        const lv_coord_t colCenterX = 40 + i * 80;          // 列中心 x: 40 / 120 / 200
+        // 文字标
+        lv_obj_t* t = lv_label_create(hc_bg);
+        mkLabel(t, &lv_font_montserrat_14, CLR_TEXT_DIM);
+        lv_label_set_text(t, lockNames[i]);
+        lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_width(t, 80);
+        lv_label_set_long_mode(t, LV_LABEL_LONG_CLIP);
+        lv_obj_align(t, LV_ALIGN_TOP_LEFT, colCenterX - 40, 4);
+        hc_lbl_lock[i] = t;
+        hc_lockOn[i] = onColors[i];
+        // 竖条：60px 宽 × 34px 高，圆角 4px
+        lv_obj_t* bar = iconRect(hc_bg, 60, 34, LV_ALIGN_TOP_LEFT,
+                                 colCenterX - 30, 18,
+                                 onColors[i], 4);
+        hc_lockBar[i] = bar;
+    }
+
+    // ===========================================================
+    // 中段（y=60..200）：时间 / 日期 / 大红按键名（无标题）
+    // ===========================================================
+    hc_lbl_time = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(hc_lbl_time, "--:--");
+    lv_obj_align(hc_lbl_time, LV_ALIGN_TOP_MID, 0, 60);
+
+    hc_lbl_date = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(hc_lbl_date, "--");
+    lv_obj_set_width(hc_lbl_date, 240);
+    lv_obj_set_style_text_align(hc_lbl_date, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_date, LV_ALIGN_TOP_MID, 0, 112);
+
+    hc_lbl_lastkey = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_lastkey, &lv_font_montserrat_48, CLR_RED);
+    lv_label_set_text(hc_lbl_lastkey, "-");
+    lv_obj_set_width(hc_lbl_lastkey, 180);
+    lv_label_set_long_mode(hc_lbl_lastkey, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(hc_lbl_lastkey, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_lastkey, LV_ALIGN_TOP_MID, 0, 132);
+
+    // 按键右下角的"字数"
+    hc_lbl_charsLbl = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_charsLbl, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(hc_lbl_charsLbl, "字数");
+    lv_obj_align(hc_lbl_charsLbl, LV_ALIGN_TOP_RIGHT, -8, 138);
+
+    hc_lbl_charsNum = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_charsNum, &lv_font_montserrat_20, CLR_TEXT);
+    lv_label_set_text(hc_lbl_charsNum, "0");
+    lv_obj_align(hc_lbl_charsNum, LV_ALIGN_TOP_RIGHT, -8, 158);
+
+    // ===========================================================
+    // 下段（y=204..232）：方案 / 温度 / 湿度 3 列
+    // ===========================================================
+    hc_lbl_profile = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_profile, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(hc_lbl_profile, profileNamesCN[currentProfile]);
+    lv_obj_set_width(hc_lbl_profile, 80);
+    lv_obj_set_style_text_align(hc_lbl_profile, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_long_mode(hc_lbl_profile, LV_LABEL_LONG_DOT);
+    lv_obj_align(hc_lbl_profile, LV_ALIGN_BOTTOM_LEFT, 0, -32);
+
+    hc_lbl_temp = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_temp, &lv_font_montserrat_20, CLR_AMBER);
+    lv_label_set_text(hc_lbl_temp, "--.-C");
+    lv_obj_set_width(hc_lbl_temp, 80);
+    lv_obj_set_style_text_align(hc_lbl_temp, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_temp, LV_ALIGN_BOTTOM_MID, 0, -32);
+
+    hc_lbl_hum = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_hum, &lv_font_montserrat_20, CLR_GREEN);
+    lv_label_set_text(hc_lbl_hum, "--%");
+    lv_obj_set_width(hc_lbl_hum, 80);
+    lv_obj_set_style_text_align(hc_lbl_hum, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_hum, LV_ALIGN_BOTTOM_RIGHT, 0, -32);
 }
 
 // ===========================
@@ -5412,6 +5559,30 @@ static void updateDynamicElements(void) {
             setText(wp_lbl_time, time_buf);
             break;
         }
+
+        case DISP_MODE_HIGH_CONTRAST: {
+            // 中段：时间 / 日期 / 大红按键名
+            setText(hc_lbl_time, time_buf);
+            setText(hc_lbl_date, date_buf);
+            // 大红色按键名：跟其它风格走 showKeystrokes 开关。
+            // "--" 不是中文 → 挂在 montserrat_48 上没问题。
+            setText(hc_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
+            // 顶部 3 列锁柱：亮 = 锁色，灭 = 深灰。
+            for (int i = 0; i < 3; i++) {
+                bool on = locks[i];
+                setBgColor(hc_lockBar[i], on ? hc_lockOn[i] : 0x1F1F1F);
+            }
+            // 下段：方案 / 温度 / 湿度
+            setText(hc_lbl_profile, profileNamesCN[currentProfile]);
+            static char tbuf[16], hbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
+            snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
+            setText(hc_lbl_temp, tbuf);
+            setText(hc_lbl_hum, hbuf);
+            // 按键右下角字数
+            setText(hc_lbl_charsNum, num_buf);
+            break;
+        }
     }
 
     // 三层锁指示（顶部条圆点/外圈、INFO_PANEL 圆点/文字/胶囊）这一帧都写完了，
@@ -5510,6 +5681,7 @@ static void renderCurrentDisplayBase(void) {
     if (km_bg) { lv_obj_del(km_bg); km_bg = nullptr; }
     if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
     if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
+    if (hc_bg) { lv_obj_del(hc_bg); hc_bg = nullptr; }
 
     // **必须清掉子对象指针，否则就是野指针**
     // 上面的 lv_obj_del(ip_bg) 会连同 card / 三颗锁灯胶囊 / 所有 label 一起释放，
@@ -5545,6 +5717,7 @@ static void renderCurrentDisplayBase(void) {
         case DISP_MODE_KEY_MON: build_style_keymon(); break;
         case DISP_MODE_RHYTHM: build_style_rhythm(); break;
         case DISP_MODE_WALLPAPER: build_style_wallpaper(); break;
+        case DISP_MODE_HIGH_CONTRAST: build_style_high_contrast(); break;
     }
     mainContentValid = true;
 }
