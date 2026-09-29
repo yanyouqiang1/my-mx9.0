@@ -1542,14 +1542,14 @@ static void dashTopBar(lv_obj_t* parent) {
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
     // 三颗锁：外圈（亮起时才显形）+ 圆点。
-    // 圆点从 6px 提到 8px，外面再套一圈同色细环 —— 单靠"小圆点换颜色"在
-    // 240px 的屏上离远了根本看不出来，加一圈之后亮度面积翻倍。
-    // 环和点的间距只有 1px（环 12px、点 8px），靠边框自身 1px 撑开。
+    // 圆点 8→10、外环 12→14、中心间距 18→22 —— 把亮度面积再往上推一档。
+    // 顶栏 28px 高度放得下 14px 的环；右半边方案序号 + 系统图标还在
+    // LV_ALIGN_RIGHT_MID, -10/-32，原布局不受影响。
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     for (int i = 0; i < 3; i++) {
         lv_obj_t* ring = lv_obj_create(bar);
-        lv_obj_set_size(ring, 12, 12);
-        lv_obj_align(ring, LV_ALIGN_LEFT_MID, 12 + i * 18, 0);
+        lv_obj_set_size(ring, 14, 14);
+        lv_obj_align(ring, LV_ALIGN_LEFT_MID, 14 + i * 22, 0);
         lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
         lv_obj_set_style_border_width(ring, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(ring, lv_color_hex(onColors[i]), LV_PART_MAIN);
@@ -1558,7 +1558,7 @@ static void dashTopBar(lv_obj_t* parent) {
         lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
         topLockRing[i] = ring;
 
-        lv_obj_t* d = iconRect(bar, 8, 8, LV_ALIGN_LEFT_MID, 14 + i * 18, 0,
+        lv_obj_t* d = iconRect(bar, 10, 10, LV_ALIGN_LEFT_MID, 16 + i * 22, 0,
                                CLR_STROKE, LV_RADIUS_CIRCLE);
         topLockDot[i] = d;
         topLockOn[i] = onColors[i];
@@ -1620,7 +1620,9 @@ static lv_obj_t* statCardBottom(lv_obj_t* parent, int cx, const char* cap,
 static void build_style_geek(void) {
     if (gk_bg) { lv_obj_del(gk_bg); gk_bg = nullptr; }
 
-    gk_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
+    // 极客仪表盘：纯黑底（与高对比度风格统一）。深蓝灰(CLR_BG)在小屏上
+    // 对比发灰，数字/温湿度这种低饱和内容铺上去反而显得闷。
+    gk_bg = makeRootPanel(ensureMainScreen(), 0x000000);
 
     dashTopBar(gk_bg);
 
@@ -2222,36 +2224,36 @@ static void build_style_high_contrast(void) {
 
     // ===========================================================
     // 顶栏（y=0..40）
-    //   左侧 3 列：LED 圆点（亮态实心+同色光晕，灭态空心描边）+ 下方 NUM/CAPS/SCR 数字
-    //   右侧：32×32 方案图标 + simsun_14 方案名
+    //   左侧 3 列：20px LED 圆点（亮态实心+同色光晕，灭态空心描边）+ 下方 NUM/CAPS/SCR 数字
+    //   右侧：32×32 方案图标 + simsun_16 方案名
     // ===========================================================
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     static const char* lockNames[3] = { "NUM", "CAPS", "SCR" };
     for (int i = 0; i < 3; i++) {
-        const lv_coord_t cx = 80 + i * 50;                 // x=80 / 130 / 180（左中右）
-        // LED 圆点：12px 直径实心圆（亮 = 锁色 + 光晕，灭 = 透明空圈）
+        const lv_coord_t cx = 30 + i * 44;                 // x=30 / 74 / 118（避开右侧图标）
+        // LED 圆点：20px 直径实心圆（亮 = 锁色 + 大光晕，灭 = 透明空圈）
         lv_obj_t* dot = lv_obj_create(hc_bg);
-        lv_obj_set_size(dot, 12, 12);
-        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, cx - 6, 6);
+        lv_obj_set_size(dot, 20, 20);
+        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, cx - 10, 4);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(dot, lv_color_hex(onColors[i]), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_border_width(dot, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(dot, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
         lv_obj_set_style_shadow_color(dot, lv_color_hex(onColors[i]), LV_PART_MAIN);
-        lv_obj_set_style_shadow_opa(dot, LV_OPA_30, LV_PART_MAIN);
-        lv_obj_set_style_shadow_width(dot, 4, LV_PART_MAIN);
-        lv_obj_set_style_shadow_spread(dot, 2, LV_PART_MAIN);
+        lv_obj_set_style_shadow_opa(dot, LV_OPA_40, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(dot, 8, LV_PART_MAIN);
+        lv_obj_set_style_shadow_spread(dot, 4, LV_PART_MAIN);
         lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
         hc_led_dot[i] = dot;
         hc_lockOn[i]  = onColors[i];
-        // 下方数字
+        // 下方数字（居中对齐圆点）
         lv_obj_t* t = lv_label_create(hc_bg);
         mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_DIM);
         lv_label_set_text(t, lockNames[i]);
-        lv_obj_set_width(t, 40);
+        lv_obj_set_width(t, 44);
         lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_align(t, LV_ALIGN_TOP_LEFT, cx - 20, 22);
+        lv_obj_align(t, LV_ALIGN_TOP_LEFT, cx - 22, 26);
         hc_lbl_lock[i] = t;
     }
     // 方案图标 + 方案名（右上角）
@@ -2269,7 +2271,7 @@ static void build_style_high_contrast(void) {
     // ===========================================================
     {
         lv_obj_t* card = iconRect(hc_bg, 220, 66, LV_ALIGN_TOP_MID, 0, 52,
-                                  0x0E1117, 10);
+                                  0x000000, 10);
         lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(card, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
         // 左 3px 青色装饰条（仪表盘"标签轴"）
@@ -2294,7 +2296,7 @@ static void build_style_high_contrast(void) {
     // ===========================================================
     {
         lv_obj_t* card = iconRect(hc_bg, 220, 66, LV_ALIGN_TOP_MID, 0, 130,
-                                  0x0E1117, 10);
+                                  0x000000, 10);
         lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(card, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
         // 左 3px 红色装饰条
@@ -2321,11 +2323,11 @@ static void build_style_high_contrast(void) {
 
     // ===========================================================
     // 数据带（y=202..234, w=220, h=32，3 等分）
-    //   卡片背景 #0A0D14，1px CLR_STROKE 描边，圆角 8
+    //   卡片背景 #000000（纯黑，靠描边浮现），1px CLR_STROKE 描边，圆角 8
     // ===========================================================
     {
         lv_obj_t* band = iconRect(hc_bg, 220, 32, LV_ALIGN_TOP_MID, 0, 202,
-                                  0x0A0D14, 8);
+                                  0x000000, 8);
         lv_obj_set_style_border_width(band, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(band, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
     }
