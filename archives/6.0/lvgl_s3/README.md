@@ -103,6 +103,19 @@ python check_font.py  # 确认 MISSING 为 0
   的 HID 修饰键处理，一处理整片小键盘就全错（7 会变成 Win 键）。
   网页"按键映射"下拉里那几个 "🔹 Left Ctrl"=224 才是 HID 风格，它们的换算
   统一在 `normalizeRemapKey()` 里做，只作用于 remap 表的读入/读出。
+- **小键盘符号键（`/ * - +`）必须用 `0xDC~0xDF`，不能退回 ASCII**。
+  这里踩过两次，两个方向的错都犯过：
+  · 用 HID usage `0x53~0x63` → 和 ASCII `'a'/'b'/'c'`(0x61~0x63) 数值撞车，
+    基础键盘按 A/B/C 会发成 Num 9 / Num 0 / Num .（见提交 `9973f87` 的 A→9 修复）。
+  · 改用 ASCII 规避撞车 → `*`=42 走 `_asciimap` 变成**主键盘 Shift+8**、
+    `+`=43 变成 Shift+=，发出来的压根不是小键盘那颗键（Mac 上数字小键盘就是废的）。
+  正解是 `0x88 + HID usage`：`Num /`=0xDC `Num *`=0xDD `Num -`=0xDE `Num +`=0xDF。
+  这一串既和 a/b/c 不撞车，又和网页"🔹 修饰键"224~231 不撞车，走 `kbPress` 的
+  `>=0x88` 分支被减回 `0x54~0x57` 交给 `pressRaw`，发出的是**真正的小键盘键**。
+  效果上等于"宏里选 Num \*"和"手按物理小键盘的 \*"发同一个码点。
+  小键盘数字（1-9/0/`.`）仍用 ASCII —— `_asciimap` 翻成主键盘数字，字符是对的；
+  换成 `0xE0~0xE7` 反而会被 `normalizeRemapKey()` 当修饰键折算掉。
+  ⚠ 网页 `s3-setting.html` 的 `KEY_OPTIONS` 是同一套值的另一个副本，**改一处要改两处**。
 - 同一个坑的第二个面：**别拿 Consumer 页的 usage 去比 `baseKey`**。
   0xE2 = 0x88+0x5A = **小键盘 2**，不是静音 —— 谁在按键分发里写
   `else if (baseKey == 0xE2)` 做 Mute，小键盘 2 就会静音且不再当数字键用。

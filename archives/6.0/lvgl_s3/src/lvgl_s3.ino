@@ -356,10 +356,28 @@ static volatile bool lockStateDirty = false;
 static bool mediaPlaying = false;
 
 // 温湿度
+//
+// 温度偏移的单位就是摄氏度，直接加在传感器读数上（shtTemp = t + shtTempOffset）。
+//
+// 之前这里是个 62.0f 的"内部基准"，而 sht31_update() 里写的是
+//     shtTemp = t + shtTempOffset - 62.0f;
+// 两处 62 正好抵消 —— 偏移从头到尾都是 0：
+//   · 屏上显示的 "偏移 +62.0" 跟实际含义对不上（那是基准值，不是偏移量）
+//   · 在校准页按 ↑↓ 改了值也看不出一丝变化（64.0 和 62.0 减完都是 0）
+//   · 传感器受主板发热影响偏高时，用户没有任何手段把读数调回来
+// 现在统一成"偏移就是偏移"：默认给实测补偿值，范围 ±20°C，屏上显示多少就真的加多少。
+//
+// 默认值 -5.3 是实测标定出来的：屏显 29.3°C 时参考温度计是 24.0°C，
+// 即本机 SHT31 受主板热源影响读数偏高约 5.3°C。每台机器发热情况不同，
+// 用菜单里的"温度校准"可以在 ±20°C 内任意微调。
+#define SHT_TEMP_OFFSET_DEFAULT  (-5.3f)
+#define SHT_TEMP_OFFSET_MIN      (-20.0f)
+#define SHT_TEMP_OFFSET_MAX      ( 20.0f)
+
 static bool shtAvailable = false;
 static float shtTemp = 0.0f;
 static float shtHumidity = 0.0f;
-static float shtTempOffset = 62.0f;
+static float shtTempOffset = SHT_TEMP_OFFSET_DEFAULT;
 static unsigned long lastSHTRead = 0;
 #define SHT_READ_INTERVAL_MS 900000UL
 
@@ -477,7 +495,7 @@ static uint32_t timerTotalSec = 0;
 static uint32_t timerRemainSec = 0;
 
 // 温度校准
-static float calTempOriginal = 62.0f;
+static float calTempOriginal = SHT_TEMP_OFFSET_DEFAULT;
 static int calTempField = 0;
 
 // 灯光设置
@@ -891,6 +909,14 @@ static bool         logoRxActive = false;    // 只有这个为 true 才处于�
 static unsigned long logoRxLastMs = 0;
 static uint16_t*    logoOutBuf  = nullptr;  // JPEGDEC 的绘制目标（解码期间有效）
 static uint32_t     meHexBytes  = 0;         // ME_DATA 累计写进去的十六进制字符数（诊断用）
+// ME 存储改成"ME_START 开一次 fd、ME_DATA 只写、ME_END 关"（原因见 handleCommand
+// 里 ME_START 那段注释）。这三个变量配合 loop() 里的超时兜底：
+// 网页发一半跑掉时不能把 fd 一直攥着 —— SPIFFS 默认只允许 10 个同时打开的文件，
+// 漏几个之后连 /logo.bin 都打不开了。
+static File         meFile;                  // 非空 = 正在收 ME 文本
+static uint32_t     meWriteErrors = 0;       // 长写/短写次数，ME_END 时据此报错
+static unsigned long meLastDataMs = 0;       // 最后一片 ME_DATA 的时间，供超时兜底
+#define ME_RX_TIMEOUT_MS 5000UL
 
 // 实现都在"构建：壁纸模式"那一段；onWrite 跑在 BLE 主机任务里、位置更靠前，
 // 这里先声明，壁纸上传的分流才能在那儿用上。
@@ -1200,7 +1226,8 @@ static void sht31_update(void) {
     if (!sht31_read_raw(rawT, rawH)) return;
     float t = -45.0f + 175.0f * ((float)rawT / 65535.0f);
     float h = 100.0f * ((float)rawH / 65535.0f);
-    shtTemp = t + shtTempOffset - 62.0f;
+    // 偏移直接加，不要再叠一个基准值 —— 见 SHT_TEMP_OFFSET_DEFAULT 上面的说明
+    shtTemp = t + shtTempOffset;
     shtHumidity = h;
 }
 
@@ -3569,7 +3596,8 @@ static void adjustSettingField(int delta) {
             break;
         }
         case SYS_MODE_CAL_TEMP: {
-            shtTempOffset = constrain(shtTempOffset + delta * 0.5f, 50.0f, 80.0f);
+            shtTempOffset = constrain(shtTempOffset + delta * 0.5f,
+                                      SHT_TEMP_OFFSET_MIN, SHT_TEMP_OFFSET_MAX);
             update_setting_caltemp_display();
             break;
         }
@@ -3743,19 +3771,27 @@ void switchProfile(uint8_t profIdx) {
 // baseMatrix 里这些 ASCII 字母走这条分支会被发成小键盘数字 ——
 // 这是基础键盘按 A 出 9、按 B 出 0、按 C 出 . 的根因。
 //
-// 修法:把 CMB 小键盘的编码从 HID Usage(0x53-0x63)统一改成 ASCII,这样
-//   Num / = '/' = 0x2F    _asciimap[0x2F] = 0x38 → HID /
-//   Num * = '*' = 0x2A    _asciimap[0x2A] = 0x25|SHIFT → SHIFT+8 → '*'
-//   Num - = '-' = 0x2D    _asciimap[0x2D] = 0x2D → HID -
-//   Num + = '+' = 0x2B    _asciimap[0x2B] = 0x2e|SHIFT → SHIFT+= → '+'
-//   Num Enter = '\n'=0x0A  _asciimap[0x0A] = 0x28 → HID Enter
-//   Num 1-9 = '1'-'9'     _asciimap[0x31..0x39] = 0x1E-0x26 → HID 1-9
-//   Num 0 = '0'           _asciimap[0x30] = 0x27 → HID 0
-//   Num . = '.'           _asciimap[0x2E] = 0x37 → HID .
-// 全部走 Keyboard.press() 就好,数值歧义彻底没了。
+// 第一版修法是"把 CMB 小键盘的编码从 HID Usage(0x53-0x63)统一改成 ASCII"
+// —— 数值撞车确实没了,但**矫枉过正**:ASCII 走的是 _asciimap,发出来的是
+// **主键盘**上打出同一个字符的键位组合,不是小键盘那颗键:
+//   Num * = '*' = 0x2A → _asciimap[0x2A] = 0x25|SHIFT → 主键盘 Shift+8  ✗
+//   Num + = '+' = 0x2B → _asciimap[0x2B] = 0x2E|SHIFT → 主键盘 Shift+=  ✗
+//   Num / = '/' = 0x2F → _asciimap[0x2F] = 0x38         → 主键盘 /       ✗
+// 用户要的是**小键盘**那颗 *（HID usage 0x55），只有 pressRaw 才发得出来。
 //
-// 这条修法的关键证据是 s3-setting.html:1056 那条已知 bug 注释,
-// 之前一直没修是因为没看出 0x53-0x63 跟 ASCII 'a'-'c' 的数值撞车。
+// 所以小键盘符号键改用 0xDC~0xDF —— 这是"HID 小键盘 usage + 0x88"，也就是
+// **键盘矩阵里小键盘那一片本来的编码**：
+//   Num / = 0x88+0x54 = 0xDC    Num * = 0x88+0x55 = 0xDD
+//   Num - = 0x88+0x56 = 0xDE    Num + = 0x88+0x57 = 0xDF
+// 走 kbPress 的 >=0x88 分支被减回 0x54~0x57 交给 pressRaw，发出来就是真正的小键盘键；
+// 同时这段和 ASCII 'a'/'b'/'c' 不撞车，A→9 那个 bug 也不会回来。
+// 效果上等价于"宏里选 Num *" == "手按物理小键盘的 * 键"，两边发同一个码点。
+//
+// 小键盘数字(1-9/0/.)保持 ASCII：_asciimap 翻成主键盘数字，字符是对的（'1' 还是 '1'）；
+// 而 0xE0~0xE7 那段和网页"🔹 修饰键"224~231 撞车，走 normalizeRemapKey 会被
+// 折算成 Ctrl/Shift，反而更糟。Num Enter 用 '\n' 同样能得到回车，一并留在 ASCII 侧。
+//
+// 网页那边对应的定义在 s3-setting.html 的 KEY_OPTIONS（"Num /":220 ~ "Num +":223），改一处要改两处。
 static inline void kbPress(uint8_t code) {
     // [DEBUG a→9] 临时诊断:打出实际走的分支,定位 baseKey 是多少、走的是哪条路径
     const char* path = "press";
@@ -4892,28 +4928,79 @@ static void handleCommand(const String& cmd) {
     // ME 键文本：网页端把 UTF-8 文本转成 hex 后分片下发，这里只负责落盘。
     // 按下 ME 键时才由 executeMacro("ME") 读出来发给电脑（见那里的 [HEXS] 协议），
     // 所以下发阶段一个字都不往主机打 —— 蓝牙发消息 ≠ 立刻在电脑上打字。
+    //
+    // == 为什么不再是"每个 ME_DATA 都 open/append/close 一次" ==
+    //
+    // 那是"数据稍大一点就崩溃重启"的根因。原写法每片（128 个 hex 字符）做一次
+    //     open(FILE_APPEND) → f.print(hex) → f.close()
+    // 这一个 open 里有**两次按文件名解析**，而 SPIFFS 的按名解析是**全盘扫描**：
+    //   · VFSFileImpl 构造函数先 stat() 一次（vfs_api.cpp:295）→ SPIFFS_stat
+    //   · fopen 再 open 一次 → SPIFFS_open
+    //   两者都走 spiffs_object_find_object_index_header_by_name
+    //   → spiffs_obj_lu_find_entry_visitor：遍历**整个文件系统**的 object
+    //   lookup 页，每遇到一个已分配的对象就把那 256 字节的索引头读到 RAM 里
+    //   去 strcmp 文件名（spiffs_nucleus.c:1673）。
+    //   所以**一次 open 的耗时取决于文件系统里存了多少东西**，而不只是这个文件多大。
+    // 于是总开销 ≈ 片数 × 全盘扫描代价，两个因子都随 ME 文本变大而变大 ——
+    // 平方级增长。小文本时每片几毫秒看不出来；文本一大，某一片的 open 就
+    // 卡在 loop() 里，而 loop() 身上压着 10 秒任务看门狗（WDT_TIMEOUT）和
+    // 6 秒卡死监测（crash_trace），任何一个先到都是当场复位。
+    // 另外每片还白搭一次 4096 字节的 stdio 缓冲 malloc/free
+    // （vfs_api.cpp:305 的 setvbuf，因为 vfs_spiffs_stat 不填 st_blksize）。
+    //
+    // 现在改成 ME_START 时**只开一次文件**，ME_DATA 只做纯写，ME_END 才 close：
+    //   · 每片不再有 stat、不再有按名解析、不再有 4KB 缓冲的分配释放
+    //   · 中途失败/网页跑掉也不会卡着 fd —— loop() 里 5 秒超时会收尾
+    // 顺带把错误真正暴露出来：open 失败、写进去的字节数对不上，都会当场报错，
+    // 而不是等 ME_END 看到一个对不上的 size 才发现。
+    //
+    // 注：SPIFFS 是日志式文件系统，改写同一页=写新页+把旧页标删。重复
+    // "截断重写"会把分区快速用旧，进而触发 SPIFFS_write 内联的 GC
+    // （spiffs_hydrogen.c:1223 → spiffs_gc_check，最多 CONFIG_SPIFFS_GC_MAX_RUNS=10 轮），
+    // 那同样是 loop() 里的长阻塞。少开少关也就少了一批页的翻烧。
     else if (cmd == "ME_START") {
-        File f = SPIFFS.open("/me_hex.txt", FILE_WRITE);
-        if (f) f.close();
+        // 上一轮没正常收尾就再来一次（网页重传/中途断开）——先结掉旧 fd
+        if (meFile) { meFile.close(); meFile = File(); }
+        meFile = SPIFFS.open("/me_hex.txt", FILE_WRITE);
         meHexBytes = 0;
-        LOG_PORT.println("[ME] START");
+        meWriteErrors = 0;
+        meLastDataMs = millis();
+        if (!meFile) {
+            LOG_PORT.println("[ME] START open FAILED");
+            triggerHud("ME 文本", "文件打开失败", lv_color_hex(CLR_RED));
+        } else {
+            LOG_PORT.println("[ME] START (single fd, opened once)");
+        }
     }
     else if (cmd.startsWith("ME_DATA:")) {
         String hex = cmd.substring(8);
         if (hex.length() == 0) return;
-        File f = SPIFFS.open("/me_hex.txt", FILE_APPEND);
-        if (f) { f.print(hex); f.close(); meHexBytes += hex.length(); }
-        else LOG_PORT.println("[ME] append FAILED (SPIFFS open failed)");
+        meLastDataMs = millis();
+        // ME_START 丢了（旧网页只发 ME_DATA，或者那条包被 BLE 吞了）：自己补开一次，
+        // 否则整段文本会一声不响地丢掉，比报错更难查。
+        if (!meFile) {
+            LOG_PORT.println("[ME] ME_DATA without START, opening file");
+            meFile = SPIFFS.open("/me_hex.txt", FILE_WRITE);
+            if (!meFile) { meWriteErrors++; return; }
+        }
+        size_t want = hex.length();
+        size_t got  = meFile.print(hex);
+        if (got != want) meWriteErrors++;
+        meHexBytes += (uint32_t)got;
     }
     else if (cmd == "ME_END") {
+        if (meFile) { meFile.close(); meFile = File(); }
         size_t sz = 0;
         if (SPIFFS.exists("/me_hex.txt")) {
             File f = SPIFFS.open("/me_hex.txt", FILE_READ);
             if (f) { sz = f.size(); f.close(); }
         }
-        LOG_PORT.printf("[ME] END onDisk=%u appended=%u\n", (unsigned)sz, (unsigned)meHexBytes);
-        if (sz == 0) triggerHud("ME 文本", "存入失败", lv_color_hex(CLR_RED));
-        else {
+        LOG_PORT.printf("[ME] END onDisk=%u appended=%u errs=%u\n",
+                        (unsigned)sz, (unsigned)meHexBytes, (unsigned)meWriteErrors);
+        if (sz == 0 || meWriteErrors > 0) {
+            triggerHud("ME 文本", meWriteErrors ? "写入出错" : "存入失败",
+                       lv_color_hex(CLR_RED));
+        } else {
             char info[32];
             snprintf(info, sizeof(info), "%u 字节已存", (unsigned)sz);
             triggerHud("ME 文本", info, lv_color_hex(CLR_GREEN));
@@ -5947,7 +6034,16 @@ void setup() {
     if (keyFxStyle >= KEYFX_COUNT) keyFxStyle = KEYFX_RIPPLE;
     indBrightness = indLevelValues[indLevel];
 
-    shtTempOffset = preferences.getFloat("sht_offset", 62.0f);
+    shtTempOffset = preferences.getFloat("sht_offset", SHT_TEMP_OFFSET_DEFAULT);
+    // 老固件把这里当成"内部基准"存，值是 62.0（那个值在校准页里怎么调都不生效）。
+    // 新语义下 62.0 会被当成 "+62°C 的偏移"加进去，读数直接爆掉 —— 所以
+    // 跳出 ±20 范围的历史值一律丢掉，回落到默认补偿。
+    // 用户真正调过的值（±20 以内）不受影响，校准结果不会丢。
+    if (shtTempOffset < SHT_TEMP_OFFSET_MIN || shtTempOffset > SHT_TEMP_OFFSET_MAX) {
+        LOG_PORT.printf("[SHT] stored offset %.1f out of range, reset to %.1f\n",
+                        shtTempOffset, SHT_TEMP_OFFSET_DEFAULT);
+        shtTempOffset = SHT_TEMP_OFFSET_DEFAULT;
+    }
 
     // I2C / MCP23017
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -6084,6 +6180,17 @@ void loop() {
     if (logoRxDone) finishLogoUpload();
     if (logoRxActive && !logoRxDone && millis() - logoRxLastMs > LOGO_RX_TIMEOUT_MS) {
         abortLogoUpload("传输中断");
+    }
+
+    // ME 文本：和壁纸同一个道理。网页发到一半关掉页面/走出蓝牙范围时，
+    // 那个 fd 不能一直开着 —— SPIFFS 默认 maxOpenFiles=10，漏几个之后
+    // 连 /logo.bin 都打不开。超时就收尾关闭，已写进去的部分保留。
+    if (meFile && millis() - meLastDataMs > ME_RX_TIMEOUT_MS) {
+        meFile.close();
+        meFile = File();
+        LOG_PORT.printf("[ME] rx timeout, closed (partial %u bytes)\n",
+                        (unsigned)meHexBytes);
+        triggerHud("ME 文本", "传输超时", lv_color_hex(CLR_AMBER));
     }
 
     // USB HID 厂商通道走同一套纪律：USB 回调只往环形缓冲里塞字节，

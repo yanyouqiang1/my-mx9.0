@@ -460,13 +460,27 @@
         "'": 52, "`": 53, ",": 54, ".": 55, "/": 56,
         "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
         "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
-        // 小键盘：改用 ASCII 编码(0x0A / 0x2A-0x2F / 0x30-0x39),固件 kbPress 走 _asciimap
-        // 自然翻成对应 HID usage。原来用 HID 0x53-0x63 时,ASCII 'a'/'b'/'c' = 0x61-0x63
-        // 落在同一段,基础键盘按 a/b/c 会被发成 Num 9/Num 0/Num . —— 这是 A→9/B→0/C→. 的根因。
-        // ASCII 编码后,a/b/c 走 _asciimap[0x61..0x63] = 0x04/0x05/0x06 (HID a/b/c),
-        // 小键盘 '1'-'9'/'0'/'/'/'*'/'-'/'+'/'.' 也各自有 _asciimap 条目正确翻译。
-        // Num Lock 没有 ASCII 等价(它是 toggle 键),从下拉里移除;Num Enter 用 '\n'(0x0A)。
-        "Num /": 47, "Num *": 42, "Num -": 45, "Num +": 43, "Num Enter": 10,
+        // 小键盘符号键：用**键盘矩阵里小键盘那一片自己的码点**(0xDC~0xDF)。
+        //
+        // 为什么不能用 ASCII（这是 Num * 发成 Shift+8 的根因）：
+        //   之前 "Num *" 编成 ASCII 42='*'，固件 kbPress 走 Keyboard.press('*')，
+        //   而 _asciimap[0x2A] = 0x25|SHIFT = "主键盘的 Shift+8"。同理
+        //   "Num +"=43 → _asciimap[0x2B] = SHIFT+'='，出来的都不是小键盘那颗键。
+        //   用户要的是**小键盘的 \***，HID usage 0x55，只有走 pressRaw 才能发出来。
+        //
+        // 为什么不能直接用 HID 0x53~0x63：那段和 ASCII 'a'/'b'/'c'(0x61~0x63)
+        //   数值撞车，基础键盘按 a/b/c 会被发成 Num 9/Num 0/Num .（曾经的 A→9 bug）。
+        //
+        // 0xDC~0xDF 是**两全**的选择：HID 小键盘这一段在矩阵里的编码就是 0x88+usage
+        //   （0x88+0x54=0xDC=Num / … 0x88+0x57=0xDF=Num +），和 a/b/c 不撞车，
+        //   固件 kbPress 对 >=0x88 的值走 pressRaw(code-0x88)，正好落到 0x54~0x57。
+        //   换句话说：宏里选"Num *"和**手按物理小键盘的 \* 键**发出的是同一个码点。
+        //
+        // 数字键(1-9/0/.)保留 ASCII：_asciimap 把它们翻成主键盘数字，字符本身是对的
+        //   ('1' 还是 '1')；而 0xE0~0xE7 那一段和网页"🔹 修饰键"的 224~231 撞车，
+        //   走一遍 normalizeRemapKey 会被折算成 Ctrl/Shift，反而更糟。
+        //   Num Lock 和 Num Enter 同理（后者用 '\n' 也能得到回车），继续留在 ASCII 侧。
+        "Num /": 220, "Num *": 221, "Num -": 222, "Num +": 223, "Num Enter": 10,
         "Num 1": 49, "Num 2": 50, "Num 3": 51, "Num 4": 52, "Num 5": 53,
         "Num 6": 54, "Num 7": 55, "Num 8": 56, "Num 9": 57,
         "Num 0": 48, "Num .": 46,
