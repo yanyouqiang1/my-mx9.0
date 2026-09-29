@@ -1532,34 +1532,38 @@ static void dashTopBar(lv_obj_t* parent) {
     lv_obj_t* bar = lv_obj_create(parent);
     lv_obj_set_size(bar, 240, 28);
     lv_obj_set_pos(bar, 0, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(CLR_SURFACE), LV_PART_MAIN);
+    // 顶栏底色改成纯黑，与极客仪表盘/高对比度风格的纯黑页底融合；
+    // 下面那条 1px 分隔线也压到 0x1A1A1A，免得在黑底上看起来像灰条。
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
     lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
-    lv_obj_set_style_border_color(bar, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+    lv_obj_set_style_border_color(bar, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
     // 三颗锁：外圈（亮起时才显形）+ 圆点。
-    // 圆点 8→10、外环 12→14、中心间距 18→22 —— 把亮度面积再往上推一档。
-    // 顶栏 28px 高度放得下 14px 的环；右半边方案序号 + 系统图标还在
-    // LV_ALIGN_RIGHT_MID, -10/-32，原布局不受影响。
+    // 圆点 10→12、外环 14→18（边框加粗到 2px）、中心间距 22→28。
+    // 顶栏 28px 高度放得下 18px 的环；三颗右沿到 ~81px，右半边
+    // 方案序号 + 系统图标（>=200px 才开始）完全不受影响。
+    // OFF 态的圆点从 CLR_STROKE（深灰 0x2B3549）改成 CLR_TEXT_MUTE
+    // （浅灰 0x5B6579）—— 黑底上深灰圆点几乎看不见，灭/亮分辨不出。
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     for (int i = 0; i < 3; i++) {
         lv_obj_t* ring = lv_obj_create(bar);
-        lv_obj_set_size(ring, 14, 14);
-        lv_obj_align(ring, LV_ALIGN_LEFT_MID, 14 + i * 22, 0);
+        lv_obj_set_size(ring, 18, 18);
+        lv_obj_align(ring, LV_ALIGN_LEFT_MID, 16 + i * 28, 0);
         lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(ring, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_width(ring, 2, LV_PART_MAIN);
         lv_obj_set_style_border_color(ring, lv_color_hex(onColors[i]), LV_PART_MAIN);
         lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_pad_all(ring, 0, LV_PART_MAIN);
         lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
         topLockRing[i] = ring;
 
-        lv_obj_t* d = iconRect(bar, 10, 10, LV_ALIGN_LEFT_MID, 16 + i * 22, 0,
-                               CLR_STROKE, LV_RADIUS_CIRCLE);
+        lv_obj_t* d = iconRect(bar, 12, 12, LV_ALIGN_LEFT_MID, 19 + i * 28, 0,
+                               CLR_TEXT_MUTE, LV_RADIUS_CIRCLE);
         topLockDot[i] = d;
         topLockOn[i] = onColors[i];
     }
@@ -5731,7 +5735,7 @@ static void updateDynamicElements(void) {
     const bool locks[3] = { numLock, capsLock, scrollLock };
     static const char* lockNamesCN[3] = { "数字锁定", "大写锁定", "滚动锁定" };
     for (int i = 0; i < 3; i++) {
-        setBgColor(topLockDot[i], locks[i] ? topLockOn[i] : CLR_STROKE);
+        setBgColor(topLockDot[i], locks[i] ? topLockOn[i] : CLR_TEXT_MUTE);
         setHidden(topLockRing[i], !locks[i]);
         // lockPrevValid == false 表示界面刚重建过：这一帧只记录不弹窗，
         // 否则重建后锁状态一样也会被判成"刚翻转"，回一次主屏弹三条提示。
