@@ -2129,104 +2129,129 @@ static void build_style_wallpaper(void) {
 //
 // 设计要点：
 //   · 不要 6 种风格共用的 dashTopBar() —— 那个是"小灯 + 文字图标 + 文字方案序号"，
-//     主题色全是低对比度的蓝灰。这版要"高对比度"，所以锁灯做成**纯黑背景上的大色点**：
-//     点 16px（dashTopBar 是 8px），亮起时整点变绿/青/琥珀、灭态时灰到几乎不可见。
-//     没有底色条、没有边框、没有文字图标 —— 顶栏就是三个点 + 一个图标。
+//     主题色全是低对比度的蓝灰。这版要"高对比度"，所以锁灯做成**纯黑背景上的大色块**：
+//     NUM / CAPS / SCR 文字直接嵌在色块里（亮起：色块满色 + 黑字；灭态：#1F1F1F + 灰字），
+//     不用再额外摆一根竖条。
 //   · 按键反馈按用户要求"那几个字就不要了"：没有"最近按键"标题，直接一个
-//     montserrat_48 的红字键名 Space / Enter / A 杵在中间。montserrat_48 没有 CJK，
-//     所以**显示的就是 ASCII 键名**，CJK 控件绕过它了。
-//   · 底部 3 个数据并排放：方案名 + 温度 + 湿度。中间留空 → 视觉上自然分三块。
-//   · 字数 = totalKeyCount（项目里只有"累计击键"，没有单独的"字符计数"，
-//     把它映射到"输了多少字"是合理的近似，标签写"字数"而不是"击键"，
-//     用户的措辞是"输了多少字"，照着走）。
+//     红字键名 Space / Enter / A 杵在中间。montserrat_* 没有 CJK，
+//     所以**显示的就是 ASCII 键名**，CJK 控件绕过它了。字号改成 montserrat_28
+//     是为了让底部温 / 湿卡 + 字数都有空间。
+//   · 底部 3 列：方案图标（L=48，最显眼）+ 温卡 + 湿卡；温 / 湿卡左上角加
+//     "温" / "湿" 中文小标，整张卡用 1px 描边色（CLR_AMBER / CLR_GREEN）
+//     划出来，比纯色温文字更有"分组"感。
+//   · 字数挪到右下角、字号变小（"字数" simsun_16 + 数字 montserrat_14）。
+//     用户要求"右下角小字"，就不再压在按键名旁边干扰视线了。
 static void build_style_high_contrast(void) {
     if (hc_bg) { lv_obj_del(hc_bg); hc_bg = nullptr; }
 
     hc_bg = makeRootPanel(ensureMainScreen(), 0x000000);   // 纯黑
 
     // ===========================================================
-    // 上段（y=0..56）：3 等分，每列一根竖条表达一个锁态
-    //   列宽 = 240/3 = 80px
-    //   列内：顶部小字标 NUM|CAPS|SCR（y≈4..14），竖条（y≈18..52）
-    //   亮：填充 lockLedColor[i]（绿/青/琥珀）
-    //   灭：填充 #1F1F1F（深灰，几乎隐形）
+    // 上段（y=4..48）：3 列锁色块，NUM / CAPS / SCR 文字嵌在色块里
+    //   列宽 240/3 = 80，色块 60×44 圆角 6
+    //   亮：填充 lockLedColor[i]，文字 CLR_BG（黑字压在亮色上对比最强）
+    //   灭：填充 #1F1F1F，文字 CLR_TEXT_MUTE（深灰字压在深灰块上"几乎隐形"）
     // ===========================================================
     const uint32_t onColors[3] = { lockLedColor[0], lockLedColor[1], lockLedColor[2] };
     static const char* lockNames[3] = { "NUM", "CAPS", "SCR" };
     for (int i = 0; i < 3; i++) {
         const lv_coord_t colCenterX = 40 + i * 80;          // 列中心 x: 40 / 120 / 200
-        // 文字标
-        lv_obj_t* t = lv_label_create(hc_bg);
-        mkLabel(t, &lv_font_montserrat_14, CLR_TEXT_DIM);
+        // 色块
+        lv_obj_t* bar = iconRect(hc_bg, 60, 44, LV_ALIGN_TOP_LEFT,
+                                 colCenterX - 30, 4,
+                                 onColors[i], 6);
+        hc_lockBar[i] = bar;
+        // 文字嵌在色块里（label 父对象 = bar，LV_ALIGN_CENTER 自然居中）
+        lv_obj_t* t = lv_label_create(bar);
+        mkLabel(t, &lv_font_montserrat_14, CLR_BG);
         lv_label_set_text(t, lockNames[i]);
-        lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_set_width(t, 80);
-        lv_label_set_long_mode(t, LV_LABEL_LONG_CLIP);
-        lv_obj_align(t, LV_ALIGN_TOP_LEFT, colCenterX - 40, 4);
+        lv_obj_align(t, LV_ALIGN_CENTER, 0, 0);
         hc_lbl_lock[i] = t;
         hc_lockOn[i] = onColors[i];
-        // 竖条：60px 宽 × 34px 高，圆角 4px
-        lv_obj_t* bar = iconRect(hc_bg, 60, 34, LV_ALIGN_TOP_LEFT,
-                                 colCenterX - 30, 18,
-                                 onColors[i], 4);
-        hc_lockBar[i] = bar;
     }
 
     // ===========================================================
-    // 中段（y=60..200）：时间 / 日期 / 大红按键名（无标题）
+    // 中段（y=66..172）：时间 / 日期 / 红字按键名（整体下移 + 拉大间距）
+    //   时间 60→66，日期 112→122，按键 132→140，字号 28→24（再压一档让位给字数 + 底段）
     // ===========================================================
     hc_lbl_time = lv_label_create(hc_bg);
     mkLabel(hc_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
     lv_label_set_text(hc_lbl_time, "--:--");
-    lv_obj_align(hc_lbl_time, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_align(hc_lbl_time, LV_ALIGN_TOP_MID, 0, 66);
 
     hc_lbl_date = lv_label_create(hc_bg);
     mkLabel(hc_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
     lv_label_set_text(hc_lbl_date, "--");
     lv_obj_set_width(hc_lbl_date, 240);
     lv_obj_set_style_text_align(hc_lbl_date, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_date, LV_ALIGN_TOP_MID, 0, 112);
+    lv_obj_align(hc_lbl_date, LV_ALIGN_TOP_MID, 0, 122);
 
     hc_lbl_lastkey = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_lastkey, &lv_font_montserrat_48, CLR_RED);
+    mkLabel(hc_lbl_lastkey, &lv_font_montserrat_24, CLR_RED);
     lv_label_set_text(hc_lbl_lastkey, "-");
     lv_obj_set_width(hc_lbl_lastkey, 180);
     lv_label_set_long_mode(hc_lbl_lastkey, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(hc_lbl_lastkey, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_lastkey, LV_ALIGN_TOP_MID, 0, 132);
+    lv_obj_align(hc_lbl_lastkey, LV_ALIGN_TOP_MID, 0, 140);
 
-    // 按键右下角的"字数"
+    // ===========================================================
+    // 字数（底段正上方，灰色小字，右上角对齐）
+    //   "字数" simsun_16 + 数字 montserrat_14，都用 CLR_TEXT_MUTE 灰色
+    //   位置在底段三列的上方、右对齐 → 整个"数据区"的右上角
+    // ===========================================================
     hc_lbl_charsLbl = lv_label_create(hc_bg);
     mkLabel(hc_lbl_charsLbl, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
     lv_label_set_text(hc_lbl_charsLbl, "字数");
-    lv_obj_align(hc_lbl_charsLbl, LV_ALIGN_TOP_RIGHT, -8, 138);
+    lv_obj_align(hc_lbl_charsLbl, LV_ALIGN_TOP_RIGHT, -52, 174);
 
     hc_lbl_charsNum = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_charsNum, &lv_font_montserrat_20, CLR_TEXT);
+    mkLabel(hc_lbl_charsNum, &lv_font_montserrat_14, CLR_TEXT_MUTE);
     lv_label_set_text(hc_lbl_charsNum, "0");
-    lv_obj_align(hc_lbl_charsNum, LV_ALIGN_TOP_RIGHT, -8, 158);
+    lv_obj_align(hc_lbl_charsNum, LV_ALIGN_TOP_RIGHT, -8, 174);
 
     // ===========================================================
-    // 下段（y=204..232）：方案 / 温度 / 湿度 3 列
+    // 下段（y=192..240）：跟顶段一样竖着 3 等分（每列 80px）
+    //   列 1 (x=0..80,  列心 40): 方案图标 48×48（L 档，最大）
+    //   列 2 (x=80..160, 列心 120): 温卡 72×48
+    //   列 3 (x=160..240, 列心 200): 湿卡 72×48
+    //   三个元素都用 LV_ALIGN_BOTTOM_MID + dx 偏移列心，
+    //   比混用 BOTTOM_LEFT/MID/RIGHT 干净——之前 profile 和温卡撞了 20px 就是混用造成的。
     // ===========================================================
     hc_img_profile = lv_img_create(hc_bg);
-    lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
-    // 32×32 居中放在左下 80px 宽列里；列宽-图宽=48，向左偏 -24 让图标视觉居中
-    lv_obj_align(hc_img_profile, LV_ALIGN_BOTTOM_LEFT, 24, -28);
+    lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_L));
+    lv_obj_align(hc_img_profile, LV_ALIGN_BOTTOM_MID, -80, 0);  // 列心 x=40
 
-    hc_lbl_temp = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_temp, &lv_font_montserrat_20, CLR_AMBER);
-    lv_label_set_text(hc_lbl_temp, "--.-C");
-    lv_obj_set_width(hc_lbl_temp, 80);
-    lv_obj_set_style_text_align(hc_lbl_temp, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_temp, LV_ALIGN_BOTTOM_MID, 0, -32);
+    // 温卡：72×48，1px 琥珀描边，左上"温"小标 + 右下大数值
+    {
+        lv_obj_t* card = iconRect(hc_bg, 72, 48, LV_ALIGN_BOTTOM_MID, 0, 0,
+                                  CLR_SURFACE, 6);  // 列心 x=120
+        lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(card, lv_color_hex(CLR_AMBER), LV_PART_MAIN);
+        lv_obj_t* cap = lv_label_create(card);
+        mkLabel(cap, &lv_font_simsun_16_cjk, CLR_AMBER);
+        lv_label_set_text(cap, "温");
+        lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 6, 4);
+        hc_lbl_temp = lv_label_create(card);
+        mkLabel(hc_lbl_temp, &lv_font_montserrat_20, CLR_AMBER);
+        lv_label_set_text(hc_lbl_temp, "--.-");
+        lv_obj_align(hc_lbl_temp, LV_ALIGN_BOTTOM_RIGHT, -6, -2);
+    }
 
-    hc_lbl_hum = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_hum, &lv_font_montserrat_20, CLR_GREEN);
-    lv_label_set_text(hc_lbl_hum, "--%");
-    lv_obj_set_width(hc_lbl_hum, 80);
-    lv_obj_set_style_text_align(hc_lbl_hum, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_hum, LV_ALIGN_BOTTOM_RIGHT, 0, -32);
+    // 湿卡：72×48，1px 绿色描边，左上"湿"小标 + 右下大数值
+    {
+        lv_obj_t* card = iconRect(hc_bg, 72, 48, LV_ALIGN_BOTTOM_MID, 80, 0,
+                                  CLR_SURFACE, 6);  // 列心 x=200
+        lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(card, lv_color_hex(CLR_GREEN), LV_PART_MAIN);
+        lv_obj_t* cap = lv_label_create(card);
+        mkLabel(cap, &lv_font_simsun_16_cjk, CLR_GREEN);
+        lv_label_set_text(cap, "湿");
+        lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 6, 4);
+        hc_lbl_hum = lv_label_create(card);
+        mkLabel(hc_lbl_hum, &lv_font_montserrat_20, CLR_GREEN);
+        lv_label_set_text(hc_lbl_hum, "--");
+        lv_obj_align(hc_lbl_hum, LV_ALIGN_BOTTOM_RIGHT, -6, -2);
+    }
 }
 
 // ===========================
@@ -5528,25 +5553,27 @@ static void updateDynamicElements(void) {
         }
 
         case DISP_MODE_HIGH_CONTRAST: {
-            // 中段：时间 / 日期 / 大红按键名
+            // 中段：时间 / 日期 / 红字按键名
             setText(hc_lbl_time, time_buf);
             setText(hc_lbl_date, date_buf);
-            // 大红色按键名：跟其它风格走 showKeystrokes 开关。
-            // "--" 不是中文 → 挂在 montserrat_48 上没问题。
+            // 红字按键名：跟其它风格走 showKeystrokes 开关。
+            // "--" 不是中文 → 挂在 montserrat_28 上没问题。
             setText(hc_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
-            // 顶部 3 列锁柱：亮 = 锁色，灭 = 深灰。
+            // 顶部 3 列锁色块：亮 = 锁色 + 黑字；灭 = #1F1F1F + 灰字。
+            // 文字颜色也得跟亮灭一起切，否则灭态时黑字压在深灰块上直接看不见。
             for (int i = 0; i < 3; i++) {
                 bool on = locks[i];
                 setBgColor(hc_lockBar[i], on ? hc_lockOn[i] : 0x1F1F1F);
+                setTextColor(hc_lbl_lock[i], on ? CLR_BG : CLR_TEXT_MUTE);
             }
-            // 下段：方案图标 / 温度 / 湿度
-            lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
+            // 下段：方案图标(L=48) / 温度 / 湿度
+            lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_L));
             static char tbuf[16], hbuf[16];
             snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
             snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
             setText(hc_lbl_temp, tbuf);
             setText(hc_lbl_hum, hbuf);
-            // 按键右下角字数
+            // 右下角字数小字
             setText(hc_lbl_charsNum, num_buf);
             break;
         }
