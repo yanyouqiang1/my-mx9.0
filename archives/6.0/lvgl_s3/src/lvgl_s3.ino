@@ -126,6 +126,7 @@ static void pushLogLine(const char* line);
 
 #define LV_LVGL_H_INCLUDE_SIMPLE 1
 #include <lvgl.h>
+#include "profile_icons.h"   // 4 方案 × 3 档 (S/M/L) RGB565 图标，由 mmx 生成
 
 // ===========================
 // 硬件配置
@@ -852,8 +853,8 @@ static lv_obj_t* hc_lbl_lastkey = nullptr;
 static lv_obj_t* hc_lockBar[3]   = { nullptr, nullptr, nullptr };
 static lv_obj_t* hc_lbl_lock[3]  = { nullptr, nullptr, nullptr };
 static uint32_t  hc_lockOn[3]    = { 0, 0, 0 };
-// 底段：方案名 / 温度 / 湿度
-static lv_obj_t* hc_lbl_profile = nullptr;
+// 底段：方案图标（M 档 32x32） / 温度 / 湿度
+static lv_obj_t* hc_img_profile = nullptr;
 static lv_obj_t* hc_lbl_temp = nullptr;
 static lv_obj_t* hc_lbl_hum = nullptr;
 // 右下：累计字数（label + 数字）
@@ -910,9 +911,7 @@ static uint32_t   topLockOn[3] = { 0, 0, 0 };
 static bool     lockPrev[3] = { false, false, false };
 static bool     lockPrevValid = false;
 static lv_obj_t* topProfileNum = nullptr;      // 方案序号 1~4
-static lv_obj_t* topIconBox    = nullptr;      // 系统图标的槽位（14x18，本身透明）
-static lv_obj_t* topIconWin[4] = { nullptr, nullptr, nullptr, nullptr };  // Windows 四格窗
-static lv_obj_t* topIconMac[4] = { nullptr, nullptr, nullptr, nullptr };  // 苹果：果体/缺口/柄/叶
+static lv_obj_t* topIconBox    = nullptr;      // 系统图标的槽位（lv_img，S 档 16×16）
 
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
@@ -1040,7 +1039,7 @@ static void resetStylePointers(void) {
     // 高对比度
     hc_lbl_time = nullptr; hc_lbl_date = nullptr; hc_lbl_lastkey = nullptr;
     for (int i = 0; i < 3; i++) { hc_lockBar[i] = nullptr; hc_lbl_lock[i] = nullptr; }
-    hc_lbl_profile = nullptr; hc_lbl_temp = nullptr; hc_lbl_hum = nullptr;
+    hc_img_profile = nullptr; hc_lbl_temp = nullptr; hc_lbl_hum = nullptr;
     hc_lbl_charsLbl = nullptr; hc_lbl_charsNum = nullptr;
 
     // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
@@ -1059,7 +1058,6 @@ static void resetStylePointers(void) {
     lockPrevValid = false;
     topProfileNum = nullptr;
     topIconBox = nullptr;
-    for (int i = 0; i < 4; i++) { topIconWin[i] = nullptr; topIconMac[i] = nullptr; }
 }
 static void destroyMainScreen(void) {
     gk_bg = nullptr; bc_bg = nullptr; ip_bg = nullptr;
@@ -1507,39 +1505,12 @@ static void dashTopBar(lv_obj_t* parent) {
     lv_label_set_text(topProfileNum, "1");
     lv_obj_align(topProfileNum, LV_ALIGN_RIGHT_MID, -10, 0);
 
-    // 系统图标槽位。本身透明、空的，里面两组图标按当前方案显示/隐藏
-    // （由 updateDynamicElements() 驱动）。
-    topIconBox = lv_obj_create(bar);
-    lv_obj_set_size(topIconBox, 14, 18);
-    lv_obj_align(topIconBox, LV_ALIGN_RIGHT_MID, -26, 0);
-    lv_obj_set_style_bg_opa(topIconBox, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(topIconBox, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(topIconBox, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(topIconBox, LV_OBJ_FLAG_SCROLLABLE);
-
-    // ---- 方案1 (Windows)：四格窗 ----
-    const lv_coord_t paneX[4] = { 0, 7, 0, 7 };
-    const lv_coord_t paneY[4] = { 2, 2, 9, 9 };
-    for (int i = 0; i < 4; i++) {
-        topIconWin[i] = iconRect(topIconBox, 6, 6, LV_ALIGN_TOP_LEFT,
-                                 paneX[i], paneY[i], CLR_ACCENT, 1);
-        setHidden(topIconWin[i], currentProfile != 0);
-    }
-
-    // ---- 方案2 (macOS)：苹果 ----
-    // 果体 = 一只压扁的圆；顶上用**底色**画一颗小圆把果体的边缘咬掉一块，
-    // 咬出来的凹陷就是苹果顶上那道缺口（它贴在顶栏上，底色恒为 CLR_SURFACE，
-    // 所以"用底色画"是安全的）；最后叠果柄和一片叶子。
-    // 建对象的顺序 = 绘制顺序，必须是 果体 → 缺口 → 柄 → 叶。
-    topIconMac[0] = iconRect(topIconBox, 14, 12, LV_ALIGN_BOTTOM_MID, 0, 0,
-                             CLR_ACCENT, LV_RADIUS_CIRCLE);          // 果体
-    topIconMac[1] = iconRect(topIconBox, 6, 6, LV_ALIGN_TOP_MID, 0, 4,
-                             CLR_SURFACE, LV_RADIUS_CIRCLE);         // 缺口
-    topIconMac[2] = iconRect(topIconBox, 2, 5, LV_ALIGN_TOP_MID, 0, 0,
-                             CLR_ACCENT, 1);                         // 果柄
-    topIconMac[3] = iconRect(topIconBox, 6, 3, LV_ALIGN_TOP_MID, 3, 1,
-                             CLR_ACCENT, 1);                         // 叶子
-    for (int i = 0; i < 4; i++) setHidden(topIconMac[i], currentProfile != 1);
+    // 系统图标槽位：直接挂一个 lv_img（S 档 16×16），src 由 updateTopBarProfile()
+    // 按 currentProfile 实时换。原来那套"画 8 块矩形模拟 Win/Mac 标志"的活人肉画法
+    // 全部废弃——统一用 profile_icon_get(profile, PROF_ICON_S) 出图。
+    topIconBox = lv_img_create(bar);
+    lv_img_set_src(topIconBox, profile_icon_get(currentProfile, PROF_ICON_S));
+    lv_obj_align(topIconBox, LV_ALIGN_RIGHT_MID, -32, 0);
 }
 
 // 顶部条右侧的方式指示（序号 + 系统图标）单独抽出来，两个地方都要用：
@@ -1551,9 +1522,8 @@ static void updateTopBarProfile(void) {
     static char profBuf[4];
     snprintf(profBuf, sizeof(profBuf), "%u", (unsigned)(currentProfile + 1));
     setText(topProfileNum, profBuf);
-    for (int i = 0; i < 4; i++) {
-        setHidden(topIconWin[i], currentProfile != 0);
-        setHidden(topIconMac[i], currentProfile != 1);
+    if (topIconBox) {
+        lv_img_set_src(topIconBox, profile_icon_get(currentProfile, PROF_ICON_S));
     }
 }
 
@@ -2239,13 +2209,10 @@ static void build_style_high_contrast(void) {
     // ===========================================================
     // 下段（y=204..232）：方案 / 温度 / 湿度 3 列
     // ===========================================================
-    hc_lbl_profile = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_profile, &lv_font_simsun_16_cjk, CLR_ACCENT);
-    lv_label_set_text(hc_lbl_profile, profileNamesCN[currentProfile]);
-    lv_obj_set_width(hc_lbl_profile, 80);
-    lv_obj_set_style_text_align(hc_lbl_profile, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_label_set_long_mode(hc_lbl_profile, LV_LABEL_LONG_DOT);
-    lv_obj_align(hc_lbl_profile, LV_ALIGN_BOTTOM_LEFT, 0, -32);
+    hc_img_profile = lv_img_create(hc_bg);
+    lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
+    // 32×32 居中放在左下 80px 宽列里；列宽-图宽=48，向左偏 -24 让图标视觉居中
+    lv_obj_align(hc_img_profile, LV_ALIGN_BOTTOM_LEFT, 24, -28);
 
     hc_lbl_temp = lv_label_create(hc_bg);
     mkLabel(hc_lbl_temp, &lv_font_montserrat_20, CLR_AMBER);
@@ -5572,8 +5539,8 @@ static void updateDynamicElements(void) {
                 bool on = locks[i];
                 setBgColor(hc_lockBar[i], on ? hc_lockOn[i] : 0x1F1F1F);
             }
-            // 下段：方案 / 温度 / 湿度
-            setText(hc_lbl_profile, profileNamesCN[currentProfile]);
+            // 下段：方案图标 / 温度 / 湿度
+            lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
             static char tbuf[16], hbuf[16];
             snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
             snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
