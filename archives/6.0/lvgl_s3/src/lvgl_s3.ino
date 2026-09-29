@@ -5979,7 +5979,15 @@ void setup() {
     // （REMAP:prof:read -> 固件 notify 一条 REMAPDUMP:...）。只给 WRITE 的话，
     // 键盘没有任何回话通道，网页上就永远是空的，用户也分不清"没保存"还是"读不出来"。
     pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+        // 同时支持 PROPERTY_WRITE 和 PROPERTY_WRITE_NR：
+        //   - WRITE_NR 是 JPEG 流式分片的关键，没有它 180 字节一包的 ACK 往返
+        //     会把上传拖到十几秒，主机侧 BLE supervision timeout 一到就被踢。
+        //     详见 https://github.com/.../issues（GATT Server is disconnected）。
+        //   - WRITE 留给文本命令（sendBLE 那条路径）继续走 await 同步，
+        //     这样命令发送完真的意味着从机收到了，不会被静默丢包。
+        BLECharacteristic::PROPERTY_WRITE |
+        BLECharacteristic::PROPERTY_WRITE_NR |
+        BLECharacteristic::PROPERTY_NOTIFY);
     pCharacteristic->setCallbacks(new MyCallbacks());
     // 必须显式 addDescriptor(BLE2902),不然 CCCD 描述符不在 GATT 数据库里,
     // 客户端(Chrome Web Bluetooth)调 startNotifications() 时往 CCCD 写订阅位会

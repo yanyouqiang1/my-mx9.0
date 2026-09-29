@@ -1453,9 +1453,24 @@
 
     async function pushWallpaper(bytes, chunkSize, pBox) {
         await sendBLE("LOGO_JPEG_START:" + bytes.length);
+        // 固件已经开了 PROPERTY_WRITE_NR，所以这里可以走"无响应写"路径，
+        // 浏览器不再每包 await ACK，吞吐量从 ~10 包/秒拉到 100+ 包/秒，
+        // GATT Server is disconnected 也不会因为 ACK 慢被踢。
+        // writeValueWithoutResponse 在 characteristic 不支持 WRITE_NR 时会抛
+        // GATT operation failed，所以先用能力嗅探兜底。
+        const canWriteNR = (typeof myCharacteristic.writeValueWithoutResponse === 'function');
         for (let i = 0; i < bytes.length; i += chunkSize) {
             const end = Math.min(i + chunkSize, bytes.length);
-            await myCharacteristic.writeValue(bytes.subarray(i, end));
+            const chunk = bytes.subarray(i, end);
+            if (canWriteNR) {
+                await myCharacteristic.writeValueWithoutResponse(chunk);
+                // 无响应写连写太快，NimBLE 的 HCI 发送队列可能爆。
+                // 1ms 已经够 NimBLE 把上一包交给控制器；不开这个间隔，
+                // 后面几十包会陆续报 GATT Server is disconnected。
+                await new Promise(r => setTimeout(r, 1));
+            } else {
+                await myCharacteristic.writeValue(chunk);
+            }
             pBox.innerText = `正在传输: ${Math.round(end / bytes.length * 100)}%  `
                 + `(${(end / 1024).toFixed(1)} / ${(bytes.length / 1024).toFixed(1)} KB)`;
         }
