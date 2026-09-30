@@ -1282,10 +1282,21 @@
         const to = parseInt(document.getElementById('remapToSel').value);
         if (from === 0 || to === 0) return alert("请选择有效的键（不能是'无按键'）");
         if (from === to) return alert("从按键和到按键不能相同");
-        // 同一 from 已存在则覆盖
+        // 同一 from 已存在则覆盖——这条覆盖是 Bug #1 的根因之一：
+        // 很多用户想"交换 Win↔Ctrl"会下意识按两次"添加映射"，但同一 from 不能并存。
+        // 给个明确提示,免得用户以为存了 2 条结果只存 1 条,再叠加读回超时,看起来就像
+        // "配 2 条回到原样"。
         const existing = remapRules.findIndex(r => r.from === from);
-        if (existing >= 0) remapRules[existing].to = to;
-        else remapRules.push({ from, to });
+        if (existing >= 0) {
+            const fromName = codeToKeyName(from) || `#${from}`;
+            const ok = confirm(`「${fromName}」已经映射为「${codeToKeyName(remapRules[existing].to) || '#'+remapRules[existing].to}」了。\n\n` +
+                `要把它的目标改成「${codeToKeyName(to) || '#'+to}」吗？\n` +
+                `（要交换两个键的话,把 from 选成另一个键再添加。）`);
+            if (!ok) return;
+            remapRules[existing].to = to;
+        } else {
+            remapRules.push({ from, to });
+        }
         remapRefreshList();
     });
 

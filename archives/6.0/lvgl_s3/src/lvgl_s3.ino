@@ -4907,7 +4907,7 @@ static void handleCommand(const String& cmd) {
         int prof = cmd.substring(9).toInt();
         char out[BLE_CMD_BUF_SIZE];
         if (prof < 0 || prof >= TOTAL_PROFILES) {
-            snprintf(out, sizeof(out), "REMAPDUMP:%d:ERR", prof);
+            snprintf(out, sizeof(out), "REMAPDUMP:%d:ERR\n", prof);
         } else {
             int n = snprintf(out, sizeof(out), "REMAPDUMP:%d:", prof);
             for (int i = 0; i < remapCounts[prof] && n < (int)sizeof(out) - 16; i++) {
@@ -4915,12 +4915,17 @@ static void handleCommand(const String& cmd) {
                                i ? ";" : "",
                                profileRemaps[prof][i].fromKey, profileRemaps[prof][i].toKey);
             }
+            // 末尾补 \n：HTML 的 onBleNotify 是按 \n 切行（parts.pop 保留无换行的尾巴，
+            // 没有 \n 的 notify 会卡在 bleNotifyLines 里永远出不来 → 读回始终为 0 条。
+            // LOG:STREAM_ON/LOG:off / LOG:CLEARED 都带 \n，dump 类响应得跟上。
+            if (n < (int)sizeof(out) - 1) out[n++] = '\n';
+            out[n] = '\0';
         }
         if (pCharacteristic) {
             pCharacteristic->setValue((uint8_t*)out, strlen(out));
             pCharacteristic->notify();
         }
-        LOG_PORT.printf("[REMAP] read prof=%d -> %s\n", prof, out);
+        LOG_PORT.printf("[REMAP] read prof=%d -> %s", prof, out);
         char buf[24];
         snprintf(buf, sizeof(buf), "读取到 %d 条", (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0);
         triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
@@ -4937,15 +4942,15 @@ static void handleCommand(const String& cmd) {
         char out[BLE_CMD_BUF_SIZE];
         bool truncated = false;
         if (val.length() == 0) {
-            snprintf(out, sizeof(out), "MACRODUMP:%s:NONE", key.c_str());
+            snprintf(out, sizeof(out), "MACRODUMP:%s:NONE\n", key.c_str());
         } else {
-            // 留 1 字节给 '\0',val 太长则截断并标 TRUNC
+            // 留 1 字节给 '\0' + 1 字节给结尾 '\n'，val 太长则截断并标 TRUNC
             size_t keyLen = strlen("MACRODUMP:") + key.length() + 1;  // "MACRODUMP:" + key + ":"
-            if (keyLen + val.length() >= sizeof(out) - 8) {
+            if (keyLen + val.length() >= sizeof(out) - 9) {
                 truncated = true;
-                val = val.substring(0, sizeof(out) - 8 - keyLen - 1);
+                val = val.substring(0, sizeof(out) - 9 - keyLen - 1);
             }
-            snprintf(out, sizeof(out), "MACRODUMP:%s:%s%s",
+            snprintf(out, sizeof(out), "MACRODUMP:%s:%s%s\n",
                      key.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
         }
         if (pCharacteristic) {
@@ -4984,15 +4989,15 @@ static void handleCommand(const String& cmd) {
         char out[BLE_CMD_BUF_SIZE];
         bool truncated = false;
         if (val.length() == 0) {
-            snprintf(out, sizeof(out), "GKEYDUMP:%s:NONE", dumpTag.c_str());
+            snprintf(out, sizeof(out), "GKEYDUMP:%s:NONE\n", dumpTag.c_str());
         } else {
-            // 留 1 字节给 '\0',val 太长则截断并标 TRUNC(参考 MACRODUMP 那段)
+            // 留 1 字节给 '\0' + 1 字节给结尾 '\n'，val 太长则截断并标 TRUNC(参考 MACRODUMP 那段)
             size_t prefixLen = strlen("GKEYDUMP:") + dumpTag.length() + 1;  // "GKEYDUMP:" + tag + ":"
-            if (prefixLen + val.length() >= sizeof(out) - 8) {
+            if (prefixLen + val.length() >= sizeof(out) - 9) {
                 truncated = true;
-                val = val.substring(0, sizeof(out) - 8 - prefixLen - 1);
+                val = val.substring(0, sizeof(out) - 9 - prefixLen - 1);
             }
-            snprintf(out, sizeof(out), "GKEYDUMP:%s:%s%s",
+            snprintf(out, sizeof(out), "GKEYDUMP:%s:%s%s\n",
                      dumpTag.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
         }
         if (pCharacteristic) {
@@ -5015,7 +5020,7 @@ static void handleCommand(const String& cmd) {
             uint8_t ph = preferences.getUChar(phKey, 0);
             if (ph > 1) ph = 0;   // 容错:被人手动写过 NVS 时强行纠正
             char out[BLE_CMD_BUF_SIZE];
-            snprintf(out, sizeof(out), "GKEYPHASE:%s:%u", key.c_str(), (unsigned)ph);
+            snprintf(out, sizeof(out), "GKEYPHASE:%s:%u\n", key.c_str(), (unsigned)ph);
             if (pCharacteristic) {
                 pCharacteristic->setValue((uint8_t*)out, strlen(out));
                 pCharacteristic->notify();
@@ -5034,7 +5039,7 @@ static void handleCommand(const String& cmd) {
             snprintf(phKey, sizeof(phKey), "g_%s_ph", key.c_str());
             preferences.putUChar(phKey, 0);
             char out[BLE_CMD_BUF_SIZE];
-            snprintf(out, sizeof(out), "GKEYPHASE:%s:0", key.c_str());
+            snprintf(out, sizeof(out), "GKEYPHASE:%s:0\n", key.c_str());
             if (pCharacteristic) {
                 pCharacteristic->setValue((uint8_t*)out, strlen(out));
                 pCharacteristic->notify();
