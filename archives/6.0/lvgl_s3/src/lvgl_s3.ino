@@ -3905,24 +3905,35 @@ void switchProfile(uint8_t profIdx) {
 // 折算成 Ctrl/Shift，反而更糟。Num Enter 用 '\n' 同样能得到回车，一并留在 ASCII 侧。
 //
 // 网页那边对应的定义在 s3-setting.html 的 KEY_OPTIONS（"Num /":220 ~ "Num +":223），改一处要改两处。
+// 把 mappedKey 发给主机。
+//   修饰键 (Arduino 0x80~0x87) 不能走 press(),因为 _asciimap[0x80~0x87]=0 会被吞;
+//   改用 pressRaw 直接发 HID Usage (0xE0~0xE7)。其它键 (ASCII / HID Usage>=0x88)
+//   Keyboard.press() 自己处理。
+//
+// "交换两个键"的实现: 例如设置 ctrl->win; win->ctrl 两条规则,
+// getMappedKey 单步查表 ——
+//   按 ctrl  → mappedKey=0x83(KEY_LEFT_GUI)  → pressRaw(0xE3) → 发 Win ✓
+//   按 win   → mappedKey=0x80(KEY_LEFT_CTRL) → pressRaw(0xE0) → 发 Ctrl ✓
+// 两条规则并存、各自独立,不互相"抵消"。
 static inline void kbPress(uint8_t code) {
-    // [DEBUG a→9] 临时诊断:打出实际走的分支,定位 baseKey 是多少、走的是哪条路径
-    const char* path = "press";
-    if (code >= 0x80 && code < 0x88) {
-        path = "pressRaw(mod+0x60)";
-        Keyboard.pressRaw((uint8_t)(code + 0x60));
-    } else if (code != 0) {
-        path = "press(_asciimap)";
-        Keyboard.press(code);
-    } else {
-        path = "skip(null)";
+    if (code == 0) {
+        LOG_PORT.printf("[KB] press code=0x00 path=skip(null)\n");
+        return;
     }
-    LOG_PORT.printf("[KB] press code=0x%02X path=%s\n", code, path);
+    if (code >= 0x80 && code < 0x88) {
+        // 修饰键 (Arduino 0x80~0x87) → HID Usage (0xE0~0xE7)
+        Keyboard.pressRaw((uint8_t)(code + 0x60));
+        LOG_PORT.printf("[KB] press code=0x%02X path=pressRaw(mod+0x60)\n", code);
+    } else {
+        Keyboard.press(code);
+        LOG_PORT.printf("[KB] press code=0x%02X path=press(asciimap)\n", code);
+    }
 }
 
 static inline void kbRelease(uint8_t code) {
+    if (code == 0) return;
     if (code >= 0x80 && code < 0x88) Keyboard.releaseRaw((uint8_t)(code + 0x60));
-    else if (code != 0) Keyboard.release(code);
+    else Keyboard.release(code);
 }
 
 // 网页"按键映射"下拉里的修饰键给的是 HID 风格 224~231，而 Keyboard.press() 按
