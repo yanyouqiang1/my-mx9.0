@@ -4277,6 +4277,88 @@ static void executeGlobalKey(String gKey) {
 }
 
 // ===========================
+// MA / MB 双状态切换执行
+// ===========================
+// 设计:每个按键(MA / MB)有状态 A 和状态 B 两套独立 payload,
+// 按一次翻一下: 0 → 跑 A → 1 → 跑 B → 0 → 跑 A ...
+//
+// 存储:
+//   g_<KEY>a / g_<KEY>b    状态 A / B 的 payload(同 g_<KEY> 的语法)
+//   g_<KEY>_ph            当前相位(0=下次跑 A, 1=下次跑 B),持久化
+//
+// 兼容老固件(只设了 g_MA / g_MB 单套):状态 A 和 B 都为空时,
+// 走老的 executeGlobalKey() 兜底,行为和 v1 一致 —— 不破坏存量用户。
+//
+// HUD 反馈:
+//   · 跑了 A / B → "MA 状态 A 已触发"
+//   · 选中状态为空 + 另一状态非空 → "MA 状态 B 未配置"(相位仍翻,提醒去网页配)
+//   · 两状态都为空 → 走老路径,不显示这条 HUD
+//
+// 这里把 SW: 切方案的解析搬到这里执行,而不是复用 executeActionPayload(),
+// 是因为 executeActionPayload() 只认 SEQ/CMB 后半段,SW 那段得在外层消化。
+// 为避免再写一遍同样 if 链,直接内联实现 —— 状态量极小(<10 行),不抽函数。
+static void executeToggleKey(const char* keyName) {
+    // 只认 MA / MB,其它键理论上不会进来(键盘分发处已 hardcode)
+    if (strcmp(keyName, "MA") != 0 && strcmp(keyName, "MB") != 0) {
+        executeGlobalKey(keyName);   // 兜底:理论不会触发,防止误用
+        return;
+    }
+
+    char phKey[16];
+    snprintf(phKey, sizeof(phKey), "g_%s_ph", keyName);
+    uint8_t phase = preferences.getUChar(phKey, 0);
+    if (phase > 1) phase = 0;     // 容错:被人手动写过 NVS 时强行纠正
+
+    char sKey[16];
+    snprintf(sKey, sizeof(sKey), "g_%s%c", keyName, (phase == 0) ? 'a' : 'b');
+    String val = preferences.getString(sKey, "");
+    char oKey[16];
+    snprintf(oKey, sizeof(oKey), "g_%s%c", keyName, (phase == 0) ? 'b' : 'a');
+    String otherVal = preferences.getString(oKey, "");
+
+    // 两套状态都未配 → 老路径(单套 g_<KEY> 或缺省切方案),相位不动
+    if (val.length() == 0 && otherVal.length() == 0) {
+        executeGlobalKey(keyName);
+        return;
+    }
+
+    // 选中状态为空 + 另一状态非空 → HUD 提示 + 相位翻(下次会用另一套)
+    if (val.length() == 0) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "状态 %c 未配置", (phase == 0) ? 'A' : 'B');
+        triggerHud(keyName, buf, lv_color_hex(CLR_AMBER));
+        preferences.putUChar(phKey, phase ^ 1);
+        return;
+    }
+
+    // 正常路径:解析 SW/SEQ/CMB 并执行
+    String rest = val;
+    if (rest.startsWith("SW:")) {
+        rest = rest.substring(3);
+        int plusIdx = rest.indexOf('+');
+        String swPart = (plusIdx != -1) ? rest.substring(0, plusIdx) : rest;
+        if (swPart == "NEXT") switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+        else if (swPart != "NONE") switchProfile(swPart.toInt());
+        if (plusIdx == -1) {
+            // 只有 SW: 没有后半段,执行完就翻相位
+            preferences.putUChar(phKey, phase ^ 1);
+            char buf[24];
+            snprintf(buf, sizeof(buf), "状态 %c 已触发", (phase == 0) ? 'A' : 'B');
+            triggerHud(keyName, buf, lv_color_hex(CLR_GREEN));
+            return;
+        }
+        rest = rest.substring(plusIdx + 1);
+    }
+    executeActionPayload(rest);
+
+    // 相位翻并写盘(每次按下都写 NVS —— NVS 寿命 10w+ 次,不会触达)
+    preferences.putUChar(phKey, phase ^ 1);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "状态 %c 已触发", (phase == 0) ? 'A' : 'B');
+    triggerHud(keyName, buf, lv_color_hex(CLR_GREEN));
+}
+
+// ===========================
 // USB HID 事件
 // ===========================
 static void usbHidKeyboardEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
@@ -4535,12 +4617,14 @@ static void scanKeyboardMatrix(void) {
                                 // 每次进菜单都闪一次只是噪音，还压住菜单第一屏。
 
                             }
-                            // MA / MB 全局键
+                            // MA / MB 全局键(双状态切换版本):
+                            // 每次按下在「状态 A ↔ 状态 B」之间翻,执行对应那套。
+                            // 配过任意一套就走新路径;两套都没配才走老的单套兜底(见 executeToggleKey)。
                             else if (baseKey == K_MA) {
-                                executeGlobalKey("MA");
+                                executeToggleKey("MA");
                             }
                             else if (baseKey == K_MB) {
-                                executeGlobalKey("MB");
+                                executeToggleKey("MB");
                             }
                             // MR 键：第一次按 = 进入"连续输入"录制（必须排在 >= MACRO_BASE 之前）
                             else if (baseKey == K_MR) {
@@ -4871,20 +4955,114 @@ static void handleCommand(const String& cmd) {
         LOG_PORT.printf("[MACRODUMP] %s len=%u truncated=%d\n",
                         key.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
     }
-    // GKEYDUMP:KEY - 把全局键 (MA/MB) 配置回读给网页
-    // 协议:`GKEYDUMP:MA:SW:1+CMB:128,4` / `GKEYDUMP:MA:NONE`
+    // GKEYDUMP:KEY[:state] - 把全局键配置回读给网页
+    // 老用法 `GKEYDUMP:MA`           → 读 g_MA    (单套全局动作,保留兼容)
+    // 新用法 `GKEYDUMP:MA:a`         → 读 g_MAa   (状态 A, 双状态切换)
+    //       `GKEYDUMP:MA:b`          → 读 g_MAb   (状态 B)
+    // 协议:`GKEYDUMP:MA:SW:1+CMB:128,4` / `GKEYDUMP:MA:a:NONE`
+    // BLE notify 上限 BLE_CMD_BUF_SIZE=256, payload 太长会被截断并加 ...TRUNC 后缀。
     else if (cmd.startsWith("GKEYDUMP:")) {
-        String key = cmd.substring(9);
-        String gKey = "g_" + key;
-        String val = preferences.getString(gKey.c_str(), "");
+        String rest = cmd.substring(9);              // "MA" / "MA:a" / "MA:b"
+        String val;
+        String dumpTag = rest;
+        // 双状态格式必须是 "<KEY>:<state>",即 length==4、第 2 个字符是 ':'、
+        // 第 3 个字符是 'a' 或 'b'。KEY 这边只认 MA / MB(2 字符)。
+        // 用 length==4 而不是 >=3 是为了避免把 "MA:" 这种半截命令误识别。
+        if (rest.length() == 4 && rest[2] == ':' &&
+            (rest[0] == 'M') && (rest[1] == 'A' || rest[1] == 'B') &&
+            (rest[3] == 'a' || rest[3] == 'b')) {
+            // 双状态格式:KEY:<a|b> 取 g_<KEY><state>
+            String key   = rest.substring(0, 2);
+            String state = rest.substring(3);
+            String gKey  = "g_" + key + state;
+            val = preferences.getString(gKey.c_str(), "");
+        } else {
+            // 兼容老格式:KEY 取 g_<KEY>(M1-M12 也走这条)
+            String gKey = "g_" + rest;
+            val = preferences.getString(gKey.c_str(), "");
+        }
         char out[BLE_CMD_BUF_SIZE];
-        snprintf(out, sizeof(out), "GKEYDUMP:%s:%s", key.c_str(),
-                 val.length() ? val.c_str() : "NONE");
+        bool truncated = false;
+        if (val.length() == 0) {
+            snprintf(out, sizeof(out), "GKEYDUMP:%s:NONE", dumpTag.c_str());
+        } else {
+            // 留 1 字节给 '\0',val 太长则截断并标 TRUNC(参考 MACRODUMP 那段)
+            size_t prefixLen = strlen("GKEYDUMP:") + dumpTag.length() + 1;  // "GKEYDUMP:" + tag + ":"
+            if (prefixLen + val.length() >= sizeof(out) - 8) {
+                truncated = true;
+                val = val.substring(0, sizeof(out) - 8 - prefixLen - 1);
+            }
+            snprintf(out, sizeof(out), "GKEYDUMP:%s:%s%s",
+                     dumpTag.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
+        }
         if (pCharacteristic) {
             pCharacteristic->setValue((uint8_t*)out, strlen(out));
             pCharacteristic->notify();
         }
-        LOG_PORT.printf("[GKEYDUMP] %s len=%u\n", key.c_str(), (unsigned)val.length());
+        LOG_PORT.printf("[GKEYDUMP] %s len=%u truncated=%d\n",
+                        dumpTag.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
+    }
+    // GKEYPHASE:KEY - 读 MA/MB 当前相位(下次按下将执行哪一套状态)
+    // 响应:`GKEYPHASE:MA:<0|1>`。缺省 0(下次按 = 状态 A)。
+    // BLE notify 单条上限 256 字节,这里响应很短,不会触发截断。
+    else if (cmd.startsWith("GKEYPHASE:")) {
+        String key = cmd.substring(10);
+        if (key != "MA" && key != "MB") {
+            LOG_PORT.printf("[GKEYPHASE] unknown key '%s'\n", key.c_str());
+        } else {
+            char phKey[16];
+            snprintf(phKey, sizeof(phKey), "g_%s_ph", key.c_str());
+            uint8_t ph = preferences.getUChar(phKey, 0);
+            if (ph > 1) ph = 0;   // 容错:被人手动写过 NVS 时强行纠正
+            char out[BLE_CMD_BUF_SIZE];
+            snprintf(out, sizeof(out), "GKEYPHASE:%s:%u", key.c_str(), (unsigned)ph);
+            if (pCharacteristic) {
+                pCharacteristic->setValue((uint8_t*)out, strlen(out));
+                pCharacteristic->notify();
+            }
+            LOG_PORT.printf("[GKEYPHASE] %s = %u\n", key.c_str(), (unsigned)ph);
+        }
+    }
+    // GKEYPHASE_RESET:KEY - 把 MA/MB 相位重置回 0(下次按下回到状态 A)
+    // 响应:`GKEYPHASE:KEY:0`,跟 GKEYPHASE 同格式方便前端共用解析。
+    else if (cmd.startsWith("GKEYPHASE_RESET:")) {
+        String key = cmd.substring(16);
+        if (key != "MA" && key != "MB") {
+            LOG_PORT.printf("[GKEYPHASE_RESET] unknown key '%s'\n", key.c_str());
+        } else {
+            char phKey[16];
+            snprintf(phKey, sizeof(phKey), "g_%s_ph", key.c_str());
+            preferences.putUChar(phKey, 0);
+            char out[BLE_CMD_BUF_SIZE];
+            snprintf(out, sizeof(out), "GKEYPHASE:%s:0", key.c_str());
+            if (pCharacteristic) {
+                pCharacteristic->setValue((uint8_t*)out, strlen(out));
+                pCharacteristic->notify();
+            }
+            LOG_PORT.printf("[GKEYPHASE_RESET] %s -> 0\n", key.c_str());
+            triggerHud("相位重置", key.c_str(), lv_color_hex(CLR_ACCENT));
+        }
+    }
+    // GKEY_RESET:KEY - 只清掉某个全局键(MA/MB)的全部双状态 + 相位,不动 M1-M12。
+    // 网页卡片里"清空该键"按钮用这个,避免误伤其他配置。
+    // 与 MACROS_RESET(清全部宏+全部全局)的区别:GKEY_RESET 是单键级别。
+    else if (cmd.startsWith("GKEY_RESET:")) {
+        String key = cmd.substring(11);
+        if (key != "MA" && key != "MB") {
+            LOG_PORT.printf("[GKEY_RESET] unknown key '%s'\n", key.c_str());
+        } else {
+            int removed = 0;
+            char k[16];
+            // 三套:老单套 + 双状态 a/b + 相位
+            snprintf(k, sizeof(k), "g_%s",   key.c_str()); if (preferences.remove(k)) removed++;
+            snprintf(k, sizeof(k), "g_%sa",  key.c_str()); if (preferences.remove(k)) removed++;
+            snprintf(k, sizeof(k), "g_%sb",  key.c_str()); if (preferences.remove(k)) removed++;
+            snprintf(k, sizeof(k), "g_%s_ph",key.c_str()); if (preferences.remove(k)) removed++;
+            LOG_PORT.printf("[GKEY_RESET] %s removed %d keys\n", key.c_str(), removed);
+            char info[24];
+            snprintf(info, sizeof(info), "%s / %d 项已清", key.c_str(), removed);
+            triggerHud("全局键已清", info, lv_color_hex(CLR_GREEN));
+        }
     }
     // SET:name:value - Macro definition
     //
@@ -4915,22 +5093,56 @@ static void handleCommand(const String& cmd) {
             triggerHud("已写入宏", info, lv_color_hex(CLR_GREEN));
         }
     }
-    // GSET:name:value - Global key assignment
+    // GSET:name[:state]:value - Global key assignment
+    // 老用法 `GSET:MA:SW:1+CMB:...`  → 写 g_MA(单套全局动作,保留兼容)
+    // 新用法 `GSET:MAa:SW:1+...`     → 写 g_MAa(状态 A)
+    //       `GSET:MAa:NONE`          → 移除 g_MAa
+    // 注意新用法的 name 段是 MAa / MAb / MBa / MBb(3 字符),老用法是 MA / MB(2 字符)。
+    // 这里不解析 payload 语法,只做"按 name/state 落盘" —— 真正执行
+    // 是 executeGlobalKey / executeToggleKey 的事,见那两处。
     else if (cmd.startsWith("GSET:")) {
         String params = cmd.substring(5);
         int colonIdx = params.indexOf(':');
         if (colonIdx > 0) {
             String name = params.substring(0, colonIdx);
             String value = params.substring(colonIdx + 1);
-            char gKey[32];
-            snprintf(gKey, sizeof(gKey), "g_%s", name.c_str());
-            preferences.putString(gKey, value);
-            triggerHud("已写入全局键", name.c_str(), lv_color_hex(CLR_ACCENT));
+            // 判定是否带 state 后缀(新格式):name 必须是 3 字符,以 'M' 开头、
+            // 第 2 字符是 'A' / 'B',第 3 字符是 'a' / 'b'。
+            // 这样老格式 "MA" / "MB"(2 字符)不会误识别。
+            bool hasState = (name.length() == 3) &&
+                            (name[0] == 'M') &&
+                            (name[1] == 'A' || name[1] == 'B') &&
+                            (name[2] == 'a' || name[2] == 'b');
+            char gKey[16];
+            if (hasState) {
+                // 新格式:name = "MAa" / "MAb" / "MBa" / "MBb" → g_MAa 等
+                snprintf(gKey, sizeof(gKey), "g_%s", name.c_str());
+                if (value == "NONE") {
+                    preferences.remove(gKey);
+                    triggerHud("已清全局键状态", name.c_str(), lv_color_hex(CLR_ACCENT));
+                } else {
+                    preferences.putString(gKey, value.c_str());
+                    char info[24];
+                    snprintf(info, sizeof(info), "%s", name.c_str());
+                    triggerHud("已写入全局键状态", info, lv_color_hex(CLR_ACCENT));
+                }
+            } else {
+                // 老格式:GSET:KEY:<payload> → g_<KEY>(单套全局动作,保留兼容)
+                snprintf(gKey, sizeof(gKey), "g_%s", name.c_str());
+                if (value == "NONE") {
+                    preferences.remove(gKey);
+                    triggerHud("已清全局键", name.c_str(), lv_color_hex(CLR_ACCENT));
+                } else {
+                    preferences.putString(gKey, value.c_str());
+                    triggerHud("已写入全局键", name.c_str(), lv_color_hex(CLR_ACCENT));
+                }
+            }
         }
     }
-    // MACROS_RESET: 清掉所有方案的 M1-M12 + 全局 MA/MB。
+    // MACROS_RESET: 清掉所有方案的 M1-M12 + 全局 MA/MB(含双状态切换)。
     // 保留 remap 规则 / 时钟 / 闹钟 / 灯光 / 壁纸 / SPIFFS 等其他 NVS 键，
-    // 只删 p?\d_M?\d+\d 这种格式(方案专属宏)和 g_MA / g_MB(全局动作)。
+    // 只删 p?\d_M?\d+\d 这种格式(方案专属宏)、g_MA / g_MB(老单套全局动作)、
+    // g_MAa / g_MAb / g_MBa / g_MBb(双状态切换)、g_MA_ph / g_MB_ph(相位)。
     // ESP32 Preferences 没有按前缀删,只能逐 key remove。
     // 旧版错存的双层前缀 `p?\d_p?\d_M?\d`(见 SET: 那段的根因)也在范围里 —— 留着不删反而
     // 会让"清完后按 M1 仍然有反应"这种残留事件更难看,顺手清掉。
@@ -4947,9 +5159,16 @@ static void handleCommand(const String& cmd) {
                 preferences.remove(pk);
             }
         }
-        // 全局动作
+        // 全局动作(老单套)
         if (preferences.remove("g_MA")) removed++;
         if (preferences.remove("g_MB")) removed++;
+        // 双状态切换(状态 A / 状态 B / 相位)
+        if (preferences.remove("g_MAa"))  removed++;
+        if (preferences.remove("g_MAb"))  removed++;
+        if (preferences.remove("g_MBa"))  removed++;
+        if (preferences.remove("g_MBb"))  removed++;
+        if (preferences.remove("g_MA_ph")) removed++;
+        if (preferences.remove("g_MB_ph")) removed++;
         LOG_PORT.printf("[MACROS_RESET] removed %d keys\n", removed);
         char info[24];
         snprintf(info, sizeof(info), "%d 项已清", removed);

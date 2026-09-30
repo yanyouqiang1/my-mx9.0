@@ -184,8 +184,6 @@
                 <div>
                     <label>编辑目标键：</label>
                     <select id="globalkKeySel" onchange="onGlobalkKeyChange()">
-                        <option value="MA">MA</option>
-                        <option value="MB">MB</option>
                         <option value="M1">M1</option>
                         <option value="M2">M2</option>
                         <option value="M3">M3</option>
@@ -247,12 +245,192 @@
                         payload = "SW:&lt;id&gt;+CMB:&lt;codes&gt;" 或 "SW:&lt;id&gt;+SEQ:&lt;text&gt;"<br>
                         <br>
                         <b>按键规则：</b><br>
-                        • MA / MB：纯全局键，按下只跑全局配置<br>
                         • M1~M12：先跑全局配置，再播按方案宏<br>
                         • 不配全局动作 → M1-M12 行为与旧版一致（仅按方案宏）<br>
+                        • MA / MB 已迁到下方「双状态切换」独立设置区
                         <br>
                         <b>组合键码值：</b>Ctrl=128, Shift=129, Alt=130, Win=131，键位见下方 KEY_OPTIONS
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 3. MA / MB 双状态切换 -->
+        <div class="card">
+            <h2>3. MA / MB 双状态切换 — 按一次翻一次</h2>
+            <div class="hint">
+                MA / MB 已从上方"全局独立功能键"里独立出来。每按一次就在 <b style="color:#38bdf8;">状态 A ⇄ 状态 B</b> 之间切换,
+                每次按下都执行当前那套里的「切换方案 + 组合键/快捷键」。
+                <br>常用场景:MA 设成 <i>游戏模式(切方案 3 + 静音)</i> / <i>工作模式(切方案 1 + Win+D 显桌面)</i>,一键来回切。
+            </div>
+
+            <div class="grid-2" style="margin-top: 10px;">
+                <!-- ========= MA 卡片 ========= -->
+                <div style="background: #1e293b; padding: 14px; border-radius: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                        <span style="font-weight: bold; font-size: 1.1rem; color: #38bdf8;">[MA]</span>
+                        <span class="hint" style="margin: 0;">下次按下将执行:</span>
+                        <span id="maPhaseBadge" style="background: #0ea5e9; color: #000; padding: 2px 10px; border-radius: 12px; font-weight: bold;">A</span>
+                        <button class="btn-tag" id="maPhaseResetBtn" style="margin-left: auto;">⟳ 重置回 A</button>
+                    </div>
+
+                    <div class="grid-2" style="gap: 8px;">
+                        <!-- MA 状态 A -->
+                        <div style="background: #334155; padding: 10px; border-radius: 6px;">
+                            <div style="font-weight: bold; color: #fbbf24; margin-bottom: 6px;">状态 A</div>
+                            <label>切换配置方案:</label>
+                            <select id="ma_aSwAction">
+                                <option value="NONE">不切换方案 (无动作)</option>
+                                <option value="0">方案 1 (Windows 默认)</option>
+                                <option value="1">方案 2 (macOS 默认)</option>
+                                <option value="2">方案 3 (游戏定制)</option>
+                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="NEXT">循环切换到下一个方案</option>
+                            </select>
+                            <div class="mode-tabs" style="margin-top: 6px;">
+                                <label><input type="radio" name="ma_aMode" value="CMB" checked onchange="toggleToggleMode('ma_a')"> ⚡ 组合快捷键</label>
+                                <label><input type="radio" name="ma_aMode" value="SEQ" onchange="toggleToggleMode('ma_a')"> 🔤 打字效果</label>
+                            </div>
+                            <div id="ma_aCmbPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <div class="chk-group">
+                                    <label><input type="checkbox" id="ma_aCtrl"> Ctrl</label>
+                                    <label><input type="checkbox" id="ma_aAlt"> Alt</label>
+                                    <label><input type="checkbox" id="ma_aShift"> Shift</label>
+                                    <label><input type="checkbox" id="ma_aWin"> Win/Cmd</label>
+                                </div>
+                                <div id="ma_aCmbKeysList"></div>
+                                <button class="btn-tag" onclick="addToggleComboKey('ma_a')" style="margin-top: 4px;">+ 添加普通键</button>
+                                <div id="ma_aCmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 未添加任何普通键</div>
+                            </div>
+                            <div id="ma_aSeqPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <textarea id="ma_aSeqInput" rows="2" placeholder="例：ls -la[ENTER]sudo apt update[ENTER]"></textarea>
+                            </div>
+                            <div style="display: flex; gap: 6px; margin-top: 8px;">
+                                <button class="btn btn-green" id="ma_aSaveBtn" style="flex: 1;">💾 保存 A</button>
+                                <button class="btn-tag" id="ma_aClearBtn">🗑 清除 A</button>
+                            </div>
+                        </div>
+                        <!-- MA 状态 B -->
+                        <div style="background: #334155; padding: 10px; border-radius: 6px;">
+                            <div style="font-weight: bold; color: #fbbf24; margin-bottom: 6px;">状态 B</div>
+                            <label>切换配置方案:</label>
+                            <select id="ma_bSwAction">
+                                <option value="NONE">不切换方案 (无动作)</option>
+                                <option value="0">方案 1 (Windows 默认)</option>
+                                <option value="1">方案 2 (macOS 默认)</option>
+                                <option value="2">方案 3 (游戏定制)</option>
+                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="NEXT">循环切换到下一个方案</option>
+                            </select>
+                            <div class="mode-tabs" style="margin-top: 6px;">
+                                <label><input type="radio" name="ma_bMode" value="CMB" checked onchange="toggleToggleMode('ma_b')"> ⚡ 组合快捷键</label>
+                                <label><input type="radio" name="ma_bMode" value="SEQ" onchange="toggleToggleMode('ma_b')"> 🔤 打字效果</label>
+                            </div>
+                            <div id="ma_bCmbPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <div class="chk-group">
+                                    <label><input type="checkbox" id="ma_bCtrl"> Ctrl</label>
+                                    <label><input type="checkbox" id="ma_bAlt"> Alt</label>
+                                    <label><input type="checkbox" id="ma_bShift"> Shift</label>
+                                    <label><input type="checkbox" id="ma_bWin"> Win/Cmd</label>
+                                </div>
+                                <div id="ma_bCmbKeysList"></div>
+                                <button class="btn-tag" onclick="addToggleComboKey('ma_b')" style="margin-top: 4px;">+ 添加普通键</button>
+                                <div id="ma_bCmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 未添加任何普通键</div>
+                            </div>
+                            <div id="ma_bSeqPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <textarea id="ma_bSeqInput" rows="2" placeholder="例：Ctrl+C[ENTER]"></textarea>
+                            </div>
+                            <div style="display: flex; gap: 6px; margin-top: 8px;">
+                                <button class="btn btn-green" id="ma_bSaveBtn" style="flex: 1;">💾 保存 B</button>
+                                <button class="btn-tag" id="ma_bClearBtn">🗑 清除 B</button>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="btn btn-red" id="maFullResetBtn" style="width: 100%; margin-top: 10px;">⚠️ 清空 MA 全部 (A+B+相位)</button>
+                </div>
+
+                <!-- ========= MB 卡片 ========= -->
+                <div style="background: #1e293b; padding: 14px; border-radius: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                        <span style="font-weight: bold; font-size: 1.1rem; color: #38bdf8;">[MB]</span>
+                        <span class="hint" style="margin: 0;">下次按下将执行:</span>
+                        <span id="mbPhaseBadge" style="background: #0ea5e9; color: #000; padding: 2px 10px; border-radius: 12px; font-weight: bold;">A</span>
+                        <button class="btn-tag" id="mbPhaseResetBtn" style="margin-left: auto;">⟳ 重置回 A</button>
+                    </div>
+
+                    <div class="grid-2" style="gap: 8px;">
+                        <!-- MB 状态 A -->
+                        <div style="background: #334155; padding: 10px; border-radius: 6px;">
+                            <div style="font-weight: bold; color: #fbbf24; margin-bottom: 6px;">状态 A</div>
+                            <label>切换配置方案:</label>
+                            <select id="mb_aSwAction">
+                                <option value="NONE">不切换方案 (无动作)</option>
+                                <option value="0">方案 1 (Windows 默认)</option>
+                                <option value="1">方案 2 (macOS 默认)</option>
+                                <option value="2">方案 3 (游戏定制)</option>
+                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="NEXT">循环切换到下一个方案</option>
+                            </select>
+                            <div class="mode-tabs" style="margin-top: 6px;">
+                                <label><input type="radio" name="mb_aMode" value="CMB" checked onchange="toggleToggleMode('mb_a')"> ⚡ 组合快捷键</label>
+                                <label><input type="radio" name="mb_aMode" value="SEQ" onchange="toggleToggleMode('mb_a')"> 🔤 打字效果</label>
+                            </div>
+                            <div id="mb_aCmbPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <div class="chk-group">
+                                    <label><input type="checkbox" id="mb_aCtrl"> Ctrl</label>
+                                    <label><input type="checkbox" id="mb_aAlt"> Alt</label>
+                                    <label><input type="checkbox" id="mb_aShift"> Shift</label>
+                                    <label><input type="checkbox" id="mb_aWin"> Win/Cmd</label>
+                                </div>
+                                <div id="mb_aCmbKeysList"></div>
+                                <button class="btn-tag" onclick="addToggleComboKey('mb_a')" style="margin-top: 4px;">+ 添加普通键</button>
+                                <div id="mb_aCmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 未添加任何普通键</div>
+                            </div>
+                            <div id="mb_aSeqPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <textarea id="mb_aSeqInput" rows="2" placeholder="例：hello world[ENTER]"></textarea>
+                            </div>
+                            <div style="display: flex; gap: 6px; margin-top: 8px;">
+                                <button class="btn btn-green" id="mb_aSaveBtn" style="flex: 1;">💾 保存 A</button>
+                                <button class="btn-tag" id="mb_aClearBtn">🗑 清除 A</button>
+                            </div>
+                        </div>
+                        <!-- MB 状态 B -->
+                        <div style="background: #334155; padding: 10px; border-radius: 6px;">
+                            <div style="font-weight: bold; color: #fbbf24; margin-bottom: 6px;">状态 B</div>
+                            <label>切换配置方案:</label>
+                            <select id="mb_bSwAction">
+                                <option value="NONE">不切换方案 (无动作)</option>
+                                <option value="0">方案 1 (Windows 默认)</option>
+                                <option value="1">方案 2 (macOS 默认)</option>
+                                <option value="2">方案 3 (游戏定制)</option>
+                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="NEXT">循环切换到下一个方案</option>
+                            </select>
+                            <div class="mode-tabs" style="margin-top: 6px;">
+                                <label><input type="radio" name="mb_bMode" value="CMB" checked onchange="toggleToggleMode('mb_b')"> ⚡ 组合快捷键</label>
+                                <label><input type="radio" name="mb_bMode" value="SEQ" onchange="toggleToggleMode('mb_b')"> 🔤 打字效果</label>
+                            </div>
+                            <div id="mb_bCmbPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <div class="chk-group">
+                                    <label><input type="checkbox" id="mb_bCtrl"> Ctrl</label>
+                                    <label><input type="checkbox" id="mb_bAlt"> Alt</label>
+                                    <label><input type="checkbox" id="mb_bShift"> Shift</label>
+                                    <label><input type="checkbox" id="mb_bWin"> Win/Cmd</label>
+                                </div>
+                                <div id="mb_bCmbKeysList"></div>
+                                <button class="btn-tag" onclick="addToggleComboKey('mb_b')" style="margin-top: 4px;">+ 添加普通键</button>
+                                <div id="mb_bCmbKeysEmpty" class="hint" style="margin-top: 4px; color: #f87171;">⚠ 未添加任何普通键</div>
+                            </div>
+                            <div id="mb_bSeqPanel" class="macro-panel" style="background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px;">
+                                <textarea id="mb_bSeqInput" rows="2" placeholder="例：Ctrl+Shift+Esc[ENTER]"></textarea>
+                            </div>
+                            <div style="display: flex; gap: 6px; margin-top: 8px;">
+                                <button class="btn btn-green" id="mb_bSaveBtn" style="flex: 1;">💾 保存 B</button>
+                                <button class="btn-tag" id="mb_bClearBtn">🗑 清除 B</button>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="btn btn-red" id="mbFullResetBtn" style="width: 100%; margin-top: 10px;">⚠️ 清空 MB 全部 (A+B+相位)</button>
                 </div>
             </div>
         </div>
@@ -547,6 +725,8 @@
             // 连接成功后启用"预加载全部"按钮(可选)。默认按需取,选键时单条拉。
             const rBtn = document.getElementById('readAllBtn');
             if (rBtn) { rBtn.disabled = false; rBtn.title = "可选:一次性预加载全部配置,后续切键免等"; }
+            // 顺手拉一次 MA/MB 双状态 + 相位回填 UI,免得用户切到这个 tab 看到空白
+            await loadToggleFromCache();
         } catch(e) {
             alert("连接失败: " + e.message);
         }
@@ -757,7 +937,10 @@
     const configCache = {
         remaps: {},     // { 0: [{from,to}, ...], 1: [...], ... }
         macros: {},     // { "p0_M1": "SEQ:abc...", "p0_M2": "CMB:128,4", ... }   null/NONE = 未设
-        gkeys: {}       // { "MA": "SW:1+CMB:128,4", "MB": "NONE" }
+        gkeys: {}       // 双状态切换扩展:
+                        //   "MA_a" / "MA_b" / "MB_a" / "MB_b" → 状态 A/B 的 payload
+                        //   "MA_ph" / "MB_ph"                   → 当前相位 "0" / "1"
+                        //   "MA"   / "MB"                       → 老单套(仅 M1-M12 用)
     };
 
     // 单条读宏,800ms timeout。返回值是 raw body(去掉前缀的 "SEQ:..." / "CMB:..." / "NONE"),
@@ -779,6 +962,48 @@
         const line = await pr;
         if (!line) return null;
         return line.substring(p.length);
+    }
+
+    // 读 MA / MB 的某个状态(a/b)的配置 payload。
+    // 协议:`GKEYDUMP:<KEY>:<a|b>`,响应前缀 `GKEYDUMP:<KEY>:<a|b>:`,
+    // 返回去掉前缀后的 body(NONE = 未设)。
+    async function readGlobalkStateConfig(key, state) {
+        const tag = `${key}:${state}`;
+        const p = `GKEYDUMP:${tag}:`;
+        const pr = waitBleNotify(p, 800);
+        await sendBLE(`GKEYDUMP:${tag}`);
+        const line = await pr;
+        if (!line) return null;
+        return line.substring(p.length);
+    }
+
+    // 读 MA / MB 当前相位(下次按下将执行 A 还是 B)。
+    // 协议:`GKEYPHASE:<KEY>`,响应 `GKEYPHASE:<KEY>:<0|1>`。
+    // 失败返 null(允许用户重试);成功返 "0" 或 "1"。
+    async function readGlobalkPhase(key) {
+        const p = `GKEYPHASE:${key}:`;
+        const pr = waitBleNotify(p, 800);
+        await sendBLE(`GKEYPHASE:${key}`);
+        const line = await pr;
+        if (!line) return null;
+        const body = line.substring(p.length);
+        if (body !== "0" && body !== "1") return null;
+        return body;
+    }
+
+    // 重置 MA / MB 相位回 0,响应 `GKEYPHASE:<KEY>:0`。
+    async function sendTogglePhaseReset(key) {
+        const p = `GKEYPHASE:${key}:`;
+        const pr = waitBleNotify(p, 800);
+        await sendBLE(`GKEYPHASE_RESET:${key}`);
+        const line = await pr;
+        if (!line) return null;
+        return line.substring(p.length);
+    }
+
+    // 单键全局清空(只清 MA 或 MB 的全部 + 相位,不动 M1-M12)。
+    async function sendToggleKeyReset(key) {
+        await sendBLE(`GKEY_RESET:${key}`);
     }
 
     // 批量预加载:4 方案 × REMAP(4 条) + M1-M12(48 条) + MA/MB(2 条) = 54 条。
@@ -809,13 +1034,28 @@
             }
         }
 
-        // 3. 全局键 MA / MB
+        // 3. 全局键 MA / MB(双状态切换:每个键 2 个状态 + 1 个相位 = 3 条)
         for (const k of ['MA', 'MB']) {
+            // 老单套(留作兜底;新 UI 已不显示,但读全配置时仍能拉到)
             total++;
             const data = await readGlobalkConfig(k);
             configCache.gkeys[k] = data;
             if (data !== null) ok++;
             if (onProgress) onProgress(total, `全局 ${k}`);
+            // 状态 A / B
+            for (const s of ['a', 'b']) {
+                total++;
+                const sd = await readGlobalkStateConfig(k, s);
+                configCache.gkeys[`${k}_${s}`] = sd;
+                if (sd !== null) ok++;
+                if (onProgress) onProgress(total, `全局 ${k} 状态${s.toUpperCase()}`);
+            }
+            // 相位
+            total++;
+            const ph = await readGlobalkPhase(k);
+            configCache.gkeys[`${k}_ph`] = ph;
+            if (ph !== null) ok++;
+            if (onProgress) onProgress(total, `${k} 相位`);
         }
 
         const sec = ((Date.now() - startMs) / 1000).toFixed(1);
@@ -824,6 +1064,7 @@
         await loadMacroFromCache();
         await loadGlobalkFromCache();
         await loadRemapFromCache();
+        await loadToggleFromCache();
     }
 
     // 按需取单条:cache 命中直接返,未命中才向键盘拉一次,拉完缓存。
@@ -1232,6 +1473,192 @@
         return extra || 'NONE';
     }
 
+    // ========== MA / MB 双状态切换 UI 状态 ==========
+    // 每个 (key, state) 一份独立的普通键列表 + payload 构造器。
+    // scope 形如 "ma_a" / "ma_b" / "mb_a" / "mb_b"。
+    // 跟上方 globalkComboKeys 完全对称,只是按 scope 索引。
+    const toggleComboKeys = {
+        ma_a: [], ma_b: [],
+        mb_a: [], mb_b: [],
+    };
+
+    function buildTogglePayload(scope) {
+        // scope: 'ma_a' / 'ma_b' / 'mb_a' / 'mb_b'
+        const sw = document.getElementById(`${scope}SwAction`).value;
+        const seqText = document.getElementById(`${scope}SeqInput`).value;
+        const mode = document.querySelector(`input[name="${scope}Mode"]:checked`).value;
+
+        let extra = '';
+        if (mode === 'SEQ') {
+            if (seqText) extra = 'SEQ:' + seqText;
+        } else {
+            const codes = [];
+            if (document.getElementById(`${scope}Ctrl`).checked)  codes.push(128);
+            if (document.getElementById(`${scope}Alt`).checked)   codes.push(130);
+            if (document.getElementById(`${scope}Shift`).checked) codes.push(129);
+            if (document.getElementById(`${scope}Win`).checked)   codes.push(131);
+            (toggleComboKeys[scope] || []).forEach(k => { if (k.code > 0) codes.push(k.code); });
+            if (codes.length > 0) extra = 'CMB:' + codes.join(',');
+        }
+
+        if (sw !== 'NONE') {
+            return extra ? `SW:${sw}+${extra}` : `SW:${sw}`;
+        }
+        return extra || 'NONE';
+    }
+
+    function addToggleComboKey(scope) {
+        if (!toggleComboKeys[scope]) toggleComboKeys[scope] = [];
+        toggleComboKeys[scope].push({ code: 0 });
+        renderToggleComboKeys(scope);
+    }
+
+    function removeToggleComboKey(scope, idx) {
+        if (!toggleComboKeys[scope]) return;
+        toggleComboKeys[scope].splice(idx, 1);
+        renderToggleComboKeys(scope);
+    }
+
+    // 复用 KEY_OPTIONS_NO_MODS 拼一个 select,跟 globalk 那份保持一致。
+    // 复用同一份字典,避免重复造轮子;字典是对象不是数组,用 for...in 遍历。
+    function renderToggleComboKeys(scope) {
+        const list = document.getElementById(`${scope}CmbKeysList`);
+        const empty = document.getElementById(`${scope}CmbKeysEmpty`);
+        if (!list) return;
+        list.innerHTML = '';
+        const arr = toggleComboKeys[scope] || [];
+        arr.forEach((k, idx) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display: flex; gap: 6px; margin-top: 4px; align-items: center;';
+            const sel = document.createElement('select');
+            sel.style.flex = '1';
+            for (const name in KEY_OPTIONS_NO_MODS) {
+                const opt = document.createElement('option');
+                opt.value = KEY_OPTIONS_NO_MODS[name];
+                opt.textContent = name;
+                if (KEY_OPTIONS_NO_MODS[name] === k.code) opt.selected = true;
+                sel.appendChild(opt);
+            }
+            sel.addEventListener('change', () => {
+                toggleComboKeys[scope][idx].code = parseInt(sel.value);
+            });
+            const rm = document.createElement('button');
+            rm.className = 'btn-tag';
+            rm.textContent = '✕ 删除';
+            rm.onclick = () => removeToggleComboKey(scope, idx);
+            row.appendChild(sel);
+            row.appendChild(rm);
+            list.appendChild(row);
+        });
+        if (empty) empty.style.display = arr.length === 0 ? 'block' : 'none';
+    }
+
+    // 切 CMB / SEQ 面板显隐。scope 同上。
+    function toggleToggleMode(scope) {
+        const mode = document.querySelector(`input[name="${scope}Mode"]:checked`).value;
+        const seqPanel = document.getElementById(`${scope}SeqPanel`);
+        const cmbPanel = document.getElementById(`${scope}CmbPanel`);
+        if (!seqPanel || !cmbPanel) return;
+        if (mode === 'SEQ') {
+            seqPanel.classList.remove('panel-disabled');
+            cmbPanel.classList.add('panel-disabled');
+        } else {
+            seqPanel.classList.add('panel-disabled');
+            cmbPanel.classList.remove('panel-disabled');
+        }
+    }
+    // 初始化所有 toggle 面板的 CMB/SEQ 显隐(默认 CMB)
+    ['ma_a', 'ma_b', 'mb_a', 'mb_b'].forEach(toggleToggleMode);
+
+    // 把缓存里的 a/b payload 填进对应 UI(scope = 'ma_a' / 'ma_b' / 'mb_a' / 'mb_b')
+    // data 可能是 'NONE' / null(未设) / 'SW:1+CMB:...' / 'CMB:...' / 'SEQ:...'
+    function fillToggleUiFromPayload(scope, data) {
+        // 先清空 UI
+        document.getElementById(`${scope}SwAction`).value = 'NONE';
+        document.getElementById(`${scope}Ctrl`).checked = false;
+        document.getElementById(`${scope}Alt`).checked = false;
+        document.getElementById(`${scope}Shift`).checked = false;
+        document.getElementById(`${scope}Win`).checked = false;
+        document.getElementById(`${scope}SeqInput`).value = '';
+        toggleComboKeys[scope] = [];
+        renderToggleComboKeys(scope);
+
+        if (!data || data === 'NONE') {
+            // 默认 CMB 模式
+            document.querySelector(`input[name="${scope}Mode"][value="CMB"]`).checked = true;
+            toggleToggleMode(scope);
+            return;
+        }
+
+        let mode = 'CMB';
+        const modSet = new Set([128, 129, 130, 131]);
+        const parts = data.split('+');
+        for (const part of parts) {
+            if (part.startsWith('SW:')) {
+                document.getElementById(`${scope}SwAction`).value = part.substring(3);
+            } else if (part.startsWith('SEQ:')) {
+                mode = 'SEQ';
+                document.getElementById(`${scope}SeqInput`).value = part.substring(4);
+            } else if (part.startsWith('CMB:')) {
+                mode = 'CMB';
+                const codes = part.substring(4).split(',').map(Number).filter(c => c > 0);
+                document.getElementById(`${scope}Ctrl`).checked  = codes.includes(128);
+                document.getElementById(`${scope}Alt`).checked   = codes.includes(130);
+                document.getElementById(`${scope}Shift`).checked = codes.includes(129);
+                document.getElementById(`${scope}Win`).checked   = codes.includes(131);
+                toggleComboKeys[scope] = codes.filter(c => !modSet.has(c)).map(c => ({ code: c }));
+            }
+        }
+        document.querySelector(`input[name="${scope}Mode"][value="${mode}"]`).checked = true;
+        toggleToggleMode(scope);
+        renderToggleComboKeys(scope);
+    }
+
+    // 更新顶部"下次将执行 X"的徽章。phase = '0' → A, '1' → B。
+    function updatePhaseBadge(key, phase) {
+        const badge = document.getElementById(`${key.toLowerCase()}PhaseBadge`);
+        if (!badge) return;
+        const ch = (phase === '1') ? 'B' : 'A';
+        badge.textContent = ch;
+        // A 蓝色、B 紫色 — 视觉区分一下
+        badge.style.background = (phase === '1') ? '#a855f7' : '#0ea5e9';
+    }
+
+    // 拉一次 MA / MB 的相位并更新徽章。失败静默,徽章保持原状。
+    async function pollTogglePhase(key) {
+        if (!myCharacteristic) return;
+        const ph = await readGlobalkPhase(key);
+        if (ph !== null) {
+            configCache.gkeys[`${key}_ph`] = ph;
+            updatePhaseBadge(key, ph);
+        }
+    }
+
+    // 把缓存里的状态 A/B/ph 全部回填 UI(scope 维度,一次性刷新 4 个面板)
+    async function loadToggleFromCache() {
+        // 状态 payload 回填
+        const scopes = [
+            { scope: 'ma_a', key: 'MA', state: 'a' },
+            { scope: 'ma_b', key: 'MA', state: 'b' },
+            { scope: 'mb_a', key: 'MB', state: 'a' },
+            { scope: 'mb_b', key: 'MB', state: 'b' },
+        ];
+        for (const item of scopes) {
+            const cacheKey = `${item.key}_${item.state}`;
+            let data = configCache.gkeys[cacheKey];
+            if (data === undefined && myCharacteristic) {
+                // cache miss,跟 ensureGlobalkLoaded 一样按需拉一次
+                LOG_PORT_UI(`[取] ${item.key} 状态 ${item.state.toUpperCase()}`);
+                data = await readGlobalkStateConfig(item.key, item.state);
+                if (data !== null) configCache.gkeys[cacheKey] = data;
+            }
+            fillToggleUiFromPayload(item.scope, data);
+        }
+        // 相位徽章
+        await pollTogglePhase('MA');
+        await pollTogglePhase('MB');
+    }
+
     function onGlobalkKeyChange() {
         // 切换键名时优先从 cache 加载该键已有的配置;
         // cache 没数据(没点过"读取所有配置")就保持空,让用户从空白开始填
@@ -1250,6 +1677,89 @@
         if (!confirm(`确定要清除 ${key} 的全局配置？`)) return;
         await sendBLE(`GSET:${key}:NONE`);
         alert(`${key} 已清空全局配置。`);
+    });
+
+    // ========== MA / MB 双状态切换:保存 / 清除 / 相位重置 / 全清 ==========
+    // (scope, key, state) 三者一一对应:scope 是 UI 区域 id 前缀,
+    // key 是 MA/MB,state 是 a/b。state 直接拼到协议名里:`GSET:<key><state>:...`。
+    const toggleBindings = [
+        { scope: 'ma_a', key: 'MA', state: 'a' },
+        { scope: 'ma_b', key: 'MA', state: 'b' },
+        { scope: 'mb_a', key: 'MB', state: 'a' },
+        { scope: 'mb_b', key: 'MB', state: 'b' },
+    ];
+    toggleBindings.forEach(b => {
+        // 保存
+        document.getElementById(`${b.scope}SaveBtn`).addEventListener('click', async () => {
+            if (!myCharacteristic) return alert('请先连接蓝牙！');
+            const payload = buildTogglePayload(b.scope);
+            const tag = `${b.key}${b.state}`;
+            await sendBLE(`GSET:${tag}:${payload}`);
+            // 本地缓存立刻更新(避免下次切换又去拉)
+            configCache.gkeys[`${b.key}_${b.state}`] = payload;
+            alert(`${b.key} 状态 ${b.state.toUpperCase()} 已生效！\n协议: GSET:${tag}:${payload}`);
+        });
+        // 清除单个状态
+        document.getElementById(`${b.scope}ClearBtn`).addEventListener('click', async () => {
+            if (!myCharacteristic) return alert('请先连接蓝牙！');
+            if (!confirm(`确定要清除 ${b.key} 状态 ${b.state.toUpperCase()}？`)) return;
+            const tag = `${b.key}${b.state}`;
+            await sendBLE(`GSET:${tag}:NONE`);
+            configCache.gkeys[`${b.key}_${b.state}`] = 'NONE';
+            fillToggleUiFromPayload(b.scope, 'NONE');
+            alert(`${tag} 已清空。`);
+        });
+    });
+    // 相位重置
+    document.getElementById('maPhaseResetBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert('请先连接蓝牙！');
+        const ph = await sendTogglePhaseReset('MA');
+        if (ph !== null) {
+            configCache.gkeys['MA_ph'] = '0';
+            updatePhaseBadge('MA', '0');
+            alert('MA 相位已重置,下次按下将执行状态 A。');
+        } else {
+            alert('MA 相位重置失败,请重试。');
+        }
+    });
+    document.getElementById('mbPhaseResetBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert('请先连接蓝牙！');
+        const ph = await sendTogglePhaseReset('MB');
+        if (ph !== null) {
+            configCache.gkeys['MB_ph'] = '0';
+            updatePhaseBadge('MB', '0');
+            alert('MB 相位已重置,下次按下将执行状态 A。');
+        } else {
+            alert('MB 相位重置失败,请重试。');
+        }
+    });
+    // 整键全清(双状态 + 相位 + 老单套),互不影响 M1-M12
+    document.getElementById('maFullResetBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert('请先连接蓝牙！');
+        if (!confirm('⚠️ 真的要清空 MA 的全部配置?\n\n会清掉:\n  • 状态 A\n  • 状态 B\n  • 相位(回到 A)\n  • 老单套(如有)\n\n不影响:\n  • M1~M12 宏\n  • 任何方案映射 / 时钟 / 灯光 / 壁纸\n\n确定继续?')) return;
+        await sendToggleKeyReset('MA');
+        // 本地缓存 + UI 全部刷新
+        configCache.gkeys['MA']    = 'NONE';
+        configCache.gkeys['MA_a']  = 'NONE';
+        configCache.gkeys['MA_b']  = 'NONE';
+        configCache.gkeys['MA_ph'] = '0';
+        fillToggleUiFromPayload('ma_a', 'NONE');
+        fillToggleUiFromPayload('ma_b', 'NONE');
+        updatePhaseBadge('MA', '0');
+        alert('MA 已全部清空。');
+    });
+    document.getElementById('mbFullResetBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert('请先连接蓝牙！');
+        if (!confirm('⚠️ 真的要清空 MB 的全部配置?\n\n会清掉:\n  • 状态 A\n  • 状态 B\n  • 相位(回到 A)\n  • 老单套(如有)\n\n不影响:\n  • M1~M12 宏\n  • 任何方案映射 / 时钟 / 灯光 / 壁纸\n\n确定继续?')) return;
+        await sendToggleKeyReset('MB');
+        configCache.gkeys['MB']    = 'NONE';
+        configCache.gkeys['MB_a']  = 'NONE';
+        configCache.gkeys['MB_b']  = 'NONE';
+        configCache.gkeys['MB_ph'] = '0';
+        fillToggleUiFromPayload('mb_a', 'NONE');
+        fillToggleUiFromPayload('mb_b', 'NONE');
+        updatePhaseBadge('MB', '0');
+        alert('MB 已全部清空。');
     });
 
     // ========== 4. 方案专属宏 M1-M12 ==========
