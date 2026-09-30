@@ -2963,17 +2963,22 @@ static void drawNotifPanel(void) {
     // 右上角：还剩几条待处理。之前这条信息占了整个顶部一行 + 一个 28 号大数字，
     // 逼得正文只剩 138 宽；现在收成一行，数字用 20 号大字体单独拎出来，
     // "1 条" 也一眼看得见（单条的时候最容易被当成没有条数）。
+    //
+    // 顺序：数字在前（读"1"先入眼），后接"条待处理"。文字锚在最右，数字往左贴，
+    // 整体显示成「1 条待处理」。
     char nbuf[8];
     snprintf(nbuf, sizeof(nbuf), "%d", notifCount);
-    lv_obj_t* cntNum = lv_label_create(scr_notif);
-    mkLabel(cntNum, &lv_font_montserrat_20, accent);
-    lv_label_set_text(cntNum, nbuf);
-    lv_obj_align(cntNum, LV_ALIGN_TOP_RIGHT, -18, 12);
 
     lv_obj_t* cntLbl = lv_label_create(scr_notif);
     mkLabel(cntLbl, &lv_font_simsun_16_cjk, CLR_TEXT);
     lv_label_set_text(cntLbl, "条待处理");
-    lv_obj_align_to(cntLbl, cntNum, LV_ALIGN_OUT_LEFT_TOP, -3, 3);
+    lv_obj_align(cntLbl, LV_ALIGN_TOP_RIGHT, -18, 12);
+
+    lv_obj_t* cntNum = lv_label_create(scr_notif);
+    mkLabel(cntNum, &lv_font_montserrat_20, accent);
+    lv_label_set_text(cntNum, nbuf);
+    // 数字贴到"条待处理"左侧,垂直略下移,让数字基线与文字下半段对齐
+    lv_obj_align_to(cntNum, cntLbl, LV_ALIGN_OUT_LEFT_TOP, -3, 3);
 
     // ---- 分隔线 ----
     lv_obj_t* sep = lv_obj_create(scr_notif);
