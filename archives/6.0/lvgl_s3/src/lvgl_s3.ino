@@ -905,9 +905,15 @@ static lv_obj_t* hc_lbl_active_num  = nullptr;
 static lv_obj_t* hc_bar_active      = nullptr;
 static lv_obj_t* hc_bar_active_fill = nullptr;
 // 状态行（y=234..240 周边剩余, w=220, h=14）：温度 / 字数 / 湿度
-static lv_obj_t* hc_lbl_strip_t     = nullptr;   // 温度
-static lv_obj_t* hc_lbl_strip_chars = nullptr;   // "字数 nnn"
-static lv_obj_t* hc_lbl_strip_h     = nullptr;   // 湿度
+static lv_obj_t* hc_lbl_strip_t     = nullptr;   // "温度" 说明
+static lv_obj_t* hc_lbl_strip_t_val = nullptr;   // 温度数值
+static lv_obj_t* hc_lbl_strip_chars = nullptr;   // "字数" 说明
+static lv_obj_t* hc_lbl_strip_chars_val = nullptr; // 字数数值
+static lv_obj_t* hc_lbl_strip_h     = nullptr;   // "湿度" 说明
+static lv_obj_t* hc_lbl_strip_h_val = nullptr;   // 湿度数值
+static lv_obj_t* hc_icon_temp = nullptr;   // 温度图标色块
+static lv_obj_t* hc_icon_chars = nullptr;  // 字数图标色块
+static lv_obj_t* hc_icon_hum = nullptr;    // 湿度图标色块
 
 // ===========================
 // 壁纸：JPEG 上传 + 解码缓冲
@@ -1104,7 +1110,10 @@ static void resetStylePointers(void) {
     hc_bar_today = nullptr; hc_bar_today_fill = nullptr;
     hc_lbl_active = nullptr; hc_lbl_active_num = nullptr;
     hc_bar_active = nullptr; hc_bar_active_fill = nullptr;
-    hc_lbl_strip_t = nullptr; hc_lbl_strip_chars = nullptr; hc_lbl_strip_h = nullptr;
+    hc_lbl_strip_t = nullptr; hc_lbl_strip_t_val = nullptr;
+    hc_lbl_strip_chars = nullptr; hc_lbl_strip_chars_val = nullptr;
+    hc_lbl_strip_h = nullptr; hc_lbl_strip_h_val = nullptr;
+    hc_icon_temp = nullptr; hc_icon_chars = nullptr; hc_icon_hum = nullptr;
 
     // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
     // 之前漏在这里清理，就踩了和 ipLockDot[] 一模一样的坑，而且这次更隐蔽：
@@ -2260,61 +2269,46 @@ static void build_style_high_contrast(void) {
         lv_obj_align(t, LV_ALIGN_TOP_LEFT, cx - 22, 26);
         hc_lbl_lock[i] = t;
     }
-    // 方案图标 + 方案名（右上角）
+    // 右上角：大号方案图标（48×48，不带方案名文字）
     hc_img_profile = lv_img_create(hc_bg);
-    lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
-    lv_obj_align(hc_img_profile, LV_ALIGN_TOP_RIGHT, -50, 4);
+    lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_L));
+    lv_obj_align(hc_img_profile, LV_ALIGN_TOP_RIGHT, -6, 0);
 
+    // 方案名（仅内部记录，界面不显示）
     hc_lbl_profile = lv_label_create(hc_bg);
     mkLabel(hc_lbl_profile, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
     lv_label_set_text(hc_lbl_profile, profileNamesCN[currentProfile]);
-    lv_obj_align(hc_lbl_profile, LV_ALIGN_TOP_RIGHT, -6, 14);
+    lv_obj_add_flag(hc_lbl_profile, LV_OBJ_FLAG_HIDDEN);
 
     // ===========================================================
-    // 主卡片 1（y=52..118, w=220, h=66）：时间 + 日期 + 左青色装饰条
+    // 时间区（无卡片框, 文字直接居中显示在 hc_bg 上）
+    //   时间 y=46..94 (字号 48), 日期 y=98..114 (字号 16)
     // ===========================================================
-    {
-        lv_obj_t* card = iconRect(hc_bg, 220, 66, LV_ALIGN_TOP_MID, 0, 52,
-                                  0x000000, 10);
-        lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(card, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
-        // 左 3px 青色装饰条（仪表盘"标签轴"）
-        lv_obj_t* strip = iconRect(card, 3, 50, LV_ALIGN_TOP_LEFT, 6, 8,
-                                   CLR_ACCENT, 0);
-        hc_card_time_strip = strip;
-    }
+    hc_card_time_strip = nullptr;   // 已废弃：时间卡和装饰条都删了
     hc_lbl_time = lv_label_create(hc_bg);
     mkLabel(hc_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
     lv_label_set_text(hc_lbl_time, "--:--");
-    lv_obj_align(hc_lbl_time, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_align(hc_lbl_time, LV_ALIGN_TOP_MID, 0, 46);
 
     hc_lbl_date = lv_label_create(hc_bg);
     mkLabel(hc_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
     lv_label_set_text(hc_lbl_date, "--");
     lv_obj_set_width(hc_lbl_date, 240);
     lv_obj_set_style_text_align(hc_lbl_date, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_date, LV_ALIGN_TOP_MID, 0, 108);
+    lv_obj_align(hc_lbl_date, LV_ALIGN_TOP_MID, 0, 98);
 
     // ===========================================================
-    // 主卡片 2（y=130..196, w=220, h=66）：大红按键名 + 左红色装饰条
+    // 按键区（无卡片框, 文字直接居中显示在 hc_bg 上）
+    //   按键(48) y=118..166 字号 48, 按键(28) y=134 备用默认隐藏
     // ===========================================================
-    {
-        lv_obj_t* card = iconRect(hc_bg, 220, 66, LV_ALIGN_TOP_MID, 0, 130,
-                                  0x000000, 10);
-        lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(card, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
-        // 左 3px 红色装饰条
-        lv_obj_t* strip = iconRect(card, 3, 50, LV_ALIGN_TOP_LEFT, 6, 8,
-                                   CLR_RED, 0);
-        hc_card_key_strip = strip;
-    }
+    hc_card_key_strip = nullptr;   // 已废弃：按键卡和装饰条都删了
     hc_lbl_lastkey_48 = lv_label_create(hc_bg);
     mkLabel(hc_lbl_lastkey_48, &lv_font_montserrat_48, CLR_RED);
     lv_label_set_text(hc_lbl_lastkey_48, "-");
     lv_obj_set_width(hc_lbl_lastkey_48, 200);
     lv_obj_set_style_text_align(hc_lbl_lastkey_48, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_long_mode(hc_lbl_lastkey_48, LV_LABEL_LONG_DOT);
-    lv_obj_align(hc_lbl_lastkey_48, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_align(hc_lbl_lastkey_48, LV_ALIGN_TOP_MID, 0, 124);
 
     hc_lbl_lastkey_28 = lv_label_create(hc_bg);
     mkLabel(hc_lbl_lastkey_28, &lv_font_montserrat_28, CLR_RED);
@@ -2322,115 +2316,75 @@ static void build_style_high_contrast(void) {
     lv_obj_set_width(hc_lbl_lastkey_28, 200);
     lv_obj_set_style_text_align(hc_lbl_lastkey_28, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_long_mode(hc_lbl_lastkey_28, LV_LABEL_LONG_DOT);
-    lv_obj_align(hc_lbl_lastkey_28, LV_ALIGN_TOP_MID, 0, 156);
+    lv_obj_align(hc_lbl_lastkey_28, LV_ALIGN_TOP_MID, 0, 140);
     lv_obj_add_flag(hc_lbl_lastkey_28, LV_OBJ_FLAG_HIDDEN);   // 默认隐藏（5..8 字符才显示）
 
     // ===========================================================
-    // 数据带（y=202..234, w=220, h=32，3 等分）
-    //   卡片背景 #000000（纯黑，靠描边浮现），1px CLR_STROKE 描边，圆角 8
+    // 数据带（KPM/TODAY/ACTIVE）已删除：腾出空间给按键放大 + 温湿度加框
     // ===========================================================
+
+    // ===========================================================
+    // 温湿度卡片（y=180..232, w=220, h=52，3 等分；纯黑底+1px CLR_STROKE 描边）
+    //   上行 y=186 (h=16):  色块图标 + 中文"温度"/"字数"/"湿度"
+//   下行 y=212 (h=20):  数值（字号 18）
+// ===========================================================
     {
-        lv_obj_t* band = iconRect(hc_bg, 220, 32, LV_ALIGN_TOP_MID, 0, 202,
-                                  0x000000, 8);
-        lv_obj_set_style_border_width(band, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(band, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+        lv_obj_t* box = iconRect(hc_bg, 220, 52, LV_ALIGN_TOP_MID, 0, 180,
+                                 0x000000, 8);
+        lv_obj_set_style_border_width(box, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(box, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
     }
 
-    // KPM 列（左）—— x≈12..84
-    hc_lbl_kpm = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_kpm, &lv_font_montserrat_10, CLR_TEXT_MUTE);
-    lv_label_set_text(hc_lbl_kpm, "KPM");
-    lv_obj_align(hc_lbl_kpm, LV_ALIGN_TOP_LEFT, 22, 206);
-
-    hc_lbl_kpm_num = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_kpm_num, &lv_font_montserrat_20, CLR_ACCENT);
-    lv_label_set_text(hc_lbl_kpm_num, "0");
-    lv_obj_align(hc_lbl_kpm_num, LV_ALIGN_TOP_LEFT, 22, 216);
-
-    // KPM 进度条（背景 60x4，全局底部条最终颜色为数据色）
-    lv_obj_t* bar1_bg = iconRect(hc_bg, 60, 4, LV_ALIGN_TOP_LEFT, 12, 230,
-                                  CLR_STROKE, 2);
-    hc_bar_kpm = bar1_bg;
-    // KPM 实条
-    hc_bar_kpm_fill = lv_obj_create(hc_bg);
-    lv_obj_set_size(hc_bar_kpm_fill, 0, 4);
-    lv_obj_align(hc_bar_kpm_fill, LV_ALIGN_TOP_LEFT, 12, 230);
-    lv_obj_set_style_bg_color(hc_bar_kpm_fill, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(hc_bar_kpm_fill, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(hc_bar_kpm_fill, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_width(hc_bar_kpm_fill, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(hc_bar_kpm_fill, LV_OBJ_FLAG_SCROLLABLE);
-
-    // TODAY 列（中）—— x≈84..156
-    hc_lbl_today = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_today, &lv_font_montserrat_10, CLR_TEXT_MUTE);
-    lv_label_set_text(hc_lbl_today, "TODAY");
-    lv_obj_align(hc_lbl_today, LV_ALIGN_TOP_MID, 0, 206);
-
-    hc_lbl_today_num = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_today_num, &lv_font_montserrat_20, CLR_TEXT);
-    lv_label_set_text(hc_lbl_today_num, "0");
-    lv_obj_align(hc_lbl_today_num, LV_ALIGN_TOP_MID, 0, 216);
-
-    lv_obj_t* bar2_bg = iconRect(hc_bg, 60, 4, LV_ALIGN_TOP_MID, 0, 230,
-                                  CLR_STROKE, 2);
-    hc_bar_today = bar2_bg;
-    hc_bar_today_fill = lv_obj_create(hc_bg);
-    lv_obj_set_size(hc_bar_today_fill, 0, 4);
-    lv_obj_align(hc_bar_today_fill, LV_ALIGN_TOP_MID, 0, 230);
-    lv_obj_set_style_bg_color(hc_bar_today_fill, lv_color_hex(CLR_VIOLET), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(hc_bar_today_fill, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(hc_bar_today_fill, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_width(hc_bar_today_fill, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(hc_bar_today_fill, LV_OBJ_FLAG_SCROLLABLE);
-
-    // ACTIVE 列（右）—— x≈156..228
-    hc_lbl_active = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_active, &lv_font_montserrat_10, CLR_TEXT_MUTE);
-    lv_label_set_text(hc_lbl_active, "ACTIVE");
-    lv_obj_align(hc_lbl_active, LV_ALIGN_TOP_RIGHT, -22, 206);
-
-    hc_lbl_active_num = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_active_num, &lv_font_montserrat_20, CLR_TEXT);
-    lv_label_set_text(hc_lbl_active_num, "0m");
-    lv_obj_align(hc_lbl_active_num, LV_ALIGN_TOP_RIGHT, -12, 216);
-
-    lv_obj_t* bar3_bg = iconRect(hc_bg, 60, 4, LV_ALIGN_TOP_RIGHT, -12, 230,
-                                  CLR_STROKE, 2);
-    hc_bar_active = bar3_bg;
-    hc_bar_active_fill = lv_obj_create(hc_bg);
-    lv_obj_set_size(hc_bar_active_fill, 0, 4);
-    lv_obj_align(hc_bar_active_fill, LV_ALIGN_TOP_RIGHT, -12, 230);
-    lv_obj_set_style_bg_color(hc_bar_active_fill, lv_color_hex(CLR_AMBER), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(hc_bar_active_fill, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(hc_bar_active_fill, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_width(hc_bar_active_fill, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(hc_bar_active_fill, LV_OBJ_FLAG_SCROLLABLE);
-
-    // ===========================================================
-    // 状态行（y=234..240 周边剩余, w=220, h=14，3 等分）
-    //   温度 / 字数 / 湿度，无描边无背景，仅一行小字
-    // ===========================================================
+    // --- 温度列（左, x≈12..80）---
+    // 图标色块 (16x16, 琥珀色) 模拟温度计
+    lv_obj_t* t_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_LEFT, 18, 186,
+                                CLR_AMBER, 2);
+    hc_icon_temp = t_icon;
+    // 温度说明文字（紧贴图标右侧）
     hc_lbl_strip_t = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_t, &lv_font_montserrat_14, CLR_AMBER);
-    lv_label_set_text(hc_lbl_strip_t, "--.-C");
-    lv_obj_set_width(hc_lbl_strip_t, 73);
-    lv_obj_set_style_text_align(hc_lbl_strip_t, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_t, LV_ALIGN_TOP_LEFT, 0, 226);
+    mkLabel(hc_lbl_strip_t, &lv_font_simsun_16_cjk, CLR_AMBER);
+    lv_label_set_text(hc_lbl_strip_t, "温度");
+    lv_obj_align(hc_lbl_strip_t, LV_ALIGN_TOP_LEFT, 38, 186);
 
+    // 温度数值
+    hc_lbl_strip_t_val = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_strip_t_val, &lv_font_montserrat_18, CLR_TEXT);
+    lv_label_set_text(hc_lbl_strip_t_val, "--.-°C");
+    lv_obj_set_width(hc_lbl_strip_t_val, 70);
+    lv_obj_set_style_text_align(hc_lbl_strip_t_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_t_val, LV_ALIGN_TOP_LEFT, 8, 210);
+
+    // --- 字数列（中, x≈84..156）---
+    lv_obj_t* c_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_MID, -28, 186,
+                                CLR_ACCENT, 2);
+    hc_icon_chars = c_icon;
     hc_lbl_strip_chars = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_chars, &lv_font_simsun_16_cjk, CLR_TEXT);
-    lv_label_set_text(hc_lbl_strip_chars, "字数 0");
-    lv_obj_set_width(hc_lbl_strip_chars, 74);
-    lv_obj_set_style_text_align(hc_lbl_strip_chars, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_chars, LV_ALIGN_TOP_MID, 0, 226);
+    mkLabel(hc_lbl_strip_chars, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(hc_lbl_strip_chars, "字数");
+    lv_obj_align(hc_lbl_strip_chars, LV_ALIGN_TOP_MID, 8, 186);
 
+    hc_lbl_strip_chars_val = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_strip_chars_val, &lv_font_montserrat_18, CLR_TEXT);
+    lv_label_set_text(hc_lbl_strip_chars_val, "0");
+    lv_obj_set_width(hc_lbl_strip_chars_val, 72);
+    lv_obj_set_style_text_align(hc_lbl_strip_chars_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_chars_val, LV_ALIGN_TOP_MID, 0, 210);
+
+    // --- 湿度列（右, x≈160..228）---
+    lv_obj_t* h_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_RIGHT, -18, 186,
+                                CLR_GREEN, 2);
+    hc_icon_hum = h_icon;
     hc_lbl_strip_h = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_h, &lv_font_montserrat_14, CLR_GREEN);
-    lv_label_set_text(hc_lbl_strip_h, "--%");
-    lv_obj_set_width(hc_lbl_strip_h, 73);
-    lv_obj_set_style_text_align(hc_lbl_strip_h, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_h, LV_ALIGN_TOP_RIGHT, 0, 226);
+    mkLabel(hc_lbl_strip_h, &lv_font_simsun_16_cjk, CLR_GREEN);
+    lv_label_set_text(hc_lbl_strip_h, "湿度");
+    lv_obj_align(hc_lbl_strip_h, LV_ALIGN_TOP_RIGHT, -34, 186);
+
+    hc_lbl_strip_h_val = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_strip_h_val, &lv_font_montserrat_18, CLR_TEXT);
+    lv_label_set_text(hc_lbl_strip_h_val, "--%");
+    lv_obj_set_width(hc_lbl_strip_h_val, 70);
+    lv_obj_set_style_text_align(hc_lbl_strip_h_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_h_val, LV_ALIGN_TOP_RIGHT, -8, 210);
 }
 
 // ===========================
@@ -5837,8 +5791,8 @@ static void updateDynamicElements(void) {
                     lv_color_hex(on ? CLR_STROKE : CLR_STROKE), LV_PART_MAIN);
             }
             // 顶栏右侧：方案图标 + 方案名（每次都刷，方案切换立刻反映）
-            lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_M));
-            setText(hc_lbl_profile, profileNamesCN[currentProfile]);
+            // 高对比度风格用 L 档(48px) 大图标，与 build 时一致
+            lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_L));
 
             // 大红键名：双字号预创建，按字符数切换可见性。
             const char* keyText = showKeystrokes ? lastKeyPressed : "--";
@@ -5855,57 +5809,18 @@ static void updateDynamicElements(void) {
                 setText(hc_lbl_lastkey_28, keyText);
             }
 
-            // ---- 数据带：KPM / TODAY / ACTIVE ----
-            // KPM：环形缓冲 60 秒总和
-            uint16_t kpm = 0;
-            for (int i = 0; i < KPM_WINDOW_SEC; i++) kpm += kpmRing[i];
-            static char kpmBuf[8];
-            snprintf(kpmBuf, sizeof(kpmBuf), "%u", (unsigned)kpm);
-            setText(hc_lbl_kpm_num, kpmBuf);
-            // KPM 进度条（0..120 → 0..100%），颜色梯度：
-            //   < 30 青 / 30..80 绿 / 80..120 琥珀 / ≥ 120 红
-            uint16_t kpmPct = (kpm > 120) ? 100 : (kpm * 100 / 120);
-            uint32_t kpmBarColor = CLR_ACCENT;
-            if (kpm >= 120)      kpmBarColor = CLR_RED;
-            else if (kpm >= 80)  kpmBarColor = CLR_AMBER;
-            else if (kpm >= 30)  kpmBarColor = CLR_GREEN;
-            lv_obj_set_size(hc_bar_kpm_fill, (kpmPct * 60) / 100, 4);
-            lv_obj_set_style_bg_color(hc_bar_kpm_fill,
-                lv_color_hex(kpmBarColor), LV_PART_MAIN);
+            // ---- 数据带已删除（KPM/TODAY/ACTIVE）腾出空间 ----
+// 保留 KPM 计算供其他风格使用；不写入任何 lvgl 对象（指针为 nullptr）
 
-            // TODAY：今日累计
-            static char todayBuf[16];
-            snprintf(todayBuf, sizeof(todayBuf), "%lu", (unsigned long)todayKeyCount);
-            setText(hc_lbl_today_num, todayBuf);
-            uint16_t todayPct = (todayKeyCount > 5000) ? 100
-                                : (uint16_t)((todayKeyCount * 100UL) / 5000UL);
-            lv_obj_set_size(hc_bar_today_fill, (todayPct * 60) / 100, 4);
-
-            // ACTIVE：分钟级 idle，按 5 min 满进度
-            unsigned long idle_ms_total = (millis() > lastActivityTime)
-                ? (millis() - lastActivityTime) : 0;
-            uint16_t idleMin = (uint16_t)(idle_ms_total / 60000UL);
-            static char activeBuf[12];
-            if (idleMin < 60) {
-                snprintf(activeBuf, sizeof(activeBuf), "%um", (unsigned)idleMin);
-            } else {
-                uint16_t h = idleMin / 60;
-                uint16_t m = idleMin % 60;
-                snprintf(activeBuf, sizeof(activeBuf), "%uh%02u", h, m);
-            }
-            setText(hc_lbl_active_num, activeBuf);
-            uint16_t activePct = (idleMin > 5) ? 100 : (idleMin * 100 / 5);
-            lv_obj_set_size(hc_bar_active_fill, (activePct * 60) / 100, 4);
-
-            // 状态行：温度 / 字数 / 湿度
+            // 温湿度框数值：上面"温度/字数/湿度"已固定,下面写数值
             static char tbuf[16], hbuf[16];
-            snprintf(tbuf, sizeof(tbuf), "%.1fC", shtTemp);
+            snprintf(tbuf, sizeof(tbuf), "%.1f°C", shtTemp);
             snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
-            setText(hc_lbl_strip_t, tbuf);
+            setText(hc_lbl_strip_t_val, tbuf);
             static char charsBuf[24];
-            snprintf(charsBuf, sizeof(charsBuf), "字数 %lu", (unsigned long)totalKeyCount);
-            setText(hc_lbl_strip_chars, charsBuf);
-            setText(hc_lbl_strip_h, hbuf);
+            snprintf(charsBuf, sizeof(charsBuf), "%lu", (unsigned long)totalKeyCount);
+            setText(hc_lbl_strip_chars_val, charsBuf);
+            setText(hc_lbl_strip_h_val, hbuf);
             break;
         }
     }
