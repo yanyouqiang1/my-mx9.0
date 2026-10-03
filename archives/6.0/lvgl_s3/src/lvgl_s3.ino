@@ -121,6 +121,7 @@ static void pushLogLine(const char* line);
 #include "lvgl_st7789_driver.h"
 #include "lv_conf.h"
 #include "crash_trace.h"
+#include "elog.h"
 
 #include <esp_heap_caps.h>
 
@@ -241,6 +242,10 @@ TwoWire Wire_SHT(1);
 #define SYS_MODE_SET_LIGHT 7
 #define SYS_MODE_REC_SEQ   8
 #define SYS_MODE_REC_CMB   9
+// 错误日志查看页。不是"设置模式"：它没有可调字段、没有保存/取消语义，
+// 所以**故意排在 IS_SETTING_MODE 区间（3~7）之外**，别被 moveSettingField /
+// adjustSettingField 那套接管。它自己在按键分发里占一个分支。
+#define SYS_MODE_ELOG      10
 #define IS_SETTING_MODE(m) ((m) >= SYS_MODE_SET_TIME && (m) <= SYS_MODE_SET_LIGHT)
 static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
@@ -401,7 +406,13 @@ static int      todayDateYmd = -1;              // YYYYMMDD
 
 // 菜单
 static uint8_t menuSel = 0;
-#define MENU_ITEMS 12
+#define MENU_ITEMS 13
+
+// 菜单项下标。build_menu() 里给"当前值角标"用 —— 之前写的是 MENU_ITEMS-1，
+// 也就是"最后一项永远是带角标的那项"。追加第 13 项之后这个假设就错了
+// （角标会跑到日志项上、把屏保风格的当前值挤掉），所以改成显式下标。
+#define MENU_IDX_SAVER 11   // 屏保风格：角标显示当前屏保模式
+#define MENU_IDX_LOG   12   // 错误日志：角标显示错误条数
 
 // 宏录制
 #define MAX_REC_KEYS 64
@@ -430,7 +441,8 @@ static const char* menuItemsCN[MENU_ITEMS] = {
     "9. 刷新温湿度",
     "10. 温度校准",
     "11. 计数清零",
-    "12. 屏保风格"
+    "12. 屏保风格",
+    "13. 错误日志"
 };
 
 // 辅助变量
@@ -591,6 +603,72 @@ static unsigned long lastPingTime = 0;
 // parts.pop() 整个吞进 rest,for 循环空跑,日志框永远不显示 ——
 // 这是第一版"开流没反应"的根因。所有 notify 一律包末尾加 \n。
 //
+// 关键响应的发送口：REMAPDUMP / MACRODUMP / GKEYDUMP / LOGOSTATUS / LOGDUMP。
+//
+// 为什么要单独一个口：日志流 pushLogLine() 和这些响应抢的是**同一条** BLE
+// 通知通道，而 BLE 通知不排队 —— 上一条客户端还没 ACK 时再发，NimBLE 会把
+// 后面的合并/丢弃。开着网页日志面板时 LOG:on 让日志流以 10Hz 持续占通道，
+// 关键响应夹在中间就发不出去，网页的 waitBleNotify 只能等到超时
+// —— 表现是"保存成功了但弹『没能从键盘读回确认』，点读取永远 0 条"。
+//
+// 这里发完关键响应后开一小段独占窗口，期间日志流不许抢。
+// 日志晚 250ms 出现无所谓，关键响应丢了网页就再也对不上了。
+static unsigned long bleCriticalNotifyUntil = 0;
+static void bleNotifyCritical(const char* buf, size_t len) {
+    if (pCharacteristic == nullptr || buf == nullptr || len == 0) return;
+    pCharacteristic->setValue((uint8_t*)buf, len);
+    pCharacteristic->notify();
+    bleCriticalNotifyUntil = millis() + 250;
+}
+
+// ===========================
+// REMAPDUMP 分片发送
+// ===========================
+//
+// ⚠ 单条 BLE 通知能带多少字节 = 协商后的 ATT MTU - 3。**MTU 协商失败时上限就是
+//   默认的 23-3 = 20 字节**（手机端浏览器很常见），超出的部分不是被截断而是
+//   **整条通知被协议栈丢掉** —— 网页那边只看到"等超时"，误以为键盘里是 0 条。
+//
+//   这条 20 字节正好解释了一个一直归因错的不对称：
+//     1 条规则 → "REMAPDUMP:0:128,131\n"        = 20 字节 → 刚好塞得下 ✓
+//     2 条规则 → "REMAPDUMP:0:128,131;131,128\n" = 28 字节 → 整条丢弃 ✗
+//   也就是"单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来"，
+//   以及保存后弹「没能从键盘读回确认」。
+//
+//   ⚠ 别想用 BLEDevice::getMTU() 算预算：它返回的是 **m_localMTU**，
+//   也就是 BLEDevice::setMTU(517) 自己设进去的那个本地值，不是协商结果。
+//   拿它当上限会算出 514，永远走"装得下"分支 —— 恰好在最需要分片的设备上失效。
+//   所以这里按最保守的 20 字节硬编码。
+//
+// 协议：逐片 `REMAPDUMP:<p>:<正文片段>\n`，最后补一条 `REMAPDUMP:<p>:END\n` 收尾。
+// 网页按 prof 累积正文，收到 END 才算读完。
+#define BLE_NOTIFY_PAYLOAD_MAX 20
+#define BLE_NOTIFY_GAP_MS 12   // 片间必须留缝：BLE 通知不排队，贴太近后片会被合并丢弃
+
+static void bleNotifyRemapDump(int prof, const char* rules) {
+    if (pCharacteristic == nullptr) return;
+    char head[24];
+    snprintf(head, sizeof(head), "REMAPDUMP:%d:", prof);
+    const size_t headLen = strlen(head);
+    // 前缀 + 收尾行都装不下就没得救了（TOTAL_PROFILES 只有一位数，实际不可能）
+    if (headLen + 5 >= BLE_NOTIFY_PAYLOAD_MAX) return;
+    const size_t chunk  = BLE_NOTIFY_PAYLOAD_MAX - headLen - 1;   // 留 1 字节给 '\n'
+    const size_t bodyLen = rules ? strlen(rules) : 0;
+
+    char line[BLE_CMD_BUF_SIZE];
+    if (bodyLen > 0) {
+        for (size_t off = 0; off < bodyLen; off += chunk) {
+            size_t n = bodyLen - off;
+            if (n > chunk) n = chunk;
+            int m = snprintf(line, sizeof(line), "%s%.*s\n", head, (int)n, rules + off);
+            bleNotifyCritical(line, (size_t)m);
+            delay(BLE_NOTIFY_GAP_MS);
+        }
+    }
+    int m = snprintf(line, sizeof(line), "REMAPDUMP:%d:END\n", prof);
+    bleNotifyCritical(line, (size_t)m);
+}
+
 // 节流：100ms / 10Hz。BLE 写一次 attribute + notify 约 7~15ms,
 // 50Hz 节流在 NimBLE 那边的发送队列里还是会堆几十包,流转发 5 秒就把
 // 队列填满,后面 REMAPDUMP / LOGOSTATUS 等关键响应发不出。
@@ -619,8 +697,10 @@ static void pushLogLine(const char* line) {
     logRingLen += n + 1;
 
     // 流转发：节流 10Hz（100ms/条），每条 notify 末尾加 \n
+    // 关键响应刚发完的那 250ms 内让路（见 bleNotifyCritical）
     if (logStreamOn && pCharacteristic != nullptr && deviceConnected) {
         unsigned long now = millis();
+        if (now < bleCriticalNotifyUntil) return;
         if ((unsigned long)(now - logLastNotifyMs) >= 100) {
             logLastNotifyMs = now;
             char out[BLE_CMD_BUF_SIZE];
@@ -656,9 +736,25 @@ static void handleCommand(const String& cmd);   // 真正定义在文件后段�
 // 表现就是"M1 相关的下发一律失败 / 不生效"，而短的（ALERT:RED）反而好使。
 //
 // 这里改成和 USB HID 那条通道一样的纪律：先把字节攒成一行，遇到 \n 提交；
-// 没带 \n 的老客户端（以及网页上零散的单包指令）靠"包间静默 15ms"兜底提交。
+// 没带 \n 的老客户端（以及网页上零散的单包指令）靠"包间静默"兜底提交。
 // 这块缓冲只在 NimBLE 主机任务里被读写，不跨任务，不需要加锁。
-#define BLE_LINE_IDLE_MS 15
+//
+// ⚠ 这个值从 15 提到 80，是修"下发 2 条规则只存进 1 条"的根因。
+//
+//   网页 sendBLE() 发的是 `str + "\n"` 一个**逻辑值**，但 Web Bluetooth 的
+//   writeValue 会按协商出来的 ATT MTU 把它拆成多个物理包。MTU 协商失败时
+//   （手机端浏览器很常见，落到 20~185 字节）一条 29 字节的
+//   `REMAP:0:clear:224,227;227,224\n` 会被切成 20 + 9 两个包。
+//
+//   15ms 的空闲判定会在**两个包之间**误判成"这条发完了"，于是固件先把
+//   `REMAP:0:clear:224,227;22` 提交掉：解析循环正确地只认出第一条
+//   224,227，尾巴 `7,224` 变成一条谁也不认识的垃圾行。屏幕上于是显示
+//   "1 条已保存"，而用户明明下发了 2 条 —— 交换 Ctrl↔Win 需要的正是第 2 条。
+//
+//   80ms 远大于任何真实的包间隔（同一个 writeValue 的续包是毫秒级连着来的），
+//   又短到不会让不带 \n 的老客户端觉得卡。真正的主终止符始终是 \n，
+//   空闲只是兜底，放宽它不会拖慢网页路径。
+#define BLE_LINE_IDLE_MS 80
 static char          bleLine[BLE_CMD_BUF_SIZE];
 static uint16_t      bleLineLen  = 0;
 static unsigned long bleLineLastMs = 0;
@@ -1191,7 +1287,7 @@ static void gotoMainScreen(void) {
 // ===========================
 static void handleCommand(const String& cmd);
 static void scanKeyboardMatrix(void);
-static void recoverI2CBus(void);
+static bool recoverI2CBus(void);
 void bootDetailTick(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
@@ -1232,6 +1328,9 @@ static void update_setting_caltemp_display(void);
 static void update_setting_light_display(void);
 static void update_recording_display(void);
 static void build_recording(void);
+static void build_elog(void);
+static void elogKey(uint16_t baseKey);
+static void elog_notePrevRun(void);
 static void finishMacroRecording(const String& targetKey);
 static void enterRecording(void);
 static void advanceRecordingStage(void);
@@ -1270,7 +1369,13 @@ static bool sht31_read_raw(uint16_t& rawT, uint16_t& rawH) {
 
 static void sht31_update(void) {
     uint16_t rawT, rawH;
-    if (!sht31_read_raw(rawT, rawH)) return;
+    if (!sht31_read_raw(rawT, rawH)) {
+        // 读取失败（总线错 / 返回字节数不对 / CRC 不过）一律记一条。
+        // 去重会把它合并成一条并累加次数，所以 15 分钟一次的周期读失败
+        // 不会刷屏，但"这颗传感器其实一直读不出来"会变成一条醒目的记录。
+        ELWARN("SHT", "读取失败 温湿度保持上次数值");
+        return;
+    }
     float t = -45.0f + 175.0f * ((float)rawT / 65535.0f);
     float h = 100.0f * ((float)rawH / 65535.0f);
     // 偏移直接加，不要再叠一个基准值 —— 见 SHT_TEMP_OFFSET_DEFAULT 上面的说明
@@ -1332,7 +1437,12 @@ class MyCallbacks : public BLECharacteristicCallbacks {
             char c = (char)raw[i];
             if (c == '\0') continue;                       // 补长度的 0，不是内容
             if (c == '\n' || c == '\r') { bleLineSubmit(); continue; }
-            if (bleLineLen >= BLE_CMD_BUF_SIZE - 1) bleLineSubmit();   // 超长行，断掉重来
+            // 超长行：**丢尾部**，不要 bleLineSubmit()。
+            // 提交的话，剩下的字节会变成一条全新的命令被 handleCommand 解析 ——
+            // 那正是"一条长命令被劈成两半、半截也能匹配上"的毒：截断点
+            // 只要落在冒号之后，残行照样是个合法命令，会静默改坏配置。
+            // 丢尾巴最坏只是这条超长命令不完整、匹配不上，配置不会错。
+            if (bleLineLen >= BLE_CMD_BUF_SIZE - 1) continue;
             bleLine[bleLineLen++] = c;
         }
         bleLineLastMs = now;
@@ -1975,13 +2085,15 @@ static void abortLogoUpload(const char* reason) {
     logoRxDone  = false;
     logoRxActive = false;
     LOG_PORT.printf("[WALLPAPER] abort: %s\n", reason);
+    // 传输中断是"用户/主机那边出问题"，但对排查很有价值：能看出
+    // 壁纸是不是经常传到一半就断（多半是蓝牙距离或网页被关掉了）。
+    ELWARN("WALL", "壁纸传输中断 %s", reason);
     triggerHud("壁纸传输", reason, lv_color_hex(CLR_RED));
     // 失败也要回报，否则网页只能干等到超时
-    if (pCharacteristic) {
+    {
         char out[80];
         snprintf(out, sizeof(out), "LOGOSTATUS:FAIL:%.40s", reason);
-        pCharacteristic->setValue((uint8_t*)out, strlen(out));
-        pCharacteristic->notify();
+        bleNotifyCritical(out, strlen(out));
     }
 }
 
@@ -2113,10 +2225,9 @@ static void finishLogoUpload(void) {
     // 主动回报：网页轮询 LOGO_STATUS 时能拿到确定答案。
     // 以前网页"字节发完"就 alert 上传成功，那是假成功 —— BLE 写成功只说明
     // 数据交给蓝牙了，不代表键盘解出来、落盘了。
-    if (pCharacteristic) {
+    {
         char okmsg[24] = "LOGOSTATUS:OK:0/0";
-        pCharacteristic->setValue((uint8_t*)okmsg, strlen(okmsg));
-        pCharacteristic->notify();
+        bleNotifyCritical(okmsg, strlen(okmsg));
     }
 }
 
@@ -2608,6 +2719,9 @@ static void handleMenuSelect(void) {
         case 11: // 屏保风格（黑屏 / 壁纸 / 时间温湿度）
             cycleScreensaverMode();
             break;
+        case 12: // 错误日志：重启后在这里翻出错内容
+            build_elog();
+            break;
     }
 }
 
@@ -2701,12 +2815,16 @@ static void build_menu(void) {
             lv_label_set_text(num, numBuf[i]);
             lv_obj_align(num, LV_ALIGN_RIGHT_MID, -12, 0);
 
-            // 当前值角标：目前只有「屏保风格」用得上，其余项留空、设成透明
+            // 右侧当前值角标：屏保风格显示当前模式、错误日志显示错误条数，
+            // 其余项留空并设成透明。用显式下标判断（不是 MENU_ITEMS-1，
+            // 追加菜单项时那个"最后一项"假设会失效）。
             lv_obj_t* val = lv_label_create(btn);
             mkLabel(val, &lv_font_simsun_16_cjk, CLR_ACCENT);
             lv_label_set_text(val, "");
             lv_obj_align(val, LV_ALIGN_RIGHT_MID, -34, 0);
-            if (i != MENU_ITEMS - 1) lv_obj_add_flag(val, LV_OBJ_FLAG_HIDDEN);
+            if (i != MENU_IDX_SAVER && i != MENU_IDX_LOG) {
+                lv_obj_add_flag(val, LV_OBJ_FLAG_HIDDEN);
+            }
             menu_items_val[i] = val;
 
             menu_items[i] = btn;
@@ -2714,9 +2832,25 @@ static void build_menu(void) {
     }
 
     // 屏保风格那一项把当前值直接顶在条目右边，省得进二级界面才知道选了什么
-    if (menu_items_val[MENU_ITEMS - 1]) {
-        setText(menu_items_val[MENU_ITEMS - 1],
+    if (menu_items_val[MENU_IDX_SAVER]) {
+        setText(menu_items_val[MENU_IDX_SAVER],
                 saverMode < TOTAL_SAVER_MODES ? saverModeNames[saverMode] : "");
+    }
+    // 错误日志项同理：直接把错误条数顶在右边。这样**不用进日志页也知道
+    // 有没有东西出过问题** —— 之前"屏上不出提示、只能靠猜"就是最难查的一类。
+    if (menu_items_val[MENU_IDX_LOG]) {
+        int errs = elog_error_count();
+        if (errs > 0) {
+            static char ebuf[16];
+            snprintf(ebuf, sizeof(ebuf), "%d 条", errs);
+            setText(menu_items_val[MENU_IDX_LOG], ebuf);
+            lv_obj_set_style_text_color(menu_items_val[MENU_IDX_LOG],
+                lv_color_hex(CLR_RED), LV_PART_MAIN);
+        } else {
+            setText(menu_items_val[MENU_IDX_LOG], "无");
+            lv_obj_set_style_text_color(menu_items_val[MENU_IDX_LOG],
+                lv_color_hex(CLR_GREEN), LV_PART_MAIN);
+        }
     }
 
     // ---- 更新页码 ----
@@ -3602,6 +3736,301 @@ static void cancelRecording(void) {
     gotoMainScreen();
 }
 
+// ===========================
+// 错误日志查看页
+// ===========================
+//
+// 这块屏存在的理由：整块板只有一个 USB 口，做键盘时被 HID 占死，
+// 串口日志和 BLE 网页日志在现场都指望不上。出错信息只能留在芯片自己的
+// flash 里，靠这一页在重启后翻出来。详见 elog.h 顶部。
+//
+// 一条日志占两行（第一行 时间/级别/次数，第二行 正文），正文允许再折一行，
+// 所以行高是按"最坏情况 = 正文两行"算的：
+//   3(上留白) + 12(数字行) + 1(行间隙) + 19×2(中文正文两行) + 2(下留白) = 56
+// 这里的 19 是 lv_font_simsun_16_cjk 的 line_height（字库 .line_height 字段实测值）。
+//
+// 纵向预算（屏 240 高）：
+//   12~31    标题「错误日志」+ 右上「共 N 条」
+//   36~210   列表：3 行 × 58
+//   215~234  底部按键提示
+//
+// 为什么只有 3 行：正文要留两行的余量（一条崩溃记录能到 20 多个字，
+// 206px 宽一行只放得下 12 个汉字），行高就压到 58。4 行 × 58 = 232 就顶到
+// 提示条了。翻页用 PgUp/PgDn 一次跳 3 行。
+//
+// 为什么没有"错误/警告/信息 各多少条"的汇总行：它和每行自带的级别字样
+// + 左侧色条 + 菜单里那条红色角标信息重复，而这 20px 正是放不下第三条的
+// 那 20px。错误条数在菜单第 13 项的角标上，进这一页之前就能看到。
+#define ELOG_ROW_H      58
+#define ELOG_ROWS       3
+#define ELOG_LIST_TOP   36
+#define ELOG_SEL_MAX    (ELOG_CAP - 1)
+
+static lv_obj_t* scr_elog = nullptr;
+static lv_obj_t* elog_cont = nullptr;                 // 裁剪窗口
+static lv_obj_t* elog_lbl_count = nullptr;            // 右上角「共 N 条」
+static lv_obj_t* elog_lbl_empty = nullptr;            // 没有记录时的提示
+static lv_obj_t* elog_row[ELOG_ROWS] = { nullptr };   // 可见的行容器（ELOG_ROWS 个）
+static int elogScroll = 0;                            // 窗口第一条的逻辑下标
+static int elogSel = 0;                               // 当前选中条（0 = 最新）
+static bool elogArmClear = false;                     // DEL 连按两次才真清空
+
+static uint32_t elogLevelColor(uint8_t lv) {
+    switch (lv) {
+        case EL_LVL_ERR:  return CLR_RED;
+        case EL_LVL_WARN: return CLR_AMBER;
+        default:          return CLR_ACCENT;
+    }
+}
+static const char* elogLevelCN(uint8_t lv) {
+    switch (lv) {
+        case EL_LVL_ERR:  return "错误";
+        case EL_LVL_WARN: return "警告";
+        default:          return "信息";
+    }
+}
+
+// 一条日志的"第一行"：时间 + 级别 + 标签 + 次数。
+// 时间优先用墙钟；系统时间没校过就退成"运行 N 分"，免得显示一排 1970 年。
+static void elogFormatTime(const ELogRec* r, char* out, size_t n) {
+    if (r->epoch >= 1577836800UL) {
+        time_t t = (time_t)r->epoch;
+        struct tm tmv;
+        if (localtime_r(&t, &tmv)) {
+            snprintf(out, n, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+            return;
+        }
+    }
+    snprintf(out, n, "%d分", (int)(r->stampMs / 60000UL));
+}
+
+// 刷新列表。elogSel 是"从最新往回数第几条"（0 = 最新），
+// 转成逻辑下标要用 total-1-elogSel —— 日志是**新的在上**，符合看日志的直觉。
+static void elogRefresh(void) {
+    int total = elog_count();
+    if (total == 0) {
+        setText(elog_lbl_count, "共 0 条");
+        for (int i = 0; i < ELOG_ROWS; i++) {
+            if (elog_row[i]) setHidden(elog_row[i], true);
+        }
+        if (elog_lbl_empty) {
+            // 没记录时判"时间未校准"只能看**当前**系统时间：elog_wallValid()
+            // 是去翻已有记录的，这里一条都没有，它必然返回 false，用不了。
+            bool clockOk = ((uint32_t)time(nullptr) >= 1577836800UL);
+            setText(elog_lbl_empty, clockOk ? "没有错误 一切正常" : "没有错误 时间未校准");
+            setHidden(elog_lbl_empty, false);
+        }
+        return;
+    }
+    if (elog_lbl_empty) setHidden(elog_lbl_empty, true);
+
+    if (elogSel >= total) elogSel = total - 1;
+    if (elogSel < 0) elogSel = 0;
+
+    // 让选中项始终落在可见窗口里
+    int selLogical = total - 1 - elogSel;
+    if (selLogical < elogScroll) elogScroll = selLogical;
+    if (selLogical >= elogScroll + ELOG_ROWS) elogScroll = selLogical - ELOG_ROWS + 1;
+    if (elogScroll > total - ELOG_ROWS) elogScroll = total - ELOG_ROWS;
+    if (elogScroll < 0) elogScroll = 0;
+
+    char cnt[16];
+    snprintf(cnt, sizeof(cnt), "共 %d 条", total);
+    setText(elog_lbl_count, cnt);
+
+    // 画 ELOG_ROWS 个可见行
+    for (int i = 0; i < ELOG_ROWS; i++) {
+        lv_obj_t* row = elog_row[i];
+        if (row == nullptr) continue;
+        int li = elogScroll + i;
+        if (li >= total) { setHidden(row, true); continue; }
+        setHidden(row, false);
+
+        const ELogRec* r = elog_get(li);
+        if (r == nullptr) { setHidden(row, true); continue; }
+        bool isSel = (li == selLogical);
+        uint32_t lc = elogLevelColor(r->level);
+
+        // 底色：选中项抬升一层，一眼能看出光标在哪
+        lv_obj_set_style_bg_color(row, lv_color_hex(isSel ? CLR_SURFACE_2 : CLR_SURFACE),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_border_color(row, lv_color_hex(isSel ? lc : CLR_STROKE),
+                                      LV_PART_MAIN);
+
+        // 子对象下标必须和建行时的创建顺序对上：bar=0, l1=1(ASCII 首行), l2=2(中文正文)
+        lv_obj_t* bar = lv_obj_get_child(row, 0);   // 左侧级别色条
+        lv_obj_t* l1   = lv_obj_get_child(row, 1);   // 时间 · 模块 · 次数
+        lv_obj_t* l2   = lv_obj_get_child(row, 2);   // 级别 + 正文
+
+        // 首行纯 ASCII：时间 + 模块标签 + 重复次数
+        char tbuf[16];
+        elogFormatTime(r, tbuf, sizeof(tbuf));
+        char head[64];
+        if (r->count > 1) {
+            snprintf(head, sizeof(head), "%s  %s  x%u", tbuf, r->tag, (unsigned)r->count);
+        } else {
+            snprintf(head, sizeof(head), "%s  %s", tbuf, r->tag);
+        }
+        setText(l1, head);
+        lv_obj_set_style_text_color(l1, lv_color_hex(isSel ? CLR_TEXT_DIM : CLR_TEXT_MUTE),
+                                    LV_PART_MAIN);
+
+        // 第二行：级别字样 + 正文。级别用字而不是只靠颜色，色觉障碍 /
+        // 小屏反光下也读得出来 —— 和通知面板"不靠颜色下判断"是同一个原则。
+        char body[ELOG_MSG_MAX + 16];
+        snprintf(body, sizeof(body), "%s %s", elogLevelCN(r->level), r->msg);
+        setText(l2, body);
+        lv_obj_set_style_text_color(l2, lv_color_hex(isSel ? CLR_TEXT : CLR_TEXT_DIM),
+                                    LV_PART_MAIN);
+
+        if (bar) {
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(bar, lv_color_hex(lc), LV_PART_MAIN);
+        }
+    }
+}
+
+static void build_elog(void) {
+    if (scr_elog == nullptr) {
+        scr_elog = lv_obj_create(NULL);
+        settingShell(scr_elog, "错误日志", "ERROR LOG");
+
+        // settingShell 默认的提示语是设置页那套，这里换成日志页的
+        lv_obj_t* shell_hint = lv_obj_get_child(scr_elog, 3);
+        if (shell_hint) {
+            setText(shell_hint, "↑↓ 翻看 · DEL 清空 · ESC 返回");
+            lv_obj_set_width(shell_hint, 224);
+            lv_label_set_long_mode(shell_hint, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_align(shell_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        }
+        // 标题竖条改成红色：这一页专门看故障，跟其它设置页一个颜色容易滑过去
+        lv_obj_t* shell_bar = lv_obj_get_child(scr_elog, 0);
+        if (shell_bar) {
+            lv_obj_set_style_bg_color(shell_bar, lv_color_hex(CLR_RED), LV_PART_MAIN);
+        }
+
+        // settingShell 的右上角本来放英文副标题（child 2）。这一页那个位置
+        // 要放「共 N 条」—— **复用同一个 label**，不要再新建一个：
+        // 两个 label 都在 TOP_RIGHT 会叠在一起，"共 N 条"被英文标题压住。
+        elog_lbl_count = lv_obj_get_child(scr_elog, 2);
+        if (elog_lbl_count) {
+            mkLabel(elog_lbl_count, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+            lv_obj_align(elog_lbl_count, LV_ALIGN_TOP_RIGHT, -14, 12);
+            lv_label_set_text(elog_lbl_count, "共 0 条");
+        }
+
+        // 列表容器：只裁剪，不画底。
+        // **必须清掉 SCROLLABLE**：默认 lv_obj_create 是可滚动的，内容超出
+        // 会被 LVGL 当成可滚动区域处理；我们要的是"超出就裁掉"。
+        elog_cont = lv_obj_create(scr_elog);
+        lv_obj_set_size(elog_cont, 232, ELOG_ROWS * ELOG_ROW_H);
+        lv_obj_align(elog_cont, LV_ALIGN_TOP_MID, 0, ELOG_LIST_TOP);
+        lv_obj_set_style_bg_opa(elog_cont, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(elog_cont, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(elog_cont, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(elog_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 空状态提示：一条记录都没有时显示，正常状态隐藏
+        elog_lbl_empty = lv_label_create(elog_cont);
+        mkLabel(elog_lbl_empty, &lv_font_simsun_16_cjk, CLR_GREEN);
+        lv_label_set_text(elog_lbl_empty, "没有错误 一切正常");
+        lv_obj_set_width(elog_lbl_empty, 224);
+        lv_label_set_long_mode(elog_lbl_empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(elog_lbl_empty, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(elog_lbl_empty, LV_ALIGN_CENTER, 0, -20);
+        setHidden(elog_lbl_empty, true);
+
+        // ELOG_ROWS 个行容器，建一次，之后只改文字和配色。
+        // 行内两行都用 TOP 锚（不用 BOTTOM 锚）：字库 line_height 是 19，
+        // 贴着底锚会把第一行顶出容器，两行文字直接压在一起。
+        for (int i = 0; i < ELOG_ROWS; i++) {
+            lv_obj_t* row = lv_obj_create(elog_cont);
+            lv_obj_set_size(row, 228, ELOG_ROW_H - 2);   // 行间距 2px
+            lv_obj_set_pos(row, 0, i * ELOG_ROW_H);
+            mkCard(row, CLR_SURFACE, 6);
+
+            // 左侧级别色条
+            lv_obj_t* bar = lv_obj_create(row);
+            lv_obj_set_size(bar, 3, ELOG_ROW_H - 16);
+            lv_obj_set_pos(bar, 1, 8);
+            lv_obj_set_style_bg_color(bar, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+            lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+            // 第一行：时间 · 模块标签 · 次数。
+            //
+            // ⚠ 这里**必须用 montserrat_12**（纯 ASCII 字体），因为内容全是
+            // ASCII：时间数字走不了中文字库。**反过来不行** —— montserrat
+            // 没有汉字字形，把"错误/警告/信息"这种中文塞进 montserrat 的 label
+            // 会一个字都画不出来（字体回退只从主字体指向它配的 fallback，
+            // 不会反向生效）。所以级别字样统一放到下面那行中文里。
+            lv_obj_t* l1 = lv_label_create(row);
+            mkLabel(l1, &lv_font_montserrat_12, CLR_TEXT_MUTE);
+            lv_label_set_text(l1, "");
+            lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 10, 3);
+
+            // 第二行：**级别字样 + 正文**（16px 中文，行高 19，可折两行）。
+            // 级别放在正文前面而不是单独一行，是为了把行高压回 58：
+            // 每条只占两行，三条就填满列表区。
+            lv_obj_t* l2 = lv_label_create(row);
+            mkLabel(l2, &lv_font_simsun_16_cjk, CLR_TEXT);
+            lv_label_set_text(l2, "");
+            lv_obj_set_width(l2, 206);
+            lv_label_set_long_mode(l2, LV_LABEL_LONG_WRAP);
+            lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 10, 17);
+
+            elog_row[i] = row;
+        }
+    }
+
+    elogScroll = 0;
+    elogSel = 0;
+    elogArmClear = false;
+    elogRefresh();
+    showScreen(scr_elog);
+    currentSysMode = SYS_MODE_ELOG;
+}
+
+// 日志页按键：↑↓ 翻、DEL 清空（两次确认）、ESC/MC 回菜单
+static void elogKey(uint16_t baseKey) {
+    if (baseKey == KEY_UP_ARROW) {
+        if (elogSel < ELOG_SEL_MAX) elogSel++;
+        elogArmClear = false;
+    } else if (baseKey == KEY_DOWN_ARROW) {
+        if (elogSel > 0) elogSel--;
+        elogArmClear = false;
+    } else if (baseKey == KEY_PAGE_UP) {
+        elogSel = (elogSel + ELOG_ROWS < ELOG_SEL_MAX) ? elogSel + ELOG_ROWS : ELOG_SEL_MAX;
+        elogArmClear = false;
+    } else if (baseKey == KEY_PAGE_DOWN) {
+        elogSel = (elogSel >= ELOG_ROWS) ? elogSel - ELOG_ROWS : 0;
+        elogArmClear = false;
+    } else if (baseKey == KEY_DELETE) {
+        // 清空是不可撤销的，所以要按两次：第一次只提示，第二次才真删。
+        if (!elogArmClear) {
+            elogArmClear = true;
+            triggerHud("清空日志", "再按一次删除键", lv_color_hex(CLR_AMBER));
+            return;
+        }
+        elog_clear();
+        elogScroll = 0;
+        elogSel = 0;
+        elogArmClear = false;
+        elogRefresh();
+        triggerHud("错误日志", "已清空", lv_color_hex(CLR_GREEN));
+    } else if (baseKey == KEY_ESC || baseKey == K_MC) {
+        elogArmClear = false;
+        // 回**菜单**而不是主屏：这一页是从菜单进来的，回菜单顺手还能点别的项
+        currentSysMode = SYS_MODE_MENU;
+        build_menu();
+    } else {
+        elogArmClear = false;   // 其它键顺手解除待确认状态
+    }
+    elogRefresh();
+}
+
 static void finishMacroRecording(const String& targetKey) {
     if (recKeyCount == 0) {
         triggerHud("宏录制", "没有录到按键", lv_color_hex(CLR_RED));
@@ -3837,6 +4266,7 @@ static void cancelSettingScreen(void) {
 static inline uint16_t normalizeRemapKey(uint16_t code);
 
 void loadRemapsFromStorage() {
+    int total = 0;
     for (int p = 0; p < TOTAL_PROFILES; p++) {
         char key[16];
         snprintf(key, sizeof(key), "rmp_cnt_%d", p);
@@ -3851,7 +4281,13 @@ void loadRemapsFromStorage() {
             profileRemaps[p][i].fromKey = normalizeRemapKey((uint16_t)(val >> 16));
             profileRemaps[p][i].toKey = normalizeRemapKey((uint16_t)(val & 0xFFFF));
         }
+        total += remapCounts[p];
     }
+    // 开机把"NVS 里到底还剩几条"喊出来。断电后配置消失时，这一行就是判据：
+    // 这里报 0 而关机前屏幕显示过"已保存"，说明写盘那步没成（分区满了 /
+    // 写失败被忽略），而不是重启逻辑有问题。
+    if (total > 0) ELINFO("REMAP", "开机从NVS恢复 %d 条", total);
+    else          ELINFO("REMAP", "开机NVS里没有任何映射");
 }
 
 void switchProfile(uint8_t profIdx) {
@@ -4468,8 +4904,14 @@ static void scanKeyboardMatrix(void) {
         Wire.beginTransmission(MCP23017_ADDR);
         if (Wire.endTransmission() != 0) {
             ct_mark(CT_S_SCAN_RECOVER);
-            recoverI2CBus();
-            return;
+            // 探测失败先记一条（"总线失联"），恢复结果由 recoverI2CBus()
+            // 自己在失败时再记一条"恢复失败"。两条分开的意义是：
+            // 光看"恢复失败"不知道是偶发还是持续，光看"失联"不知道有没有救回来。
+            ELWARN("I2C", "芯片无响应 正在恢复总线");
+            if (!recoverI2CBus()) {
+                return;   // 没救回来，这一轮扫描直接跳过（下面读到的全是垃圾）
+            }
+            ELINFO("I2C", "总线已恢复");
         }
     }
 
@@ -4561,15 +5003,24 @@ static void scanKeyboardMatrix(void) {
                         // 原版里 K_MC 在界面态的语义是"退出"，只有回到主界面才是"进入菜单"。
                         const bool inRecMode = (currentSysMode == SYS_MODE_REC_SEQ
                                                 || currentSysMode == SYS_MODE_REC_CMB);
+                        const bool inElogMode = (currentSysMode == SYS_MODE_ELOG);
                         const bool inUiMode = (currentSysMode == SYS_MODE_MENU)
                                               || IS_SETTING_MODE(currentSysMode)
-                                              || inRecMode;
+                                              || inRecMode
+                                              || inElogMode;
 
                         if (inUiMode) {
                             // ---- 界面态：这一整块把按键吃干净，一律不发到主机 ----
 
+                            // 错误日志页：上下翻 / DEL 清空 / ESC 回菜单。
+                            // 必须排在菜单分支**之前**判断吗？不必 —— SYS_MODE_ELOG
+                            // 和 SYS_MODE_MENU 是互斥的 currentSysMode，顺序无所谓，
+                            // 但放在最前面读起来更清楚。
+                            if (inElogMode) {
+                                elogKey(baseKey);
+                            }
                             // 菜单：方向键移动 / 回车选中 / ESC·MC 退回主屏
-                            if (currentSysMode == SYS_MODE_MENU) {
+                            else if (currentSysMode == SYS_MODE_MENU) {
                                 if (baseKey == KEY_DOWN_ARROW || baseKey == KEY_RIGHT_ARROW) {
                                     menuSel = (menuSel + 1) % MENU_ITEMS;
                                     build_menu();
@@ -4745,18 +5196,29 @@ static void scanKeyboardMatrix(void) {
 // ===========================
 // I2C 恢复
 // ===========================
-static void recoverI2CBus(void) {
+// 返回 true = 总线和 MCP23017 都救回来了。
+//
+// 这条路径以前是静默的：begin_I2C 失败也照样返回，调用方无从判断，
+// 于是"键盘突然失灵"这件事在日志里一个字都没有 —— 而它恰恰是
+// 最需要留证的一类故障（总线受干扰 / 接触不良 / 上电时序没满足）。
+// 现在失败会直接进错误日志，菜单里能翻到"总线恢复失败 x N 次"。
+static bool recoverI2CBus(void) {
     Wire.end();
     delay(10);
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000);
     Wire.setTimeOut(25);
-    if (mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
-        for (int c = 0; c < NUM_COLS; c++) {
-            mcp.pinMode(c, OUTPUT);
-            mcp.digitalWrite(c, HIGH);
-        }
+    if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
+        // 去重会把反复的同类失败合并成一条并累加次数，
+        // 所以这里可以放心每次都记。
+        ELERR("I2C", "总线恢复失败 键盘可能失灵");
+        return false;
     }
+    for (int c = 0; c < NUM_COLS; c++) {
+        mcp.pinMode(c, OUTPUT);
+        mcp.digitalWrite(c, HIGH);
+    }
+    return true;
 }
 
 // ===========================
@@ -4882,6 +5344,7 @@ static void handleCommand(const String& cmd) {
                     remapCounts[prof] = 0;
 
                     int start = 0;
+                    int nvsFail = 0;
                     while (start < rules.length() && remapCounts[prof] < MAX_REMAP_RULES) {
                         int semicolon = rules.indexOf(';', start);
                         String rule = (semicolon > 0) ? rules.substring(start, semicolon) : rules.substring(start);
@@ -4893,50 +5356,125 @@ static void handleCommand(const String& cmd) {
                             char itemKey[20];
                             snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, remapCounts[prof]);
                             uint32_t val = ((uint32_t)profileRemaps[prof][remapCounts[prof]].fromKey << 16) | profileRemaps[prof][remapCounts[prof]].toKey;
-                            preferences.putUInt(itemKey, val);
+                            // ⚠ 必须看返回值。Preferences::put* 失败时返回 0，最常见的
+                            //   失败原因是 NVS 分区写不进**新键**（分区只有 20KB，
+                            //   NVS 是只增不减的日志结构存储）。
+                            //   以前这里完全不看返回值，屏幕照旧显示"已保存"、
+                            //   按键当场也生效（RAM 里有这份表），断电后 NVS 里
+                            //   什么都没有 —— 表现就是"配好了当场能用，断一次电全没了，
+                            //   再配一次还是不行"。而单条规则通常能写进去（新键少、
+                            //   旧条目还能就地覆盖），所以"只配一条正常、配两条就丢"
+                            //   这种不对称正好指向这里。
+                            if (preferences.putUInt(itemKey, val) == 0) nvsFail++;
                             remapCounts[prof]++;
                         }
-                        start = (semicolon > 0) ? semicolon + 1 : rules.length();
+                        // semicolon == 0 也当作分隔符：规则串以 ';' 开头时
+                        // indexOf 返回 0，而旧代码的 `semicolon > 0` 会把它当"没有分号"，
+                        // 于是把 ";224,227;227,224" 整段当成一条去 parse。
+                        start = (semicolon >= 0) ? semicolon + 1 : rules.length();
                     }
                     char key[16];
                     snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
-                    preferences.putInt(key, remapCounts[prof]);
-                    char buf[24];
-                    snprintf(buf, sizeof(buf), "%d 条已保存", remapCounts[prof]);
-                    LOG_PORT.printf("[REMAP] prof=%d saved %d rules\n", prof, remapCounts[prof]);
-                    triggerHud("按键重映射", buf, lv_color_hex(CLR_GREEN));
+                    if (preferences.putInt(key, remapCounts[prof]) == 0) nvsFail++;
+
+                    // 读回校验：RAM 里有不等于 flash 里有。这里把 NVS 里真正读回来的
+                    // 数字段数和每一条的值都重新比一遍，以**校验结果**为准，
+                    // 而不是拿 RAM 里的 remapCounts 去报喜。
+                    int intended = remapCounts[prof];
+                    int stored = preferences.getInt(key, -1);
+                    if (stored != intended) nvsFail++;
+                    int verified = 0;
+                    for (int i = 0; i < intended; i++) {
+                        char itemKey[20];
+                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+                        uint32_t back = preferences.getUInt(itemKey, 0xFFFFFFFFUL);
+                        uint16_t rf = normalizeRemapKey((uint16_t)(back >> 16));
+                        uint16_t rt = normalizeRemapKey((uint16_t)(back & 0xFFFF));
+                        if (rf == profileRemaps[prof][i].fromKey &&
+                            rt == profileRemaps[prof][i].toKey) {
+                            verified++;
+                        }
+                    }
+                    if (nvsFail > 0) {
+                        // flash 里的东西不可信 → 把 RAM 也对齐成"实际存住的那部分"，
+                        // 否则当次运行看起来正常、下次开机又变样，更没法查。
+                        remapCounts[prof] = verified;
+                    }
+
+                    char buf[32];
+                    LOG_PORT.printf("[REMAP] prof=%d want=%d verified=%d nvsFail=%d\n",
+                                    prof, intended, verified, nvsFail);
+                    if (nvsFail > 0) {
+                        // 存不进去就把原因摆到屏幕上，别再让用户以为"保存成功了"。
+                        snprintf(buf, sizeof(buf), "只存住 %d/%d 条", verified, intended);
+                        ELERR("REMAP", "方案%d 存盘失败 %s NVS分区可能已满", prof + 1, buf);
+                        triggerHud("按键重映射", buf, lv_color_hex(CLR_RED));
+                    } else {
+                        snprintf(buf, sizeof(buf), "%d 条已保存", verified);
+                        ELINFO("REMAP", "方案%d 保存 %d 条", prof + 1, verified);
+                        triggerHud("按键重映射", buf, lv_color_hex(CLR_GREEN));
+                    }
                 } else if (wantClear) {
                     LOG_PORT.printf("[REMAP] prof=%d cleared\n", prof);
+                    // ⚠ 清空分支以前只打 UART，不进错误日志 —— 于是"映射莫名其妙
+                    //   变 0 条"这种事在日志里查无实据。固件侧任何会让某个方案
+                    //   变空的路径都必须留痕，否则永远分不清是"没存进去"还是
+                    //   "被清掉了"。这条和上面的 保存/回读 行一起构成完整审计链：
+                    //   保存 N 条 → 回读 N 条 → （若出现）方案N 已清空。
+                    ELWARN("REMAP", "方案%d 已清空", prof + 1);
                     triggerHud("按键重映射", "已清空", lv_color_hex(CLR_AMBER));
                 }
             }
         }
     }
-    // REMAP:prof:read - 把这个方案现有的规则回读给网页
-    // （回读只能靠 BLE notify，所以这里往同一个特征里 notify 一条 REMAPDUMP:）
+    // REMAPREAD:p - 把方案 p 现有的规则回读给网页
+    // （回读只能靠 BLE notify。正文超 20 字节时分片发，详见 bleNotifyRemapDump）
     else if (cmd.startsWith("REMAPREAD:")) {
         int prof = cmd.substring(9).toInt();
-        char out[BLE_CMD_BUF_SIZE];
-        if (prof < 0 || prof >= TOTAL_PROFILES) {
-            snprintf(out, sizeof(out), "REMAPDUMP:%d:ERR\n", prof);
-        } else {
-            int n = snprintf(out, sizeof(out), "REMAPDUMP:%d:", prof);
-            for (int i = 0; i < remapCounts[prof] && n < (int)sizeof(out) - 16; i++) {
-                n += snprintf(out + n, sizeof(out) - n, "%s%u,%u",
+        // 这里只拼**正文**（"128,131;131,128"），头部和收尾交给 bleNotifyRemapDump 分片。
+        // 旧代码在这里自己拼完整的 "REMAPDUMP:<p>:<rules>\n"：2 条规则整行 28 字节，
+        // 超过手机端浏览器常见的 20 字节 ATT 载荷上限，**整条通知被协议栈丢掉**，
+        // 网页只等到来一个超时 → 弹「没能从键盘读回确认」、列表刷新成 0 条。
+        // 1 条规则刚好 20 字节能过、2 条就丢，这个不对称一直没人认出来。
+        char body[BLE_CMD_BUF_SIZE];
+        body[0] = '\0';
+        int n = 0;
+        if (prof >= 0 && prof < TOTAL_PROFILES) {
+            for (int i = 0; i < remapCounts[prof] && n < (int)sizeof(body) - 16; i++) {
+                n += snprintf(body + n, sizeof(body) - n, "%s%u,%u",
                                i ? ";" : "",
                                profileRemaps[prof][i].fromKey, profileRemaps[prof][i].toKey);
             }
-            // 末尾补 \n：HTML 的 onBleNotify 是按 \n 切行（parts.pop 保留无换行的尾巴，
-            // 没有 \n 的 notify 会卡在 bleNotifyLines 里永远出不来 → 读回始终为 0 条。
-            // LOG:STREAM_ON/LOG:off / LOG:CLEARED 都带 \n，dump 类响应得跟上。
-            if (n < (int)sizeof(out) - 1) out[n++] = '\n';
-            out[n] = '\0';
+            body[n] = '\0';
         }
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)out, strlen(out));
-            pCharacteristic->notify();
+        // prof 越界时 body 保持空：网页只会收到一条孤零零的 END，语义是"读不到"。
+        bleNotifyRemapDump(prof, body);
+        // ⚠ 这里原来打的是 `[REMAP] read prof=%d -> %s`，把整条 out 原样灌进 LOG_PORT。
+        //   看着像"多打一条调试信息"，实际有两个害处：
+        //   1) LOG_PORT 会给每行加 "LOG:" 前缀再 notify，于是同一次读取会发出
+        //      **两条内容几乎相同**的 notify。BLE 通知不排队，客户端没 ACK 时
+        //      后一条会被合并丢弃 —— 网页两个并发的读回 waiter 里必有一个超时。
+        //   2) 网页 onBleNotify 里 `LOG:` 分支优先级高于前缀匹配（那是故意的，
+        //      免得 LOG 行截胡日志面板自己的 waiter），所以这条"兜底"行
+        //      **永远匹配不上** REMAPDUMP 前缀，看着像双保险实际是零保险，
+        //      还把整张映射表刷进网页日志面板。
+        //   只记条数、正文字节数和分片数 —— 分片数是要紧的：手机上 ATT 载荷只有
+        //   20 时一条规则 1 片、两条 2 片，对不上就说明分片协议又被改坏了。
+        const size_t bodyLen = strlen(body);
+        const size_t perFrag = (BLE_NOTIFY_PAYLOAD_MAX - 12 > 0) ? (BLE_NOTIFY_PAYLOAD_MAX - 12) : 1;
+        const size_t frags = bodyLen ? (bodyLen + perFrag - 1) / perFrag : 0;
+        LOG_PORT.printf("[REMAP] read prof=%d cnt=%d bytes=%u frags=%u\n", prof,
+                        (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0,
+                        (unsigned)bodyLen, (unsigned)(frags + 1));
+        ELINFO("REMAP", "方案%d 回读 %d 条 共%u字节", prof + 1,
+               (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0,
+               (unsigned)bodyLen);
+        // 被读的方案和当前生效的方案不是同一个时单独喊一句：网页下拉框选的方案
+        // 和键盘自己跑的方案本来就互相独立，存对了地方但按键不变时最容易混过去。
+        if (prof >= 0 && prof < TOTAL_PROFILES && prof != (int)currentProfile) {
+            ELWARN("REMAP", "读的是方案%d 键盘当前是方案%u", prof + 1,
+                   (unsigned)(currentProfile + 1));
         }
-        LOG_PORT.printf("[REMAP] read prof=%d -> %s", prof, out);
         char buf[24];
         snprintf(buf, sizeof(buf), "读取到 %d 条", (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0);
         triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
@@ -4964,10 +5502,7 @@ static void handleCommand(const String& cmd) {
             snprintf(out, sizeof(out), "MACRODUMP:%s:%s%s\n",
                      key.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
         }
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)out, strlen(out));
-            pCharacteristic->notify();
-        }
+        bleNotifyCritical(out, strlen(out));
         LOG_PORT.printf("[MACRODUMP] %s len=%u truncated=%d\n",
                         key.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
     }
@@ -5011,10 +5546,7 @@ static void handleCommand(const String& cmd) {
             snprintf(out, sizeof(out), "GKEYDUMP:%s:%s%s\n",
                      dumpTag.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
         }
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)out, strlen(out));
-            pCharacteristic->notify();
-        }
+        bleNotifyCritical(out, strlen(out));
         LOG_PORT.printf("[GKEYDUMP] %s len=%u truncated=%d\n",
                         dumpTag.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
     }
@@ -5032,10 +5564,7 @@ static void handleCommand(const String& cmd) {
             if (ph > 1) ph = 0;   // 容错:被人手动写过 NVS 时强行纠正
             char out[BLE_CMD_BUF_SIZE];
             snprintf(out, sizeof(out), "GKEYPHASE:%s:%u\n", key.c_str(), (unsigned)ph);
-            if (pCharacteristic) {
-                pCharacteristic->setValue((uint8_t*)out, strlen(out));
-                pCharacteristic->notify();
-            }
+            bleNotifyCritical(out, strlen(out));
             LOG_PORT.printf("[GKEYPHASE] %s = %u\n", key.c_str(), (unsigned)ph);
         }
     }
@@ -5051,10 +5580,7 @@ static void handleCommand(const String& cmd) {
             preferences.putUChar(phKey, 0);
             char out[BLE_CMD_BUF_SIZE];
             snprintf(out, sizeof(out), "GKEYPHASE:%s:0\n", key.c_str());
-            if (pCharacteristic) {
-                pCharacteristic->setValue((uint8_t*)out, strlen(out));
-                pCharacteristic->notify();
-            }
+            bleNotifyCritical(out, strlen(out));
             LOG_PORT.printf("[GKEYPHASE_RESET] %s -> 0\n", key.c_str());
             triggerHud("相位重置", key.c_str(), lv_color_hex(CLR_ACCENT));
         }
@@ -5227,26 +5753,17 @@ static void handleCommand(const String& cmd) {
     else if (cmd == "LOG:on") {
         logStreamOn = true;
         logLastNotifyMs = 0;            // 立即允许第一条(开流响应那条不卡)
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)"LOG:STREAM_ON\n", 15);
-            pCharacteristic->notify();
-        }
+        bleNotifyCritical("LOG:STREAM_ON\n", 15);
         LOG_PORT.println("[LOG] stream ON");
     }
     else if (cmd == "LOG:off") {
         logStreamOn = false;
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)"LOG:STREAM_OFF\n", 16);
-            pCharacteristic->notify();
-        }
+        bleNotifyCritical("LOG:STREAM_OFF\n", 16);
         LOG_PORT.println("[LOG] stream OFF");
     }
     else if (cmd == "LOG:clear") {
         logRingLen = 0;
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)"LOG:CLEARED\n", 12);
-            pCharacteristic->notify();
-        }
+        bleNotifyCritical("LOG:CLEARED\n", 12);
         LOG_PORT.println("[LOG] buffer cleared");
     }
     else if (cmd == "LOG:dump") {
@@ -5278,8 +5795,7 @@ static void handleCommand(const String& cmd) {
                     out[total]   = '\0';
                 }
                 if (total > 0) {
-                    pCharacteristic->setValue((uint8_t*)out, (size_t)total);
-                    pCharacteristic->notify();
+                    bleNotifyCritical(out, (size_t)total);
                     sent = true;
                 }
                 pos = end;
@@ -5292,11 +5808,9 @@ static void handleCommand(const String& cmd) {
             }
             if (!sent) {
                 // 缓冲空也要回一个,免得网页干等
-                pCharacteristic->setValue((uint8_t*)"LOGDUMP:\n", 9);
-                pCharacteristic->notify();
+                bleNotifyCritical("LOGDUMP:\n", 9);
             }
-            pCharacteristic->setValue((uint8_t*)"LOGDUMP:END\n", 13);
-            pCharacteristic->notify();
+            bleNotifyCritical("LOGDUMP:END\n", 13);
         }
         LOG_PORT.printf("[LOG] dump %u bytes\n", (unsigned)logRingLen);
     }
@@ -5454,11 +5968,14 @@ static void handleCommand(const String& cmd) {
                                          : (wpReady ? "OK" : "IDLE");
         snprintf(out, sizeof(out), "LOGOSTATUS:%s:%lu/%lu",
                  state, (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
-        if (pCharacteristic) {
-            pCharacteristic->setValue((uint8_t*)out, strlen(out));
-            pCharacteristic->notify();
-        }
-        LOG_PORT.printf("[WALLPAPER] status: %s\n", out);
+        bleNotifyCritical(out, strlen(out));
+        // 同 REMAPREAD：不要把 out 原样再灌一遍 LOG_PORT。
+        // 网页那边 waitBleNotify("LOGOSTATUS:") 是 waiter 路径，而带 "LOG:" 前缀的
+        // 这条在 onBleNotify 里会被日志分支先吃掉、永远匹配不上前缀，等于
+        // 白白发一次还多制造一条内容相同的 notify（BLE 会把连续相同通知合并掉）。
+        // 壁纸上传期间网页在高频轮询 LOGO_STATUS，多发一条的代价被放大。
+        LOG_PORT.printf("[WALLPAPER] status: %s:%lu/%lu\n", state,
+                        (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
     }
     // NOTIFY:text -> ALERT_GREEN
     else if (cmd.startsWith("NOTIFY:")) {
@@ -6350,6 +6867,56 @@ static void showBootDiagnostics(void) {
                   (unsigned)ct_prev.uptimeMs);
 }
 
+// 把"上一次是怎么结束的"补写成一条**持久**日志。
+//
+// 为什么必须在这里（也就是每次开机）做，而不是出错的那一刻：
+//   panic / 看门狗复位的那一刻，芯片已经直接重启了，flash 写不进去
+//   （而且 panic 里碰文件系统只会让复位更慢、风险更大）。
+//   真正能活过复位的只有 crash_trace.h 的 RTC 慢存 —— 所以开机后
+//   先把那份现场读出来，落成一条普通错误日志。
+//   这样"昨晚自己重启了"这件事，重启后在菜单里就能翻到完整描述，
+//   而不只是开机时一闪而过的那三张 HUD。
+static void elog_notePrevRun(void) {
+    esp_reset_reason_t why = esp_reset_reason();
+
+    // 断电重启 / 主动重启不记：那是正常行为，记一堆"启动"条目只会把
+    // 真正有用的错误挤掉（64 条槽位很宝贵）。
+    bool abnormal = (why != ESP_RST_POWERON && why != ESP_RST_DEEPSLEEP
+                     && why != ESP_RST_SW && why != ESP_RST_EXT);
+
+    // 本次启动事件。异常复位时降成警告级，正常启动只记一条信息级。
+    // 反复重启（跑不起来 → 反复重启）会连续产生多条"上次异常退出"，
+    // 靠 elog_add 的去重合并成一条并累加次数，一眼能看出"崩了 N 次"。
+    char boot[80];
+    snprintf(boot, sizeof(boot), "启动 原因:%s", resetReasonName(why));
+    if (abnormal) ELWARN("BOOT", "%s", boot);
+    else         ELINFO("BOOT", "%s", boot);
+
+    if (!abnormal) return;
+
+    if (ct_prev.magic == CT_MAGIC) {
+        const char* keyName = (ct_prev.keyCode == 0xFFFFFFFFUL)
+                              ? "无" : getKeyName((uint16_t)ct_prev.keyCode);
+        char msg[ELOG_MSG_MAX];
+        if (ct_prev.ready == 0) {
+            // 上一次连 setup 都没跑完 —— 死在启动流程里（多半是硬件/配置问题）
+            snprintf(msg, sizeof(msg), "上次死在启动中 阶段:%s", ctStageName(ct_prev.stage));
+        } else {
+            snprintf(msg, sizeof(msg), "上次%s于%s 运行%u秒 按键:%s",
+                     ct_prev.hang ? "卡死" : "崩溃",
+                     ctStageName(ct_prev.stage),
+                     (unsigned)(ct_prev.uptimeMs / 1000UL), keyName);
+        }
+        // 卡死是我们自己监测任务判定的（不是 panic），级别给错误；
+        // 崩溃同理。两者都是"用不了了"，都是错误级。
+        ELERR("CRASH", "%s", msg);
+    } else {
+        // RTC 慢存没有现场：说明复位发生在 ct_begin() 之前，或者掉电时
+        // 慢存已经掉电清零。能确定是异常复位但拿不到阶段，如实这么记。
+        ELERR("CRASH", "上次异常复位 但没留下现场记录");
+    }
+}
+
 // ===========================
 // setup()
 // ===========================
@@ -6390,7 +6957,13 @@ void setup() {
     // 厂商通道必须先注册回调再 begin()，否则主机发下来的报告没人收
     VendorHID.onEvent(onHidVendorEvent);
     VendorHID.begin();
-    USB.begin();
+    // USB.begin() 的返回值是 tinyusb_init() 成功与否（**不是**"主机有没有枚举"），
+    // 所以在这里判不会误报。返回 false = USB 协议栈压根没起来，
+    // 键盘完全不能用，但屏上照样正常显示主屏 —— 用户只觉得"键盘没反应"，
+    // 完全查不到是哪一环出的问题。这条必须落到错误日志里。
+    if (!USB.begin()) {
+        ELERR("USB", "协议栈启动失败 主机识别不到键盘");
+    }
 
     // SPI TFT
     tftSPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS);
@@ -6404,6 +6977,34 @@ void setup() {
 
     // NVS
     preferences.begin("keyboard", false);
+
+    // 可写性自检：写一个探针键，再读回来比一遍。
+    //
+    // 为什么要探针 —— NVS 分区在默认 8MB 分区表里只有 0x5000 = 20KB，
+    // 而且它是**只增不减**的日志结构存储：每次 put 都往后面追加一条新记录，
+    // 旧的靠 GC 慢慢回收，闪存擦写次数多了就再也塞不进**新键**。
+    // （已有键能就地覆盖，新键需要空槽 —— 这就是"单条规则存得下、两条存不下"
+    //  这种不对称的原因：多出来的那条恰好要开一个新键。）
+    //
+    // Preferences::put* 失败时只返回 0，不抛异常，而全工程的调用点几乎都不看
+    // 返回值。结果是屏幕照旧显示"已保存"、按键当场也生效（RAM 里有这张表），
+    // 断电后 NVS 里空无一物 —— 典型的"配好了能用，断一次电全没了"。
+    // 这里开机先探一次，把这件事变成开机日志里看得见的告警，
+    // 而不是让用户拿断电去试。
+    {
+        const uint32_t kProbeVal = 0xA5C30001UL;
+        bool probeOk = (preferences.putUInt("nvs_probe", kProbeVal) == 4) &&
+                       (preferences.getUInt("nvs_probe", 0) == kProbeVal);
+        preferences.remove("nvs_probe");
+        if (probeOk) {
+            ELINFO("NVS", "分区可写 配置能正常保存");
+        } else {
+            // 这里只记日志、不弹 HUD：setup 走到这一行时主屏还没建起来，
+            // triggerHud() 会去 lv_scr_act() 上建对象，太早调用不安全。
+            // 记成 ERR 就够醒目了 —— 菜单第 13 项会挂红色"N 条"角标。
+            ELERR("NVS", "分区写不进去 配置可能保存不上");
+        }
+    }
 
     // 恢复时间
     time_t savedEpoch = (time_t)preferences.getUInt("set_epoch", 0);
@@ -6460,6 +7061,7 @@ void setup() {
     if (shtTempOffset < SHT_TEMP_OFFSET_MIN || shtTempOffset > SHT_TEMP_OFFSET_MAX) {
         LOG_PORT.printf("[SHT] stored offset %.1f out of range, reset to %.1f\n",
                         shtTempOffset, SHT_TEMP_OFFSET_DEFAULT);
+        ELWARN("NVS", "温度偏移 %0.1f 越界 已重置", (double)shtTempOffset);
         shtTempOffset = SHT_TEMP_OFFSET_DEFAULT;
     }
 
@@ -6468,6 +7070,7 @@ void setup() {
     Wire.setClock(400000);
     if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
         LOG_PORT.println("[MCP23017] Init failed, recovering...");
+        ELERR("I2C", "开机初始化失败 正在恢复");
         recoverI2CBus();
     }
 
@@ -6479,6 +7082,10 @@ void setup() {
         shtAvailable = true;
         sht31_update();
         lastSHTRead = millis();
+    } else {
+        // 少了这颗传感器温度湿度一直是空的。以前这里一声不吭，
+        // 用户只看到"温度不显示"，完全不知道是传感器没接上还是固件坏了。
+        ELERR("SHT", "温湿度传感器无响应 温度不会更新");
     }
 
     // BLE
@@ -6522,7 +7129,43 @@ void setup() {
     //   · 壁纸解出来的图写不进 /logo.bin → 当次能显示，一重启就没了
     // SPIFFS 挂的就是表里那个 spiffs 分区（1.5MB），够放 115KB 的 logo + 一行文本，
     // 而且不用改分区表 —— 改分区表会挪动 app 分区、有抹掉 NVS 里宏/映射的风险。
-    SPIFFS.begin(true);
+    // ⚠ begin(true) 的 true = 挂不上就格式化重来。**整块板只能调这一次** ——
+    // 再调一次会把用户配置（壁纸 /logo.bin、ME 文本）和下面的错误日志一起抹掉。
+    bool fsMounted = SPIFFS.begin(true);
+
+    // 错误日志：把上次运行留在 flash 上的日志读回 RAM，然后补一条"上次怎么结束的"。
+    // 必须放在 SPIFFS.begin() 之后 —— elog 靠 SPIFFS 存取。放在这里是因为
+    // 上面 USB / LVGL / NVS / I2C 这些初始化步骤的报错也都想一起记下来。
+    elog_begin();
+    elog_notePrevRun();
+    if (!fsMounted || SPIFFS.totalBytes() == 0) {
+        // 文件系统没挂上：elog 会降级成"只留内存里的记录，重启就丢"。
+        // 这本身就是要记的第一号故障，必须让用户在菜单里看得到。
+        ELERR("FS", "存储未挂载 日志重启后会丢失");
+    }
+
+    // 开机就把"上次是怎么崩的"落盘，不等 elog_tick 的 60 秒。
+    //
+    // 为什么不能等：崩溃记录是在**本次**开机才生成的，如果开机后不到一分钟
+    // 又崩了，那条记录会跟着 RAM 一起没了 —— 而"开机就崩"恰恰是最需要
+    // 留证的场景（配置坏了、硬件接触不良，都是一上电就复现）。
+    //
+    // 磨损上限：只在**真的有错误级条目**时才提前落盘（正常开机不写），
+    // 并且用 NVS 里的时间戳限流到 5 分钟一次。这样一个"反复崩溃重启"的
+    // 设备（开机间隔远短于 5 分钟）也只会 5 分钟写一次，不会把 flash 写废。
+    {
+        bool hasErr = false;
+        for (int i = 0; i < elog_count() && !hasErr; i++) {
+            if (elog_get(i)->level == EL_LVL_ERR) hasErr = true;
+        }
+        uint32_t nowS = (uint32_t)time(nullptr);
+        uint32_t lastS = preferences.getULong("elog_fs", 0);
+        if (hasErr && fsMounted &&
+            (nowS < lastS || (nowS - lastS) > 300UL)) {   // 300s = 5 分钟
+            elog_flush();
+            preferences.putULong("elog_fs", nowS);
+        }
+    }
 
     // 开机把上次传的壁纸从盘上读回 PSRAM，重启不用让网页再传一遍
     loadWallpaperFromDisk();
@@ -6584,7 +7227,33 @@ void loop() {
     // 延迟重启
     if (pendingRestartMs != 0 && (long)(millis() - pendingRestartMs) >= 0) {
         pendingRestartMs = 0;
+        // 主动重启前先把日志落盘：重启后 RAM 就没了，不落盘这一轮记的
+        // 故障信息会跟着一起消失（而"重启"本身正是最需要留证的场景）。
+        elog_flush();
         esp_restart();
+    }
+
+    // 错误日志落盘：到点且有值得记的变化时才真写 flash，详见 elog.h。
+    // 放在这里（主任务、循环开头）而不是各报错点，是为了保证写 flash
+    // 这件耗时的事不会插在 I2C 扫描这类高频路径中间。
+    elog_tick();
+
+    // 内存水位巡检。内部 DRAM 耗尽是这个项目历史上最主要的重启原因
+    // （LVGL 曾经一次性从内部堆划 64KB，见 lv_mem_port.h），
+    // 而它的表现就是"跑着跑着自己重启"—— 事后无从查起。
+    // 这里按 15 秒一次的节拍看一眼，低于阈值就记一条；去重会把它
+    // 合并成一条并累加次数，所以"一直低"也只占一行。
+    {
+        static unsigned long lastMemCheck = 0;
+        if (millis() - lastMemCheck > 15000) {
+            lastMemCheck = millis();
+            uint32_t freeHeap = (uint32_t)esp_get_free_heap_size();
+            if (freeHeap < 8192) {
+                ELERR("MEM", "内部内存仅剩 %uK 随时可能重启", (unsigned)(freeHeap / 1024));
+            } else if (freeHeap < 20480) {
+                ELWARN("MEM", "内部内存偏低 剩 %uK", (unsigned)(freeHeap / 1024));
+            }
+        }
     }
 
     // BLE 重连
@@ -6608,6 +7277,7 @@ void loop() {
         meFile = File();
         LOG_PORT.printf("[ME] rx timeout, closed (partial %u bytes)\n",
                         (unsigned)meHexBytes);
+        ELWARN("ME", "接收超时 只存下 %u 字节", (unsigned)meHexBytes);
         triggerHud("ME 文本", "传输超时", lv_color_hex(CLR_AMBER));
     }
 

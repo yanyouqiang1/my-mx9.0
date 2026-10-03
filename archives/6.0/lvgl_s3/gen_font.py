@@ -167,18 +167,38 @@ def scan_source_chars(path):
     return found
 
 
+def source_files():
+    """要扫描的固件源码。
+
+    **所有** .ino/.h/.cpp 都要扫，不只是 lvgl_s3.ino —— 错误日志的界面文案在
+    lvgl_s3.ino 里，但模块自己的头文件（elog.h）以后也可能加中文。
+    漏掉任何一个文件的后果都是"屏上显示方框"，而这种问题只有烧进去才发现。
+
+    排除 lv_font_simsun_16_cjk.c：它是**本脚本的产物**，不是输入，
+    而且它本身没有任何汉字（字形是二进制数据），扫它纯属浪费。
+    """
+    out = []
+    for name in sorted(os.listdir(SRC)):
+        if not name.endswith((".ino", ".h", ".cpp")):
+            continue
+        if name.startswith("lv_font_"):
+            continue
+        out.append(os.path.join(SRC, name))
+    return out
+
+
 def main():
     chars = load_hanzi()
     cov = covered_set(chars)
     base = len(cov)
 
-    src = os.path.join(SRC, "lvgl_s3.ino")
-    if os.path.exists(src):
+    srcs = source_files()
+    for src in srcs:
         extra = scan_source_chars(src)
         added = extra - cov
         cov |= extra
         if added:
-            print(f"另外从固件源码补进 {len(added)} 个字："
+            print(f"另外从 {os.path.basename(src)} 补进 {len(added)} 个字："
                   + "".join(chr(c) for c in sorted(added)))
 
     print(f"字表 {len(chars)} 字 + 符号，合计 {len(cov)} 个码位（基础 {base}）")

@@ -755,6 +755,9 @@
     // 键盘回话通道：固件会用它 notify 上传结果（LOGOSTATUS:）和映射规则回读（REMAPDUMP:）。
     // 之前特征只有 WRITE，键盘没有任何回话通道，网页上就"发完即当成功"。
     let bleNotifyLines = [];
+    // REMAPDUMP 分片正文缓存：prof -> 已收到的正文片段拼接。
+    // 固件按 ATT 载荷上限（手机上常只有 20 字节）逐片发，收到 REMAPDUMP:<p>:END 才算完。
+    let remapDumpBuf = {};
     // 多 waiter 队列：每次 waitBleNotify 把 {prefix, resolve, timer} 推进 pendingWaits，
     // 来一行 notify 就 FIFO 找第一个前缀匹配的,消费掉。
     // 旧版用单 handler 链式:MA → MB → M1 三连击时,MA 的响应回来后 handler 被重置成 null,
@@ -791,6 +794,46 @@
                 appendLogLine(t.substring(4));
                 continue;
             }
+            // ⚠ REMAPDUMP 分片重组。必须排在通用 waiter 匹配**之前**。
+            //
+            //   固件发回来的映射表正文可能超过单条 BLE 通知的载荷上限（ATT MTU
+            //   协商失败时只有 23-3 = 20 字节，手机端浏览器很常见），超了不是被截断
+            //   而是**整条通知被协议栈丢掉**。所以固件改成逐片发：
+            //     REMAPDUMP:<p>:<正文片段>\n   （可 0~N 条）
+            //     REMAPDUMP:<p>:END\n          （收尾，1 条）
+            //   这里按方案号累积正文，收到 END 才算读完，再交回 waiter。
+            //
+            //   1 条规则整行正好 20 字节能过、2 条 28 字节就丢 —— 长期表现为
+            //   "单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来 + 弹没能从键盘读回确认"。
+            //
+            //   为什么不直接让 waiter 匹配第一片：那样只会拿到**半个表**，
+            //   比拿不到更难查。
+            if (t.startsWith("REMAPDUMP:")) {
+                const rest = t.substring(10);
+                if (rest.endsWith(":END")) {
+                    const prof = rest.substring(0, rest.length - 4);
+                    const body = remapDumpBuf[prof] || "";
+                    delete remapDumpBuf[prof];
+                    // 用重组好的完整行去兑现 waiter，保持 readRemap 的解析不变
+                    const full = `REMAPDUMP:${prof}:${body}`;
+                    for (let i = 0; i < pendingWaits.length; i++) {
+                        if (pendingWaits[i].prefix === `REMAPDUMP:END:${prof}`) {
+                            clearTimeout(pendingWaits[i].timer);
+                            const w = pendingWaits[i];
+                            pendingWaits.splice(i, 1);
+                            w.resolve(full);
+                            break;
+                        }
+                    }
+                } else {
+                    const ci = rest.indexOf(':');
+                    if (ci > 0) {
+                        const prof = rest.substring(0, ci);
+                        remapDumpBuf[prof] = (remapDumpBuf[prof] || "") + rest.substring(ci + 1);
+                    }
+                }
+                continue;
+            }
             // FIFO 匹配:最早的 waiter 先消费。固件命令处理是单线程顺序执行,
             // notify 顺序跟 send 顺序一致,FIFO 匹配结果正确。
             for (let i = 0; i < pendingWaits.length; i++) {
@@ -823,8 +866,20 @@
         // 每条命令都补一个 '\n'：固件那边现在按行缓冲，' \n' 才是"这条发完了"的信号。
         // 以前靠"包间静默"兜底，长指令被蓝牙拆包时很容易粘成两行错位。
         try {
-            await myCharacteristic.writeValue(encoder.encode(str + "\n"));
+            const payload = encoder.encode(str + "\n");
+            await myCharacteristic.writeValue(payload);
             LOG_PORT_UI("→ " + str);
+            // ⚠ 20 字节是个要紧的分界：Web Bluetooth 的 writeValue 会按协商出来的
+            //   ATT MTU 拆包，MTU 协商失败时（手机端浏览器很常见）一个包只装 20 字节。
+            //   拆包正好踩在固件"包间静默 = 这条发完了"的判据上 —— 历史上就是它把
+            //   `REMAP:0:clear:224,227;227,224`（29 字节）劈成 20+9，
+            //   固件把 `REMAP:0:clear:224,227;22` 当成完整命令收下，
+            //   结果"下发 2 条只存进 1 条"，而屏幕上显示的是"1 条已保存"。
+            //   固件那边已把空闲窗口从 15ms 放宽到 80ms，这里留一条可见记录，
+            //   以后再遇到对不上条数，先看这行。
+            if (payload.length > 20) {
+                LOG_PORT_UI(`&nbsp;&nbsp;(${payload.length} 字节 · 蓝牙会拆包)`);
+            }
         } catch (e) {
             const msg = `写入失败：${e && e.message ? e.message : e}`;
             LOG_PORT_UI("✗ " + msg + "  指令：" + str);
@@ -1018,7 +1073,10 @@
         for (let p = 0; p < 4; p++) {
             total++;
             const rules = await readRemap(p);
-            configCache.remaps[p] = rules || [];
+            // ⚠ 同样只在真读到时才写缓存。批量预加载 4 个方案，只要有一个方案
+            //   超时（蓝牙刚连上、第一次 notify 还没建立好很常见），`|| []` 就会
+            //   把那一个方案永久标成"0 条"，之后点多少次「从键盘读取」都救不回来。
+            if (rules !== null) configCache.remaps[p] = rules;
             if (rules !== null) ok++;
             if (onProgress) onProgress(total, `REMAP 方案${p + 1}`);
         }
@@ -1200,15 +1258,28 @@
 
     async function loadRemapFromCache() {
         const prof = document.getElementById('remapProfile').value;
-        // 先显示空,等待回话再填 —— 不然快速切方案时会看到上一方案的规则残留
-        remapRules = [];
-        remapRefreshList();
-
         const rules = await ensureRemapLoaded(prof);
 
+        // 快速连切方案时，后发起的那个 await 可能不是最后返回的 —— 方案对不上就丢弃，
+        // 否则会把别的方案的规则填进当前方案。
         if (document.getElementById('remapProfile').value !== prof) return;
 
-        remapRules = rules || [];
+        // ⚠ 读失败(null)和"这个方案真的没有规则"([])是两件事，绝不能同等对待。
+        //
+        //   旧代码这里是 `remapRules = []` + remapRefreshList() 放在 await **之前**
+        //   无conditionally 执行，回来再 `remapRules = rules || []` 兜一次底。
+        //   于是一次 BLE 超时就会把编辑器里辛苦加的规则全清空 —— 而用户接下来
+        //   看到的是"0 条"，自然会以为刚才没保存上，于是再点一次「💾 保存到键盘」。
+        //   那时 remapRules 已经被清成 []，pairs 拼出空串，网页发出
+        //   `REMAP:<p>:clear:`，固件按"整份替换"语义把键盘上已存的规则**静默抹掉**。
+        //   端到端表现就是"配了 N 条完全没生效"，而且再也查不出是哪一步丢的。
+        //
+        //   所以现在：等真的读到结果再动列表，读不到就原样保留 + 一行提示。
+        if (rules === null) {
+            LOG_PORT_UI(`⚠ 方案 ${Number(prof) + 1} 读取超时，规则列表保持原样未改动`);
+            return;
+        }
+        remapRules = rules;
         remapRefreshList();
     }
 
@@ -1333,24 +1404,55 @@
 
     // 读回：让键盘把该方案现有的规则 notify 上来。
     // 以前"从键盘读取"读不出来，是因为特征根本没有 NOTIFY，键盘没法回话。
-    function readRemap(prof, timeoutMs) {
+    //
+    // ⚠ retries：刚连上蓝牙时 CCCD 订阅可能还没在主机侧真正生效，固件 notify 的
+    //   第一条很容易正好落在订阅建立之前，于是必然超时。失败后原样重发一次，
+    //   两次之间隔了 timeoutMs，不存在两条相同 notify 被 BLE 合并的风险
+    //   （合并问题来自"两个并发的 readRemap"，那个重复监听器已经删掉了）。
+    async function readRemap(prof, timeoutMs, retries) {
         const p = `REMAPDUMP:${prof}:`;
-        const pr = waitBleNotify(p, timeoutMs || 3000);
-        sendBLE(`REMAPREAD:${prof}`);   // 不 await：要先挂上监听再发指令
-        return pr.then(line => {
-            if (!line) return null;
-            const body = line.substring(p.length);
-            if (body === "ERR") return null;
-            if (!body) return [];
-            return body.split(';').filter(Boolean).map(s => {
-                const [f, t] = s.split(',').map(Number);
-                return { from: f, to: t };
-            });
-        });
+        // 等的是**收尾标记**而不是第一片正文：正文可能分好几片，先到的那片不是全表。
+        // onBleNotify 里按 prof 累积正文，收到 REMAPDUMP:<p>:END 才把完整行交回来。
+        const endPrefix = `REMAPDUMP:END:${prof}`;
+        for (let attempt = 0; attempt <= (retries === undefined ? 1 : retries); attempt++) {
+            remapDumpBuf[prof] = '';          // 上一轮的残片不能串进这一轮
+            const pr = waitBleNotify(endPrefix, timeoutMs || 3000);
+            sendBLE(`REMAPREAD:${prof}`);   // 不 await：要先挂上监听再发指令
+            const line = await pr;
+            if (line) {
+                const body = line.substring(p.length);
+                if (body === "ERR") return null;
+                if (!body) return [];       // 真的读到了，且键盘上确实一条都没有
+                return body.split(';').filter(Boolean).map(s => {
+                    const [f, t] = s.split(',').map(Number);
+                    return { from: f, to: t };
+                });
+            }
+            LOG_PORT_UI(`REMAP 方案${Number(prof) + 1} 第 ${attempt + 1} 次读回超时，重试…`);
+        }
+        return null;   // 真的没回话 —— 调用方必须区别对待，不能当成"0 条"
     }
 
     document.getElementById('remapSaveBtn').addEventListener('click', async () => {
         const prof = document.getElementById('remapProfile').value;
+        // ⚠⚠ 列表为空时**直接拒绝保存**，不再弹 confirm 放行。
+        //
+        //   旧代码这里是"弹窗问一句，用户点确定就照发"。但 pairs 为空串时发出去的
+        //   是 `REMAP:<p>:clear:`，固件按"整份替换"语义会把键盘上**已经存好的**
+        //   映射全部抹掉 —— 也就是说，只要列表因为任何原因变空（读回超时、
+        //   切了方案下拉框还没回填、用户手动删光了），点一下"保存"就是在删配置。
+        //
+        //   confirm 在这里是有害的：弹窗文案再吓人，用户也是反射性地点"确定"。
+        //   清空本来就有专门的按钮（🗑️ 清空此方案），两条路必须分开，
+        //   "保存"永远不该有能力清空别人的数据。
+        if (remapRules.length === 0) {
+            alert(`规则列表是空的，已阻止保存。\n\n` +
+                  `原因：列表为空时"保存"发出去的是 \`REMAP:${prof}:clear:\`，\n` +
+                  `固件会按整份替换把方案 ${Number(prof) + 1} 上**已有的全部映射清空**。\n\n` +
+                  `要清空请点「🗑️ 清空此方案」。\n` +
+                  `若你刚配了规则却看到空列表，说明没读回键盘 —— 先点「📥 从键盘读取」。`);
+            return;
+        }
         let pairs = "";
         if (remapRules.length > 0) {
             pairs = remapRules.map(r => `${r.from},${r.to}`).join(';');
@@ -1366,20 +1468,22 @@
         } else if (back.length === remapRules.length) {
             alert(`已保存 ${back.length} 条映射到方案 ${Number(prof) + 1}（已从键盘读回确认）。`);
         } else {
-            alert(`下发的是 ${remapRules.length} 条，键盘读回是 ${back.length} 条，对不上。\n请看键盘屏幕上的提示。`);
+            // 条数对不上只有两种可能，两种都会让用户以为"保存成功了"：
+            //   1) 蓝牙拆包把命令截断（看上面的收发流水里有没有"会拆包"提示）
+            //   2) NVS 分区只有 20KB，写不下新键（键盘屏幕会红字提示"只存住 x/y 条"）
+            // 都要在这里点名，否则用户只会反复点保存，越点越乱。
+            alert(`下发的是 ${remapRules.length} 条，键盘只收下了 ${back.length} 条。\n\n` +
+                  `常见原因：\n` +
+                  `  1) 蓝牙把这条长命令拆包了（收发流水里有"会拆包"提示就是它）\n` +
+                  `  2) 键盘 NVS 分区已满，写不下新键（屏幕上会红字提示）\n\n` +
+                  `当前列表以键盘读回的 ${back.length} 条为准。`);
+            // 本地视图也按键盘的真实结果对齐，别让界面继续显示一个没存上的方案
+            if (back !== null) {
+                remapRules = back;
+                remapRefreshList();
+                configCache.remaps[prof] = back;
+            }
         }
-    });
-
-    document.getElementById('remapLoadBtn')?.addEventListener('click', async () => {
-        const prof = document.getElementById('remapProfile').value;
-        const back = await readRemap(prof, 4000);
-        if (back === null) {
-            alert("键盘没回话。\n请确认蓝牙已连接、固件是最新那版，然后重试。");
-            return;
-        }
-        remapRules = back;
-        remapRefreshList();
-        alert(back.length ? `已从键盘读回 ${back.length} 条映射。` : `方案 ${Number(prof) + 1} 在键盘上没有映射规则。`);
     });
 
     document.getElementById('remapProfile').addEventListener('change', () => {
@@ -1387,14 +1491,33 @@
         loadRemapFromCache();
     });
 
-    // remapLoadBtn 在新流程里变成"只读当前方案"快捷,不再弹"协议不提供"的旧提示
+    // "📥 从键盘读取" —— 点一次、读一次。
+    //
+    // ⚠ 这里原来前后挂了**两个** remapLoadBtn 的 click 监听（1373 和 1391 两段，
+    //   id 在 147 行只声明了一次）。后果是点一次按钮发出**两条** REMAPREAD，
+    //   固件于是 notify **两次内容完全一样**的 REMAPDUMP。BLE 通知不排队，
+    //   上一条客户端还没 ACK 时第二条会被合并丢弃 -> 两个 waiter 必有一个超时。
+    //   这就是"从键盘读取永远读到 0 条"的直接原因。
     document.getElementById('remapLoadBtn').addEventListener('click', async () => {
         const prof = document.getElementById('remapProfile').value;
-        const back = await readRemap(prof, 2000);
-        configCache.remaps[prof] = back || [];
-        loadRemapFromCache();
-        if (back !== null) alert(`已读取方案 ${Number(prof) + 1} 的 ${back.length} 条映射。`);
-        else alert("键盘没回话,请确认固件是最新版");
+        const back = await readRemap(prof, 3000);
+        // ⚠ 只有真的读回来了才写缓存。null 是"键盘没回话"，[] 是"键盘上确实一条都没有"，
+        //   两者含义相反。旧代码的 `back || []` 把"没回话"直接固化成"0 条"，
+        //   而 ensureRemapLoaded 只认 `!== undefined` 就返回缓存，
+        //   于是这一次超时会让本次页面会话里这个方案永远显示 0 条。
+        if (back !== null) configCache.remaps[prof] = back;
+        // 只有真读回来了才刷新列表。back === null 时缓存里本来就没有这个方案的条目，
+        // 再调 loadRemapFromCache() 会让 ensureRemapLoaded 缓存未命中、
+        // **再发一条 REMAPREAD** —— 一次点击变两条指令，BLE 通知不排队，
+        // 两个并发 waiter 必有一个超时，反而把"读不到"变成"读两次都不到"。
+        if (back !== null) loadRemapFromCache();
+        if (back === null) {
+            alert("键盘没回话（3 秒内没收到 REMAPDUMP）。\n请确认蓝牙已连接、固件是最新那版。\n当前规则列表未改动。");
+        } else {
+            alert(back.length
+                ? `已从键盘读回方案 ${Number(prof) + 1} 的 ${back.length} 条映射。`
+                : `方案 ${Number(prof) + 1} 在键盘上确实没有任何映射规则。`);
+        }
     });
 
     // 切宏键 / 切方案:从 cache 加载该键的宏

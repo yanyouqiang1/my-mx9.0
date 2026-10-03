@@ -20,6 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_C = os.path.join(HERE, "src", "lv_font_simsun_16_cjk.c")
 SOURCES = [
     os.path.join(HERE, "src", "lvgl_s3.ino"),
+    os.path.join(HERE, "src", "elog.h"),
+    os.path.join(HERE, "src", "elog.cpp"),
 ]
 
 CJK = re.compile(r"[\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF]")
@@ -47,16 +49,62 @@ def load_covered():
 
 def scan(path, covered):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+        text = strip_comments(f.read())
+    lines = text.split("\n")
     missing = {}
     for i, line in enumerate(lines, 1):
         if not CJK.search(line):
             continue
-        # 注释里的中文不影响显示，但顺手一起报出来更容易定位
         for ch in set(CJK.findall(line)):
             if ord(ch) not in covered:
                 missing.setdefault(ch, []).append(i)
     return missing
+
+
+def strip_comments(text):
+    """把 C/C++ 注释去掉，只留真正会被编译的代码（含字符串字面量）。
+
+    为什么必须去注释：注释里出现汉字很正常（这份固件注释写得比代码还多），
+    但注释**不会显示在屏上**。不剔除的话工具会把几百个注释用字全报成"缺字"，
+    真正的缺字反而被淹没 —— 这个脚本靠"干净"才有意义。
+
+    刻意用状态机而不是正则：正则分不清 "http://x" 里的 // 和真注释，
+    会把一整行代码连带后面的字面量一起吃掉 → **漏报**真正的缺字。
+    漏报比误报危险得多，所以老老实实按字符走。
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":                       # 行注释
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and nxt == "*":                     # 块注释
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                if text[i] == "\n":
+                    out.append("\n")                      # 保留换行，行号才不会错位
+                i += 1
+            i += 2
+        elif c in "\"'":                                  # 字符串 / 字符字面量
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:         # 转义
+                    out.append(text[i:i + 2])
+                    i += 2
+                    continue
+                out.append(text[i])
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def main():
