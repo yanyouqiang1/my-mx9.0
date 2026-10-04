@@ -679,8 +679,18 @@ static uint8_t menuSel = 0;          // 兼容旧名字：现在指一级大类�
 static uint8_t menuItemSel = 0;      // 二级：组内项下标
 static bool   menuInSub = false;     // 当前在二级
 
-// 列表最多能同时显示几行（一级 6 个大类，二级最多 3 项，6 够用）
-#define MENU_ROW_MAX 6
+// 一行菜单对应的对象数。
+//
+// ⚠️ **必须 >= 一级的大类个数（MENU_GROUP_COUNT）**。这个数组只建这么多行对象，
+// 渲染循环也是 `for (i = 0; i < MENU_ROW_MAX; i++)`，所以超出这个数的项
+// **既不会被画出来也不会报错** —— 表现是"菜单项存在、能选中、能进去，
+// 但屏幕上就是看不见那一行"，非常像被什么盖住了。
+// 加第 7 个大类「宠物」时这里只加到 6，症状就是这个。改大它。
+#define MENU_ROW_MAX 8
+
+// 列表最多能同时显示几行（一级 7 个大类，二级最多 5 项，6 够用 —— 第 7 个
+// 大类靠 menuScrollOffset 滚进窗口）
+#define MENU_VISIBLE_ITEMS 6
 
 // 宏录制
 #define MAX_REC_KEYS 64
@@ -840,8 +850,8 @@ static uint8_t indBrightness = 255;
 //   199~237  底部两行按键提示
 // 行高/步进是从原来的 26/28 收下来过的：底部提示改成两行后要占 38px
 // （原来一行只占 19px），原来的 50+6×28=218 直接压到提示上面。
-// 一级正好 6 个大类，所以这 6 行是一屏全放得下的，不用翻页。
-#define MENU_VISIBLE_ITEMS 6
+// 一级现在是 7 个大类，一屏放得下 6 行，第 7 行靠 menuScrollOffset 滚进来。
+// （定义在前面 MENU_ROW_MAX 那段）
 #define MENU_ITEM_H        24
 #define MENU_PITCH         26
 #define MENU_LIST_TOP      42
@@ -3928,7 +3938,11 @@ static void petRefreshPage(void) {
 
     // 心情条
     uint8_t m = pet.mood > 100 ? 100 : pet.mood;
-    setSizePos(pt_moodBar, (m * 128) / 100, 10, 100, 9);
+    // 心情条。pt_moodBar 是 **pt_moodBg 的子对象**，它的 x/y 是**相对父对象**的，
+    // 必须留在 (0,0)。写成 (100,9)（轨道的屏幕坐标）的话它会被推到
+    // x=200 右侧、y=18，屏幕上只剩右边缘一条橙色竖线 —— 症状就是
+    // "进度条不对，橙色只有一条线条"。父对象已经 pad_all=0，所以 (0,0) 正好贴左。
+    setSizePos(pt_moodBar, (m * 128) / 100, 10, 0, 0);
     setBgColor(pt_moodBar, m > PET_MOOD_OK ? CLR_GREEN
                                           : (m > PET_MOOD_SAD ? CLR_AMBER : CLR_RED));
 
@@ -4046,8 +4060,6 @@ static void petSetBottomYield(bool yield) {
 // 右上角会吃掉台词第一行的宽度。
 
 #define PK_TOP    168
-#define PK_HEAD_CX 36
-#define PK_HEAD_CY 204
 
 static void petDestroyPeek(void) {
     if (pk_bar) {
@@ -4061,6 +4073,14 @@ static void petDestroyPeek(void) {
 }
 
 // 探头的猫：只画到下巴，肩膀在横条之外，视觉上就是"从屏底探出来"
+//
+// ⚠️ **这里所有坐标都是相对 pk_bar 的，不是屏幕坐标。** pk_bar 自己在
+// lv_layer_top 上、位置 (0, PK_TOP)，而 `lv_obj_align(child, TOP_LEFT, x, y)`
+// 的 x/y 是相对**父对象内容区**的。草图（mock_pet_peek.png）画的是屏幕坐标，
+// 照抄进来就会整体下移 PK_TOP=168，猫直接画到屏幕 y=342（屏高才 240）。
+// 台词那三个 label 反而是对的（3/22/41 就是相对值，屏幕上落在 171/190/209）。
+#define PK_HEAD_CX 36
+#define PK_HEAD_CY 36      // = 屏幕 204 - PK_TOP
 static void petBuildPeek(void) {
     petDestroyPeek();
     pk_bar = lv_obj_create(lv_layer_top());
@@ -4097,11 +4117,13 @@ static void petBuildPeek(void) {
     }
     lv_label_set_text(pk_line3, "长按 LOGO 收起我");
 
-    // 关闭提示的 ✕：一个 16px 圆圈 + 里面一个 Montserrat 的 "X"。
+    // 关闭提示的 ✕：一个 16px 圆圈 + 里面一个 Montserrat 的 "X"，摆在提示行右端。
+    // x 不变（bar 在 x=0，212 就是屏幕 212）；y 要减掉 PK_TOP：
+    // 屏幕 211..227 -> 相对 bar 是 43..59。
     // 为什么用字形而不是两条斜线：transform_angle 被禁（见 README），
     // 斜线只能画成一串小方块，边缘全是锯齿。ASCII 的 X 正好就是那个形状，
     // 而且 Montserrat 一定有它 —— 不用碰字库。
-    lv_obj_t* cb = iconRect(pk_bar, 16, 16, LV_ALIGN_TOP_LEFT, 212, 211, 0x1A1A1A, 8);
+    lv_obj_t* cb = iconRect(pk_bar, 16, 16, LV_ALIGN_TOP_LEFT, 212, 43, 0x1A1A1A, 8);
     pk_close = lv_label_create(cb);
     mkLabel(pk_close, &lv_font_montserrat_14, CLR_TEXT_DIM);
     lv_label_set_text(pk_close, "X");
