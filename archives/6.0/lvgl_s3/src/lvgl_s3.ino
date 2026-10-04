@@ -797,7 +797,9 @@ static lv_obj_t* set_time_field_labels[5] = { nullptr };
 static lv_obj_t* set_alarm_lbl_time = nullptr;
 static lv_obj_t* set_alarm_sw = nullptr;
 static lv_obj_t* set_alarm_state_lbl = nullptr;
-static lv_obj_t* set_alarm_field_labels[2] = { nullptr };
+// 三个字段：0=时 1=分 2=开关。原来只有 2 个，那个开关是**只能看不能碰**的
+// 摆设 —— 见 build_settings_alarm 里的注释。
+static lv_obj_t* set_alarm_field_labels[3] = { nullptr };
 
 static lv_obj_t* set_timer_lbl_time = nullptr;
 static lv_obj_t* set_timer_btn = nullptr;
@@ -3722,16 +3724,19 @@ static void update_setting_alarm_display(void) {
     static char buf[16];
     snprintf(buf, sizeof(buf), "%02d:%02d", alarmEditH, alarmEditM);
     setText(set_alarm_lbl_time, buf);
+    // 开关和状态文字都跟**编辑态**走，不是跟已保存的值走：
+    // 用户在页面上翻到"开"还没按回车时，屏上就该已经是"已开启"，
+    // 否则会出现"我明明选了开，它还显示已关闭"这种看起来没生效的情况。
     if (set_alarm_sw) {
-        if (alarmEnabled) lv_obj_add_state(set_alarm_sw, LV_STATE_CHECKED);
-        else               lv_obj_clear_state(set_alarm_sw, LV_STATE_CHECKED);
+        if (alarmEditOn) lv_obj_add_state(set_alarm_sw, LV_STATE_CHECKED);
+        else              lv_obj_clear_state(set_alarm_sw, LV_STATE_CHECKED);
     }
-    setText(set_alarm_state_lbl, alarmEnabled ? "已开启" : "已关闭");
+    setText(set_alarm_state_lbl, alarmEditOn ? "已开启" : "已关闭");
     if (set_alarm_state_lbl) {
         lv_obj_set_style_text_color(set_alarm_state_lbl,
-            lv_color_hex(alarmEnabled ? CLR_GREEN : CLR_TEXT_MUTE), LV_PART_MAIN);
+            lv_color_hex(alarmEditOn ? CLR_GREEN : CLR_TEXT_MUTE), LV_PART_MAIN);
     }
-    for (int i = 0; i < 2; i++) markField(set_alarm_field_labels[i], i == alarmFieldIdx);
+    for (int i = 0; i < 3; i++) markField(set_alarm_field_labels[i], i == alarmFieldIdx);
 }
 
 static void update_setting_timer_display(void) {
@@ -3809,7 +3814,8 @@ static void update_setting_light_display(void) {
 // 原因：原来每次进来都 lv_obj_del(旧屏) + lv_obj_create(NULL)，而旧屏往往正是
 // 当前活动屏 —— LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL，紧接着的刷新就
 // 解引用空指针 → panic → 重启（MR 进录制必崩就是这个）。顺带整屏删建也太重。
-static lv_obj_t* settingShell(lv_obj_t* scr, const char* titleCN, const char* titleEn) {
+static lv_obj_t* settingShell(lv_obj_t* scr, const char* titleCN, const char* titleEn,
+                              const char* hintCN = "←→ 切换 · ↑↓ 调整 · 回车保存 · ESC 取消") {
     lv_obj_set_style_bg_color(scr, lv_color_hex(CLR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(scr, 0, LV_PART_MAIN);
@@ -3835,7 +3841,7 @@ static lv_obj_t* settingShell(lv_obj_t* scr, const char* titleCN, const char* ti
 
     lv_obj_t* hint = lv_label_create(scr);
     mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-    lv_label_set_text(hint, "←→ 切换 · ↑↓ 调整 · 回车保存 · ESC 取消");
+    lv_label_set_text(hint, hintCN);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
     return scr;
 }
@@ -3916,6 +3922,7 @@ static void build_settings_alarm(void) {
     alarmEditH = alarmHour;
     alarmEditM = alarmMinute;
     alarmFieldIdx = 0;
+    alarmEditOn = alarmEnabled;   // 进页面先把当前状态搬进编辑态
 
     if (scr_settings_alarm == nullptr) {
         scr_settings_alarm = lv_obj_create(NULL);
@@ -3931,22 +3938,31 @@ static void build_settings_alarm(void) {
         lv_label_set_text(set_alarm_lbl_time, "07:00");
         lv_obj_align(set_alarm_lbl_time, LV_ALIGN_TOP_MID, 0, 18);
 
-        // 开关 + 文字状态
+        // 开关 + 文字状态。
+        //
+        // 这个 lv_switch **只当显示器用**，不指望谁来点它：整机没有触屏，
+        // 全工程也没有一处 add_event_cb，它天生点不动。以前它是唯一的"开关"，
+        // 状态只从 alarmEnabled 单向镜像过去、没有任何输入路径能改 ——
+        // 看着像个开关，其实只能看。现在真正能改它的是下面第三个字段"开关"，
+        // ←/→ 选到它、↑/↓ 翻 alarmEditOn，这里跟着刷新。
         set_alarm_sw = lv_switch_create(card);
         lv_obj_set_size(set_alarm_sw, 52, 28);
         lv_obj_align(set_alarm_sw, LV_ALIGN_BOTTOM_MID, 0, -16);
         lv_obj_set_style_bg_color(set_alarm_sw, lv_color_hex(CLR_SURFACE_2), LV_PART_MAIN);
         lv_obj_set_style_bg_color(set_alarm_sw, lv_color_hex(CLR_ACCENT), LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(set_alarm_sw, lv_color_hex(CLR_TEXT), LV_PART_KNOB);
+        lv_obj_clear_flag(set_alarm_sw, LV_OBJ_FLAG_CLICKABLE);
 
         set_alarm_state_lbl = lv_label_create(card);
         mkLabel(set_alarm_state_lbl, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
         lv_label_set_text(set_alarm_state_lbl, "已关闭");
         lv_obj_align(set_alarm_state_lbl, LV_ALIGN_BOTTOM_MID, 0, -34);
 
-        const char* fieldNames[2] = { "时", "分" };
-        int fieldX[2] = { -30, 30 };
-        for (int i = 0; i < 2; i++) {
+        // 时 / 分 / 开关。和灯光设置页的"背光开关"是同一套做法：
+        // 布尔量不做成不可点的控件，而是排进可导航的字段循环里，↑/↓ 直接翻。
+        const char* fieldNames[3] = { "时", "分", "开关" };
+        int fieldX[3] = { -70, 0, 70 };
+        for (int i = 0; i < 3; i++) {
             set_alarm_field_labels[i] = fieldChip(scr_settings_alarm, fieldX[i], 62, 44, fieldNames[i], false);
         }
     }
@@ -3966,7 +3982,10 @@ static void build_settings_timer(void) {
 
     if (scr_settings_timer == nullptr) {
         scr_settings_timer = lv_obj_create(NULL);
-        settingShell(scr_settings_timer, "倒计时", "TIMER");
+        // 这一屏的回车是"开始/停止"，不是"保存"（见 toggleCountdownFromKeyboard），
+        // 所以提示行不能沿用通用的"回车保存"，否则会教用户按一个不起作用的键。
+        settingShell(scr_settings_timer, "倒计时", "TIMER",
+                     "←→ 切换 · ↑↓ 调整 · 回车开始/停止 · ESC 取消");
 
         lv_obj_t* card = lv_obj_create(scr_settings_timer);
         lv_obj_set_size(card, 200, 108);
@@ -4588,7 +4607,8 @@ static void moveSettingField(int dir) {
             update_setting_time_display();
             break;
         case SYS_MODE_SET_ALARM:
-            alarmFieldIdx = (alarmFieldIdx + dir + 2) % 2;
+            // 三个字段了（时/分/开关），模数跟着从 2 改成 3
+            alarmFieldIdx = (alarmFieldIdx + dir + 3) % 3;
             update_setting_alarm_display();
             break;
         case SYS_MODE_SET_TIMER:
@@ -4621,6 +4641,9 @@ static void adjustSettingField(int delta) {
             switch (alarmFieldIdx) {
                 case 0: alarmEditH = constrain(alarmEditH + delta, 0, 23); break;
                 case 1: alarmEditM = constrain(alarmEditM + delta, 0, 59); break;
+                // ↑/↓ 翻开关。delta 是 ±1，这里只用它的正负，翻一次就够 ——
+                // 按住不放连翻也只会"开→关→开"，正好是想要的手感。
+                case 2: alarmEditOn = !alarmEditOn; break;
             }
             update_setting_alarm_display();
             break;
@@ -4695,7 +4718,11 @@ static void saveSettingScreen(void) {
         case SYS_MODE_SET_ALARM: {
             alarmHour = alarmEditH;
             alarmMinute = alarmEditM;
-            alarmEnabled = lv_obj_has_state(set_alarm_sw, LV_STATE_CHECKED);
+            // 取编辑态，不再从那个点不动的 lv_switch 上读。
+            // 以前读开关：整机没触屏、全工程没有 add_event_cb，那开关的状态
+            // 只会是进页面时镜像进来的 alarmEnabled —— 也就是说"在闹钟页里
+            // 改开关"这件事改了个寂寞，保存时又把它盖回原值。
+            alarmEnabled = alarmEditOn;
             preferences.putUChar("alarm_h", alarmHour);
             preferences.putUChar("alarm_m", alarmMinute);
             preferences.putBool("alarm_on", alarmEnabled);
