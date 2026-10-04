@@ -145,15 +145,17 @@ def build(pose, name, mood, lines, hint):
         d.text((20, top + 5 + 19 * i), ln, font=f(CJK, 16),
                fill=rgb(CLR_TEXT if i == 0 else CLR_TEXT_DIM), anchor="la")
 
-    # 底部按键提示（两行制，同 mkHintLine 的思路）
+    # 底部按键提示（一行，216px 内）
+    #   全部用 C3 的实体键（静音/旋钮/灯光长按），矩阵键一个都不占 ——
+    #   宠物页不吞键，打字照常。
     d.text((120, 229), hint, font=f(CJK, 16), fill=rgb(CLR_TEXT_DIM), anchor="mm")
     return im
 
 
 SCREENS = [
-    ("idle",   "小橘", 0.72, ["在等你打字…", "不过我也不急"], "空格 摸摸 · 回车 喂食"),
-    ("greet",  "小橘", 0.90, ["你回来啦！", "走了 12 分钟，我想你了"], "空格 摸摸 · 回车 喂食"),
-    ("hungry", "小橘", 0.35, ["肚子叫了…", "到饭点啦，喂我一口？"], "空格 摸摸 · 回车 喂食"),
+    ("idle",   "小橘", 0.72, ["在等你打字…", "不过我也不急"], "静音摸 · 旋钮撸 · 灯长退"),
+    ("greet",  "小橘", 0.90, ["你回来啦！", "走了 12 分钟，我想你了"], "静音摸 · 旋钮撸 · 灯长退"),
+    ("hungry", "小橘", 0.35, ["肚子叫了…", "到饭点啦，喂我一口？"], "旋钮按 喂食 · 灯长退出"),
 ]
 
 for i, (pose, name, mood, lines, hint) in enumerate(SCREENS):
