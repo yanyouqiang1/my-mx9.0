@@ -25,6 +25,7 @@ CLR_TEXT_DIM  = 0x8E9BB2
 CLR_ACCENT    = 0x22D3EE
 CLR_AMBER     = 0xFBBF24
 CLR_GREEN     = 0x34D399
+CLR_RED       = 0xF87171
 CLR_PET       = 0xF5A97F   # 宠物主色（橘猫）
 CLR_PET_DARK  = 0xC4805F   # 耳朵内侧 / 纹路
 CLR_PET_BODY  = 0xE8C39E
@@ -233,6 +234,87 @@ peek_sheet.resize((peek_sheet.width * 2, peek_sheet.height * 2), Image.NEAREST)\
     .save("mock_pet_peek.png")
 build_peek(*PEEKS[0]).resize((W * S, H * S), Image.NEAREST).save("mock_pet_peek_greet.png")
 
+
+# ============ 场景 3：探头期间「底部让位」前后对比 ============
+# 高对比度风格的底部状态条 y=178..235，正好落在探头横条 y=168..240 里。
+# 用户要求探头期间把状态条让出来 —— 这张图验证让位之后版面不空洞。
+def build_hc(show_bar, with_peek):
+    """高对比度主屏，坐标照抄 build_style_high_contrast() 的版面注释。"""
+    im, d = new_screen("greet")
+    d.rectangle((0, 0, 239, 239), fill=rgb(0x000000))
+
+    # 6..32 顶部三颗大锁灯
+    for i, cx in enumerate((30, 74, 118)):
+        on = i != 1
+        c = rgb(CLR_GREEN if i == 0 else CLR_ACCENT if i == 1 else CLR_AMBER)
+        if on:
+            d.rounded_rectangle((cx - 20, 6, cx + 20, 32), radius=4, fill=c)
+            d.text((cx, 19), ("NUM", "CAPS", "SCR")[i], font=f(LATIN_B, 12),
+                   fill=rgb(0x000000), anchor="mm")
+        else:
+            d.rounded_rectangle((cx - 20, 6, cx + 20, 32), radius=4,
+                                fill=rgb(0x1F1F1F), outline=rgb(0x333333), width=1)
+            d.text((cx, 19), ("NUM", "CAPS", "SCR")[i], font=f(LATIN_B, 12),
+                   fill=rgb(0x666666), anchor="mm")
+
+    # 46..98 大时钟 / 98..117 日期 / 124..176 大红按键名
+    d.text((120, 72), "23:47", font=f(LATIN_B, 44), fill=rgb(CLR_TEXT), anchor="mm")
+    d.text((120, 108), "10月4日 星期日", font=f(CJK, 16),
+           fill=rgb(CLR_TEXT_DIM), anchor="mm")
+    d.text((120, 150), "Space", font=f(LATIN_B, 44), fill=rgb(CLR_RED), anchor="mm")
+
+    # 178..235 底部状态条（box x=10..230, w=220, h=58）
+    if show_bar:
+        d.rounded_rectangle((10, 178, 229, 235), radius=8,
+                            fill=rgb(0x000000), outline=rgb(CLR_STROKE), width=1)
+        d.line((156, 183, 156, 230), fill=rgb(CLR_STROKE), width=1)
+
+        def meter(row_y, bar_y, cap, val, color, pct):
+            d.text((16, row_y), cap, font=f(CJK, 16), fill=rgb(color), anchor="lm")
+            d.text((151, row_y), val, font=f(LATIN, 16), fill=rgb(CLR_TEXT), anchor="rm")
+            d.rounded_rectangle((16, bar_y, 16 + 135 - 1, bar_y + 5), radius=3,
+                                fill=rgb(CLR_SURFACE_2))
+            d.rounded_rectangle((16, bar_y, 16 + int(135 * pct) - 1, bar_y + 5),
+                                radius=3, fill=rgb(color))
+
+        meter(180 + 9, 199, "温度", "23.5°C", CLR_AMBER, 0.47)
+        meter(209 + 9, 228, "湿度", "58%",   CLR_GREEN, 0.58)
+        d.text((164, 193), "字数", font=f(CJK, 16), fill=rgb(CLR_ACCENT), anchor="lm")
+        d.text((221, 217), "128.4k", font=f(LATIN, 16), fill=rgb(CLR_TEXT), anchor="rm")
+
+    if with_peek:
+        d.rectangle((0, 168, 239, 239), fill=rgb(0x141A26))
+        d.line((0, 168, 239, 168), fill=rgb(CLR_STROKE), width=1)
+        cx, cy = 36, 204
+        d.ellipse((cx - 20, cy - 26, cx + 20, cy + 14), fill=rgb(CLR_PET))
+        d.ellipse((cx - 21, cy - 30, cx - 7, cy - 16), fill=rgb(CLR_PET))
+        d.ellipse((cx + 7, cy - 30, cx + 21, cy - 16), fill=rgb(CLR_PET))
+        for sx in (-1, 1):
+            ex = cx + sx * 8
+            d.ellipse((ex - 4, cy - 12, ex + 4, cy - 4), fill=rgb(0x1A1A1A))
+        d.polygon([(cx - 3, cy - 1), (cx + 3, cy - 1), (cx, cy + 2)], fill=rgb(0xD2694A))
+        d.arc((cx - 8, cy - 2, cx, cy + 7), 0, 110, fill=rgb(0x1A1A1A), width=2)
+        d.arc((cx, cy - 2, cx + 8, cy + 7), 70, 180, fill=rgb(0x1A1A1A), width=2)
+        d.text((64, 171), "你回来啦！", font=f(CJK, 16), fill=rgb(CLR_TEXT), anchor="la")
+        d.text((64, 190), "我等了你 12 分钟", font=f(CJK, 16),
+               fill=rgb(CLR_TEXT_DIM), anchor="la")
+        d.text((64, 209), "长按 LOGO 收起我", font=f(CJK, 16),
+               fill=rgb(CLR_TEXT_DIM), anchor="la")
+        d.ellipse((212, 211, 228, 227), outline=rgb(CLR_TEXT_DIM), width=1)
+        d.line((216, 215, 224, 223), fill=rgb(CLR_TEXT_DIM), width=1)
+        d.line((224, 215, 216, 223), fill=rgb(CLR_TEXT_DIM), width=1)
+    return im
+
+
+# 左：常态（底部条在）  中：探头直接盖（错误做法）  右：探头 + 让位（正确做法）
+yield_sheet = Image.new("RGB", (W * 3 + GAP * 2, H), rgb(0x05070C))
+yield_sheet.paste(build_hc(True,  False), (0, 0))                  # 常态
+yield_sheet.paste(build_hc(True,  True),  (W + GAP, 0))            # 不让位
+yield_sheet.paste(build_hc(False, True),  (W * 2 + GAP * 2, 0))    # 让位
+yield_sheet.resize((yield_sheet.width * 2, yield_sheet.height * 2), Image.NEAREST)\
+    .save("mock_pet_yield.png")
+
 print("写出 mock_pet.png / mock_pet_idle.png / mock_pet_greet.png / mock_pet_hungry.png")
 print("写出 mock_pet_peek.png / mock_pet_peek_greet.png")
+print("写出 mock_pet_yield.png  （常态 / 盖住 / 让位）")
 print(f"全屏对话气泡宽 216px，每行最多 {216 // 16} 字；探头台词宽 168px，每行 {168 // 16} 字")
