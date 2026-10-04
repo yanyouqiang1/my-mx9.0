@@ -72,12 +72,25 @@
 
 // ---------------------------------------------------------------- 预算常量
 //
-// ⚠ 别想用 BLEDevice::getMTU() 算预算：它返回的是 **m_localMTU**，也就是
-//   BLEDevice::setMTU(517) 自己设进去的那个本地值，不是协商结果。拿它当上限
-//   会算出 514，永远走"装得下"分支 —— 恰好在最需要分片的设备上失效。
-//   所以按最保守的 20 字节硬编码。想要更大吞吐就把协商结果接进来（见 README），
-//   但默认值必须是 20。
-#define BT_PAYLOAD_MAX      20      // 单条通知的字节预算（含末尾的包终止符）
+// ⚠ 千万别用 BLEDevice::getMTU() 算预算：它返回的是 **m_localMTU**，也就是
+//   BLEDevice::setMTU(517) 自己设进去的那个本地**请求**值，不是协商结果。
+//   拿它当上限会算出 514，而实际协商是 min(517, 主机支持) —— 手机/浏览器
+//   常常只给 247 甚至 185，于是每一条通知都会超。超了会怎样？看
+//   BLECharacteristic::notify：它**只打一条 log_w 就把数据截断**，不报错、
+//   不抛异常 —— 收件方拿到的是**残缺的正文**，而这正是丢片那一类
+//   "静默数据损坏"。所以必须取 `pServer->getPeerMTU()`（真正协商后的值），
+//   见 btLinkPayloadMax()。
+//
+// 两个值：
+//   BT_PAYLOAD_MIN      没连上 / 拿不到协商结果时用。必须是最保守的那个 ——
+//                      这条路上错一步就是静默截断。
+//   BT_PAYLOAD_NEGO_MAX 协商成功后允许的上限。留了余量（不用满 244）：
+//                      一包几百字节会让 BLE 协议栈在单个 connection event 里
+//                      长时间占用，个别主机上反而不稳；244 已经能把
+//                      "每包 9 字节"提速 27 倍，把 8KB 日志回拉从 6.7 秒
+//                      压到 0.3 秒以内，够用了。
+#define BT_PAYLOAD_MIN      20      // 保守值：没协商成功时按这个走
+#define BT_PAYLOAD_NEGO_MAX 244     // 协商成功后的上限（不是请求值，是实际值）
 
 // 包终止符是 **'\r'**，不是 '\n'。这不是随手选的：
 //
@@ -96,7 +109,7 @@
 #define BT_PKT_END_STR      "\r"
 
 // 收尾标记 "END" + 终止符 = 4 字节。VERB/KEY 的长度上限由它反推：
-// 一条消息的收尾那一包必须装得下 BT_PAYLOAD_MAX，否则整条消息永远收不到
+// 一条消息的收尾那一包必须装得下当前预算（btLinkPayloadMax()），否则整条消息永远收不到
 // （超预算的通知不是被截断，是**整条被协议栈丢掉**，日志里什么异常都没有）。
 //
 // 这条约束比看上去紧：最长的 verb（MACRODUMP，9 字节）只给 KEY 剩 5 字节，
@@ -152,11 +165,23 @@ void btLinkInit(BLECharacteristic* ch, void (*onCmd)(const String&));
 
 // 连接状态。由 MyServerCallbacks 的 onConnect / onDisconnect 驱动。
 // 断开时正在排队的消息会被清掉（发出去也没人收，白占队列）。
-void btLinkSetConnected(bool connected);
+// srv 是协商后 MTU 的唯一来源（BLECharacteristic::getService() 是私有的，
+// 拿不到 server），由 onConnect 回调传进来。不传就永远退回 BT_PAYLOAD_MIN。
+void btLinkSetConnected(bool connected, BLEServer* srv = nullptr);
 bool btLinkConnected();
 
 // 链路是否可用（特征已绑 + 有人连着）。发包前先问这个。
 bool btLinkReady();
+
+// 一条通知现在实际能带多少字节（含包终止符）。
+//
+// 读的是**真正协商后的** MTU（pServer->getPeerMTU），不是 setMTU 请求的值。
+// 没连上 / 没协商完 / 拿不到 → 退回 BT_PAYLOAD_MIN(20)，绝不乐观。
+// 详见 bt_link.cpp 里 btLinkPayloadMax() 的注释（那里写清了为什么不能用
+// BLEDevice::getMTU，以及超了会静默截断）。
+//
+// 只是**读一下**，可以随便调；但每片分片都会调，所以别在里面加阻塞操作。
+size_t btLinkPayloadMax();
 
 // ---------------------------------------------------------------- 二进制旁路
 //

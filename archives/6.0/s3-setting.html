@@ -547,13 +547,6 @@
                         <option value="5">风格 6：全屏壁纸相册模式</option>
                     </select>
                 </div>
-                <div>
-                    <label>实时按键键名回显 (Keystroke OSD)：</label>
-                    <select id="keystrokeSelect" onchange="toggleKeystroke()">
-                        <option value="1">开启实时按键回显</option>
-                        <option value="0">关闭实时按键回显</option>
-                    </select>
-                </div>
             </div>
         </div>
 
@@ -1360,7 +1353,13 @@
         // 固件不是一口气发完，它把整份 JSON 摊到很多轮主循环上慢慢发
         // （不然一条大 JSON 会把主循环按住、触发任务看门狗重启）。所以这里
         // 是 await 到收尾标记才返回，超时给宽一点。
-        const body = await BtLink.call("CFGDUMP", "CFGGET", 15000);
+        // ⚠ 30 秒不是随便给的：固件把整份 JSON 摊到很多轮主循环上分片发
+        //   （不然一条大 JSON 会把主循环按住、触发任务看门狗重启），每片之间
+        //   还要让 BLE 协议栈喘口气。协商到 MTU 247 时一秒能发几十片，秒级
+        //   就完；但**没协商成功**的设备（只给 20 字节载荷）会退回每片 9 字节，
+        //   20KB 的配置要两千多片、十几秒 —— 那时候 15 秒就会误报超时。
+        //   宁可真慢着等，也不要把"还没发完"报成"一个字节都没收到"。
+        const body = await BtLink.call("CFGDUMP", "CFGGET", 30000);
         if (body === null) {
             // 四种 null 挨个分清，因为它们的修法完全不同，混成一句"超时"
             // 会把用户指到错误的方向上去（这个坑已经踩过一次：sendBLE
@@ -1597,7 +1596,7 @@
         }
         // 只有 CFGEND 带请求号，固件回 CFGSAVE:<请求号>:... 时才配得对
         BtLink._lastSendErr = null;
-        const reply = await BtLink.call("CFGSAVE", "CFGEND", 15000);
+        const reply = await BtLink.call("CFGSAVE", "CFGEND", 30000);
         if (reply === null) {
             // 三种 null 分开说。其中"没发出去"最要紧：固件那边压根没收到
             // CFGEND，而它还开着 5 秒接收窗口，超时后会往日志里报
@@ -2654,10 +2653,16 @@
         await cfgPush(m => { m.disp_mode = mode; });
     }
 
-    async function toggleKeystroke() {
-        const val = document.getElementById('keystrokeSelect').value;
-        await sendBLE("SET_KEYSTROKE:" + val);
-    }
+    // 这里原来还有一个「实时按键键名回显 (Keystroke OSD)」的下拉，
+    // onchange 发 SET_KEYSTROKE:1/0 —— **固件里从来没有这个分支**
+    // （lvgl_s3.ino 全文 grep 不到 SET_KEYSTROKE），点了什么也不会发生。
+    // 那个功能本身是有的，入口是上面那个「显示风格」里的
+    // **风格 4：实时击键监控台 (OSD状态)**（固件 DISP_MODE_KEY_MON = 3），
+    // 走 disp_mode 存配置 JSON。
+    //
+    // 删掉它是因为**死控件比没有控件更糟**：选「关闭」会让人以为关掉了某个
+    // 功能（其实什么都没发生），选「开启」没反应会让人以为键盘坏了；
+    // 而两个控件做同一件事、入口还不一样，迟早有人选错那个没用的。
 
     // ========== 壁纸上传（与原版一致，单独保留） ==========
     let uploadBlob = null;

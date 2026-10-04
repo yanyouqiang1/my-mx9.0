@@ -1426,7 +1426,9 @@ static void sht31_update(void) {
 // 连接状态交给 bt_link：它要在断链时把正在排队的响应清掉（发出去也没人收，
 // 还会把下一条挤掉），所以别在 .ino 里另存一份 deviceConnected。
 class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer)    { btLinkSetConnected(true); }
+    // pServer 要转给 bt_link：协商后的 MTU 只在 server 上（characteristic 的
+    // getService() 是私有的，拿不到），拿不到就一直按 20 字节保守发。
+    void onConnect(BLEServer* pServer)    { btLinkSetConnected(true, pServer); }
     void onDisconnect(BLEServer* pServer) { btLinkSetConnected(false); }
 };
 
@@ -6366,10 +6368,19 @@ static void handleCommand(const String& cmd) {
         //      免得 LOG 行截胡日志面板自己的 waiter），所以这条"兜底"行
         //      **永远匹配不上** REMAPDUMP 前缀，看着像双保险实际是零保险，
         //      还把整张映射表刷进网页日志面板。
-        //   只记条数、正文字节数和分片数 —— 分片数是要紧的：手机上 ATT 载荷只有
-        //   20 时一条规则 1 片、两条 2 片，对不上就说明分片协议又被改坏了。
+        //   只记条数、正文字节数和分片数 —— 分片数是要紧的，它是"分片协议有没有
+        //   被改坏"最直接的判据：MTU 协商失败时（手机上 ATT 载荷只有 20）一条规则
+        //   1 片、两条 2 片，对不上就说明分片这块出问题了。
         const size_t bodyLen = strlen(body);
-        const size_t perFrag = BT_PAYLOAD_MAX - (sizeof("REMAPDUMP:0:") - 1) - 1;   // 头 + '\n'
+        // ⚠ 分片数必须按**当前**预算算。MTU 协商成功后每片能带两百多字节，
+        //   还按 20 字节的旧账本算的话，报出来的片数是实际的十几倍 ——
+        //   看着就像分片坏了，其实只是账本没跟上（这个坑在改 btLinkPayloadMax
+        //   的时候差点真踩进去）。
+        const size_t perFrag = btLinkPayloadMax() - (sizeof("REMAPDUMP:0:") - 1) - 1;   // 头 + 终止符
+        if (perFrag == 0) {   // 预算连头都装不下，emitChunk 本来也发不出去
+            LOG_PORT.printf("[REMAP] read prof=%d 预算装不下协议头\n", prof);
+            return;
+        }
         const size_t frags = bodyLen ? (bodyLen + perFrag - 1) / perFrag : 0;
         LOG_PORT.printf("[REMAP] read prof=%d cnt=%d bytes=%u frags=%u\n", prof,
                         (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0,

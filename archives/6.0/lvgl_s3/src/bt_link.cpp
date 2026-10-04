@@ -99,11 +99,44 @@ static inline size_t headLen(const char* verb, const char* key) {
     return strlen(verb) + 1 + strlen(key) + 1;
 }
 
-// 这一组 VERB/KEY 一次能带多少正文（不含 '\n'）
+// 一条通知现在能带多少字节（含末尾的包终止符）——**按实际协商结果**。
+//
+// 这不是优化，是把一份**早就申请了、却一直没用上**的带宽用起来：
+// setup() 里 BLEDevice::setMTU(517) 已经向主机请求了大 MTU，但分片逻辑一直
+// 按 20 字节硬算，于是手机/浏览器协商到 247 的时候，链路实际只用了 8% 的
+// 带宽。代价直接体现在"大配置拉取会超时"：8KB 日志要 888 片、20KB 配置要
+// 2300 片，每片之间还要 btLinkDelay(6ms) —— 光是这个间隔就是十几秒。
+//
+// ⚠ 为什么必须用 getPeerMTU 而不是 BLEDevice::getMTU()：
+//   getMTU() 返回 m_localMTU = 我们 setMTU(517) 请求的值，**不是协商结果**。
+//   实际生效的是 min(517, 主机支持)。拿请求值当上限，在只给 247 的手机上
+//   每一条通知都会超，而 BLECharacteristic::notify 对超长只打一条 log_w
+//   就**静默截断** —— 收件方拿到残缺正文，正是丢片那一类静默数据损坏。
+//
+// ⚠ 拿不到 / 没连上 / 异常，一律退回 BT_PAYLOAD_MIN。这条路上"乐观"一次
+//   就是静默截断，宁可慢也不能坏。
+// 协商后的 MTU 只在 BLEServer 手上（BLECharacteristic::getService() 是私有的，
+// 拿不到），而 server 是在连接回调里才有的 —— 所以由 onConnect 传进来。
+// 拿不到就一直是 nullptr，btLinkPayloadMax() 退回保守值，不会出错。
+static BLEServer* s_srv = nullptr;
+
+size_t btLinkPayloadMax(void) {
+    if (s_ch == nullptr || !s_connected || s_srv == nullptr) return BT_PAYLOAD_MIN;
+    // 本项目只支持单连接（notify 靠 BLE2902），所以 conn_id 恒为 0。
+    uint16_t mtu = s_srv->getPeerMTU(0);
+    if (mtu <= 3) return BT_PAYLOAD_MIN;          // 还没协商完
+    size_t payload = (size_t)mtu - 3;             // 扣掉 3 字节 ATT 头
+    if (payload > BT_PAYLOAD_NEGO_MAX) payload = BT_PAYLOAD_NEGO_MAX;
+    if (payload < BT_PAYLOAD_MIN)  payload = BT_PAYLOAD_MIN;
+    return payload;
+}
+
+// 这一组 VERB/KEY 一次能带多少正文（不含包终止符）
 static inline size_t chunkRoom(const char* verb, const char* key) {
     size_t h = headLen(verb, key);
-    if (h + 1 >= BT_PAYLOAD_MAX) return 0;   // 头 + '\n' 都塞不下，参数非法
-    return BT_PAYLOAD_MAX - h - 1;
+    size_t max = btLinkPayloadMax();
+    if (h + 1 >= max) return 0;                    // 头 + 终止符都塞不下，参数非法
+    return max - h - 1;
 }
 
 // VERB/KEY 是协议的寻址部分，必须非空、不含 ':' 和 '\n'，
@@ -120,7 +153,7 @@ static bool headOk(const char* verb, const char* key) {
     //   "END" 和终止符正好 21 > 20 —— 而超预算的通知不是被截断，是**整条被
     //   协议栈丢掉**，于是这条消息永远收不到正文也等不到收尾，网页只看到超时，
     //   而且日志里什么异常都没有。（正文分片本身装得下，所以只查正文会漏掉它。）
-    if (headLen(verb, key) + BT_END_MARK_LEN > BT_PAYLOAD_MAX) return false;
+    if (headLen(verb, key) + BT_END_MARK_LEN > btLinkPayloadMax()) return false;
     return true;
 }
 
@@ -142,8 +175,11 @@ void btLinkInit(BLECharacteristic* ch, void (*onCmd)(const String&)) {
     }
 }
 
-void btLinkSetConnected(bool connected) {
+void btLinkSetConnected(bool connected, BLEServer* srv) {
     s_connected = connected;
+    // server 只在连上时给；断开就清掉，免得下次连的是别的实例时拿着旧的
+    // 指针去问 MTU（那会读到一个不相关连接的协商结果）。
+    s_srv = connected ? srv : nullptr;
     if (!connected) {
         // 断开后正在排队的响应发出去也没人收，白占队列，还会把下一条挤掉。
         for (int i = 0; i < BT_TXQ_LEN; i++) s_txq[i].used = false;
@@ -177,7 +213,8 @@ static void notifyPacket(char* pkt, size_t n) {
 // 返回这一片实际带走的正文字节数；0 = 这一片发不了（预算不足）。
 static uint16_t emitChunk(const char* verb, const char* key,
                           const char* body, uint16_t len, uint16_t off) {
-    static char pkt[BT_PAYLOAD_MAX + 8];
+    // 按协商上限分配，不是按 BT_PAYLOAD_MIN —— 分片时才知道实际能带多少
+    static char pkt[BT_PAYLOAD_NEGO_MAX + 8];
     size_t room = chunkRoom(verb, key);
     if (room == 0) return 0;
 
@@ -205,7 +242,7 @@ static uint16_t emitChunk(const char* verb, const char* key,
 }
 
 static void emitEnd(const char* verb, const char* key) {
-    static char pkt[BT_PAYLOAD_MAX + 8];
+    static char pkt[BT_PAYLOAD_NEGO_MAX + 8];
     int m = snprintf(pkt, sizeof(pkt), "%s:%s:END" BT_PKT_END_STR, verb, key);
     if (m > 0 && m < (int)sizeof(pkt)) notifyPacket(pkt, (size_t)m);
 }
@@ -317,15 +354,16 @@ bool btLinkStreamBegin(const char* verb, const char* key, size_t totalLen) {
     //   明确报"传输丢片"而不是往下走。这条握手本身也占一个包，
     //   代价是每条流多 1 包，换掉一整类静默数据损坏，很划算。
     //
-    // ⚠⚠ 它是**和正文第一片连在同一个 body 里**发出的，不是独立的一行，
-    //   而这不是偷懒，是 20 字节预算下唯一的发法，别去"修"：
-    //     · 每片正文只有 chunkRoom = BT_PAYLOAD_MAX - 头长 - 1 = 20-10-1
-    //       = **9 字节**（key 是 1~4 位请求号，CFGDUMP 的头 10 字节）
-    //     · 想让 "LEN:20480" 独立成行，得占 9 字节正文 + 1 字节换行 = 10 > 9
+    // ⚠⚠ 它是**和正文第一片连在同一个 body 里**发出的，不是独立的一行。
+    //   这一点在 MTU 协商成功之后**变得不那么必要了，但仍然不能改** ——
+    //   因为协商可能失败（没连上、主机只给 23），那时的正文预算又回到 9 字节：
+    //     · 最坏情况（未协商）每片正文 = 20 - 头长 10 - 1 = **9 字节**
+    //     · "LEN:20480" 独立成行要 9 字节正文 + 1 字节换行 = 10 > 9
     //     · 硬凑的话分片会从这一行中间切开，网页每片各自带 `VERB:KEY:` 头，
     //       切出来的行是 "LEN:2048" 和 "0" 两段，**永远拼不回 "LEN:20480"**
-    //   所以这里塞进流式单槽的开头，和 JSON 首片连续存放；主机侧必须把
-    //   `LEN:<n>{...` 这种粘连形态一起认掉（见 s3-setting.html 的 _onLine）。
+    //   协商成功时（比如 244 字节预算）它是塞得下独立一行的，但主机侧那个
+    //   "LEN 粘连形态"的分支仍然必须留着 —— 固件降级、老版本、协商失败的
+    //   设备都会走到那条路上。写成"两种形态都认"是唯一稳的做法。
     //   代价是单槽前 8~10 字节被占掉，JSON 的第一片从那儿接上。
     {
         char lenLine[32];
