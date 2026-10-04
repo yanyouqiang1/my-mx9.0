@@ -22,6 +22,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+// 蓝牙链路统一收发层。**蓝牙的收和发都只应该经过它**：
+// 发的时候它负责按 20 字节上限分片、片间留缝、关键响应开独占窗口，并且把
+// 发包摊到多次 loop 上（不然一条 8KB 回拉会把任务看门狗喂爆重启）；
+// 收的时候它负责在 BLE 回调里喂狗、把裸字节旁路给二进制协议、按行攒指令，
+// 再在 loop() 里派发 —— 所有 LVGL 操作仍然只发生在主任务。
+// 协议细节和用法见 src/bt_link.h。
+#include "bt_link.h"
+
 // 诊断日志走 UART0（板载 USB-TTL，烧录用的那个口，PC 上是 COM4）。
 //
 // 为什么不直接用 Serial：platformio.ini 里设了 ARDUINO_USB_CDC_ON_BOOT=1，
@@ -38,18 +46,17 @@
 // handleCommand 里 LOG:on / LOG:off / LOG:dump / LOG:clear 四个分支。
 // 这里只声明 LogMirror 并把 LOG_PORT 指向它，全文 LOG_PORT.printf 不动。
 //
-// BLE 一条 notify 包的上限（含 \0）。必须在 LogMirror 之前定义,
-// 否则类体里的 char lineBuf[BLE_CMD_BUF_SIZE] 编译不过。
-// 这个宏原本放在 BLE 段(第 593 行附近),挪上来只是换个位置,含义没变。
-#define BLE_CMD_BUF_SIZE   256
+// BLE 一条通知能带多少字节 = 协商后的 ATT MTU - 3。协商失败时（手机端
+// 浏览器很常见）只有 23-3 = 20 字节，**超出的不是被截断而是整条被协议栈丢掉**。
+// 分片、收尾标记、片间间隔全在 bt_link 里，这里不再各写一份。
 
 // LogMirror::write() 收完一行就调 pushLogLine()。后者函数体在 BLE 全局段
-// 之后(因为要用 pCharacteristic / deviceConnected),这里先前置声明。
+// 之后（因为要用 btLinkStream），这里先前置声明。
 static void pushLogLine(const char* line);
 
 class LogMirror : public Print {
     HardwareSerial* real;
-    char    lineBuf[BLE_CMD_BUF_SIZE];
+    char    lineBuf[BT_RX_BUF_SIZE];
     size_t  lineLen;
 public:
     LogMirror(HardwareSerial* r) : real(r), lineLen(0) {}
@@ -98,11 +105,28 @@ static LogMirror LogPortProxy(&Serial0);
 static char*  logRingBuf   = nullptr;   // ps_malloc，setup() 里建
 static size_t logRingLen   = 0;
 static bool   logStreamOn  = false;     // LOG:on / LOG:off 控制
-static unsigned long logLastNotifyMs = 0;  // 节流：50Hz 上限
 
-// 推一行进环形缓冲；若 LOG:on 已开，按行做一次 BLE notify（带节流）
-// 函数体在文件下方 BLE 全局变量之后定义（需要 pCharacteristic / deviceConnected），
-// 这里先声明供 LogMirror::write 调用。
+// === LOG:dump 的回拉状态机 ===
+//
+// 环形缓冲会被新日志不断改写（满了就 memmove 丢最老的整行），而回拉要花
+// 1~2 秒 —— 这期间新日志还在往里写，直接对着 logRingBuf 读，读到的位置
+// 早就被顶歪了，回拉出来是错位的行。所以开始时整段 memcpy 一份快照
+// （同样放 PSRAM，8KB），回拉期间只读快照。
+//
+// ⚠ 必须放 PSRAM，不能放 .bss：内部 DRAM 只有 327KB，而项目历史上最主要的
+//   重启原因就是内部堆被吃干（见 lv_mem_port.h 和 elog 的 MEM 告警）。
+static char*  logDumpSnap  = nullptr;   // ps_malloc，setup() 里建
+static size_t logDumpLen   = 0;         // 快照里有多少字节要发
+static size_t logDumpPos   = 0;         // 已经喂给 bt_link 多少字节
+static bool   logDumpActive = false;    // true = 正在流式回拉
+
+// 每轮 loop 推一段快照给 bt_link。缓冲一满就返回，下一轮再来 —— 于是
+// 8KB 回拉变成"每轮喂 ~160 字节、发 ~3 片"，主循环全程还在扫键盘、刷屏幕、
+// 喂看门狗。函数体在 btLinkStreamWrite 之后（下面 LOG 控制那一段）。
+static void logDumpPump(void);
+
+// 推一行进环形缓冲；若 LOG:on 已开，按行推一次流转发（节流在 bt_link 里）
+// 函数体在文件下方，这里先声明供 LogMirror::write 调用。
 static void pushLogLine(const char* line);
 
 // USB HID
@@ -591,83 +615,23 @@ static const char* profileNamesCN[TOTAL_PROFILES] = {
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 static BLEServer* pServer = nullptr;
 static BLECharacteristic* pCharacteristic = nullptr;
-static bool deviceConnected = false;
 static bool oldDeviceConnected = false;
 static unsigned long lastPingTime = 0;
 
-// 推一行进环形缓冲；若 LOG:on 已开，按行做一次 BLE notify（带节流）。
-// 这里是 LogMirror::write 会调到的"主行处理"——
-// 函数体放在 BLE 全局之后，这样 pCharacteristic / deviceConnected 都在作用域里。
+// 这里**不再**有任何"怎么发"的代码。
 //
-// **末尾必须带 \n**：网页端 onBleNotify 按 \n 切行分发，没 \n 就直接被
-// parts.pop() 整个吞进 rest,for 循环空跑,日志框永远不显示 ——
-// 这是第一版"开流没反应"的根因。所有 notify 一律包末尾加 \n。
+// 原来这一段里有 bleNotifyCritical() 和 bleNotifyRemapDump() 两个手写的发送口，
+// 外加 LOG 流自己那一份 notify，5 个动词 5 套分片规则，抄错一处就丢一次包
+// （丢包的表现是网页只能等超时，然后误以为键盘里是 0 条配置）。现在统一走
+// bt_link，全文只有这四种用法：
 //
-// 关键响应的发送口：REMAPDUMP / MACRODUMP / GKEYDUMP / LOGOSTATUS / LOGDUMP。
+//   btLinkReplyC("REMAPDUMP", body)        处理请求的分支里回话（key = 请求号）
+//   btLinkReplyf("GKEYPHASE", "%u", ph)    printf 风格
+//   btLinkStream("LOG", line)              日志流：内部 10Hz 节流 + 给响应让路
+//   btLinkStreamBegin/Write/End            8KB 日志回拉这种大块（正文不进队列）
 //
-// 为什么要单独一个口：日志流 pushLogLine() 和这些响应抢的是**同一条** BLE
-// 通知通道，而 BLE 通知不排队 —— 上一条客户端还没 ACK 时再发，NimBLE 会把
-// 后面的合并/丢弃。开着网页日志面板时 LOG:on 让日志流以 10Hz 持续占通道，
-// 关键响应夹在中间就发不出去，网页的 waitBleNotify 只能等到超时
-// —— 表现是"保存成功了但弹『没能从键盘读回确认』，点读取永远 0 条"。
-//
-// 这里发完关键响应后开一小段独占窗口，期间日志流不许抢。
-// 日志晚 250ms 出现无所谓，关键响应丢了网页就再也对不上了。
-static unsigned long bleCriticalNotifyUntil = 0;
-static void bleNotifyCritical(const char* buf, size_t len) {
-    if (pCharacteristic == nullptr || buf == nullptr || len == 0) return;
-    pCharacteristic->setValue((uint8_t*)buf, len);
-    pCharacteristic->notify();
-    bleCriticalNotifyUntil = millis() + 250;
-}
-
-// ===========================
-// REMAPDUMP 分片发送
-// ===========================
-//
-// ⚠ 单条 BLE 通知能带多少字节 = 协商后的 ATT MTU - 3。**MTU 协商失败时上限就是
-//   默认的 23-3 = 20 字节**（手机端浏览器很常见），超出的部分不是被截断而是
-//   **整条通知被协议栈丢掉** —— 网页那边只看到"等超时"，误以为键盘里是 0 条。
-//
-//   这条 20 字节正好解释了一个一直归因错的不对称：
-//     1 条规则 → "REMAPDUMP:0:128,131\n"        = 20 字节 → 刚好塞得下 ✓
-//     2 条规则 → "REMAPDUMP:0:128,131;131,128\n" = 28 字节 → 整条丢弃 ✗
-//   也就是"单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来"，
-//   以及保存后弹「没能从键盘读回确认」。
-//
-//   ⚠ 别想用 BLEDevice::getMTU() 算预算：它返回的是 **m_localMTU**，
-//   也就是 BLEDevice::setMTU(517) 自己设进去的那个本地值，不是协商结果。
-//   拿它当上限会算出 514，永远走"装得下"分支 —— 恰好在最需要分片的设备上失效。
-//   所以这里按最保守的 20 字节硬编码。
-//
-// 协议：逐片 `REMAPDUMP:<p>:<正文片段>\n`，最后补一条 `REMAPDUMP:<p>:END\n` 收尾。
-// 网页按 prof 累积正文，收到 END 才算读完。
-#define BLE_NOTIFY_PAYLOAD_MAX 20
-#define BLE_NOTIFY_GAP_MS 12   // 片间必须留缝：BLE 通知不排队，贴太近后片会被合并丢弃
-
-static void bleNotifyRemapDump(int prof, const char* rules) {
-    if (pCharacteristic == nullptr) return;
-    char head[24];
-    snprintf(head, sizeof(head), "REMAPDUMP:%d:", prof);
-    const size_t headLen = strlen(head);
-    // 前缀 + 收尾行都装不下就没得救了（TOTAL_PROFILES 只有一位数，实际不可能）
-    if (headLen + 5 >= BLE_NOTIFY_PAYLOAD_MAX) return;
-    const size_t chunk  = BLE_NOTIFY_PAYLOAD_MAX - headLen - 1;   // 留 1 字节给 '\n'
-    const size_t bodyLen = rules ? strlen(rules) : 0;
-
-    char line[BLE_CMD_BUF_SIZE];
-    if (bodyLen > 0) {
-        for (size_t off = 0; off < bodyLen; off += chunk) {
-            size_t n = bodyLen - off;
-            if (n > chunk) n = chunk;
-            int m = snprintf(line, sizeof(line), "%s%.*s\n", head, (int)n, rules + off);
-            bleNotifyCritical(line, (size_t)m);
-            delay(BLE_NOTIFY_GAP_MS);
-        }
-    }
-    int m = snprintf(line, sizeof(line), "REMAPDUMP:%d:END\n", prof);
-    bleNotifyCritical(line, (size_t)m);
-}
+// 业务代码只管"我要说什么"，不再关心一片能带几个字节、片间要不要留缝、
+// 要不要补收尾标记、发包会不会把主循环按住。三件事的完整理由见 src/bt_link.h。
 
 // 节流：100ms / 10Hz。BLE 写一次 attribute + notify 约 7~15ms,
 // 50Hz 节流在 NimBLE 那边的发送队列里还是会堆几十包,流转发 5 秒就把
@@ -696,94 +660,23 @@ static void pushLogLine(const char* line) {
     logRingBuf[logRingLen + n] = '\n';
     logRingLen += n + 1;
 
-    // 流转发：节流 10Hz（100ms/条），每条 notify 末尾加 \n
-    // 关键响应刚发完的那 250ms 内让路（见 bleNotifyCritical）
-    if (logStreamOn && pCharacteristic != nullptr && deviceConnected) {
-        unsigned long now = millis();
-        if (now < bleCriticalNotifyUntil) return;
-        if ((unsigned long)(now - logLastNotifyMs) >= 100) {
-            logLastNotifyMs = now;
-            char out[BLE_CMD_BUF_SIZE];
-            int m = snprintf(out, sizeof(out) - 2, "LOG:%s", line);  // 留 2 字节给 \n\0
-            if (m > 0 && m < (int)sizeof(out) - 2) {
-                out[m]     = '\n';
-                out[m + 1] = '\0';
-                pCharacteristic->setValue((uint8_t*)out, (size_t)(m + 1));
-                pCharacteristic->notify();
-            }
-        }
-    }
+    // 流转发。节流 10Hz（100ms/条）、给关键响应让路、分片收尾，全在 bt_link 里。
+    // 这里只管"要不要把这一行推上通道"，一个字节的协议细节都不碰。
+    if (logStreamOn) btLinkStream("LOG", line);
 }
 
-// 主机指令队列（生产者 = NimBLE 主机任务，消费者 = loop()）。
-// onWrite 只负责入队，绝不碰 LVGL —— 原因见 MyCallbacks::onWrite 的注释。
-// BLE_CMD_BUF_SIZE 已在前面 LogMirror 之前定义。
-#define BLE_CMD_QUEUE_LEN 8
-static QueueHandle_t bleCmdQueue = nullptr;
 static void handleCommand(const String& cmd);   // 真正定义在文件后段的命令解析入口
 
-// ===========================
-// BLE 文本通道的行缓冲
-// ===========================
-//
-// 为什么必须按行拼：BLE 的一"条指令"是逻辑概念，实际是若干个 ATT 包。
-// 固件里 BLEDevice::setMTU(517) 只是**请求**协商，MTU 没协商成功时
-// （Windows 端很常见，实际落到 23~185 字节）网页的 writeValue 会被浏览器
-// 拆成多包。而原来的 onWrite 是"一个包 = 一条完整命令"，于是
-//   `SET:p0_M1:CMB:224,48` 这种 20 多字节的宏
-//   `GSET:M1:PROFILE:1`      这种全局动作
-// 会被切成两半分别进队，handleCommand 拿到的都是残缺指令，什么也不匹配 ——
-// 表现就是"M1 相关的下发一律失败 / 不生效"，而短的（ALERT:RED）反而好使。
-//
-// 这里改成和 USB HID 那条通道一样的纪律：先把字节攒成一行，遇到 \n 提交；
-// 没带 \n 的老客户端（以及网页上零散的单包指令）靠"包间静默"兜底提交。
-// 这块缓冲只在 NimBLE 主机任务里被读写，不跨任务，不需要加锁。
-//
-// ⚠ 这个值从 15 提到 80，是修"下发 2 条规则只存进 1 条"的根因。
-//
-//   网页 sendBLE() 发的是 `str + "\n"` 一个**逻辑值**，但 Web Bluetooth 的
-//   writeValue 会按协商出来的 ATT MTU 把它拆成多个物理包。MTU 协商失败时
-//   （手机端浏览器很常见，落到 20~185 字节）一条 29 字节的
-//   `REMAP:0:clear:224,227;227,224\n` 会被切成 20 + 9 两个包。
-//
-//   15ms 的空闲判定会在**两个包之间**误判成"这条发完了"，于是固件先把
-//   `REMAP:0:clear:224,227;22` 提交掉：解析循环正确地只认出第一条
-//   224,227，尾巴 `7,224` 变成一条谁也不认识的垃圾行。屏幕上于是显示
-//   "1 条已保存"，而用户明明下发了 2 条 —— 交换 Ctrl↔Win 需要的正是第 2 条。
-//
-//   80ms 远大于任何真实的包间隔（同一个 writeValue 的续包是毫秒级连着来的），
-//   又短到不会让不带 \n 的老客户端觉得卡。真正的主终止符始终是 \n，
-//   空闲只是兜底，放宽它不会拖慢网页路径。
-#define BLE_LINE_IDLE_MS 80
-static char          bleLine[BLE_CMD_BUF_SIZE];
-static uint16_t      bleLineLen  = 0;
-static unsigned long bleLineLastMs = 0;
+// 指令队列、按行攒包、空闲兜底提交，全都在 bt_link 里，这里一份副本都不留。
+// 原因（踩过的坑）都搬进了 src/bt_link.h：
+//   · "一个包 = 一条命令"会把长指令（整张映射表、SET:… 宏）切成两半，
+//     handleCommand 拿到的都是残缺指令，什么也不匹配 —— 而短的（ALERT:RED）
+//     反而好使，症状是"M1 相关的下发一律失败"。
+//   · 空闲兜底从 15ms 放宽到 80ms：Web Bluetooth 的 writeValue 会按协商出来的
+//     ATT MTU 拆包（协商失败时 20~185 字节），15ms 会在**同一个 writeValue 的
+//     两个包之间**误判成"这条发完了"，于是 29 字节的
+//     `REMAP:0:clear:224,227;227,224` 被当成两条命令收下，"下发 2 条只存进 1 条"。
 
-// 把攒到的一行塞进队列。队列满时丢最老的一条，保证新指令一定能进去（宁旧不新）。
-static void bleLineSubmit(void) {
-    if (bleLineLen == 0 || bleCmdQueue == nullptr) { bleLineLen = 0; return; }
-    bleLine[bleLineLen] = '\0';
-    bleLineLen = 0;
-    if (xQueueSend(bleCmdQueue, bleLine, 0) != pdTRUE) {
-        char drop[BLE_CMD_BUF_SIZE];
-        if (xQueueReceive(bleCmdQueue, drop, 0) == pdTRUE) {
-            xQueueSend(bleCmdQueue, bleLine, 0);
-        }
-    }
-}
-
-// 在 loop() 里把队列排空，逐条喂给 handleCommand()。
-// 一轮最多处理 4 条：BLE 灌进来的指令量很小，卡住主循环反而会让屏幕和键盘
-// 一起变卡；而 4 条的量足以在两轮 loop 内把 8 深的队列清空。
-static void drainBleCommands(void) {
-    if (bleCmdQueue == nullptr) return;
-    static char buf[BLE_CMD_BUF_SIZE];
-    for (int i = 0; i < 4; i++) {
-        if (xQueueReceive(bleCmdQueue, buf, 0) != pdTRUE) return;
-        buf[BLE_CMD_BUF_SIZE - 1] = '\0';
-        handleCommand(String(buf));
-    }
-}
 
 // ===========================
 // C3 串口通道（灯光键 / 静音键 / CPG 键 / 旋钮）
@@ -1386,15 +1279,18 @@ static void sht31_update(void) {
 // ===========================
 // BLE 回调
 // ===========================
+//
+// 连接状态交给 bt_link：它要在断链时把正在排队的响应清掉（发出去也没人收，
+// 还会把下一条挤掉），所以别在 .ino 里另存一份 deviceConnected。
 class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) { deviceConnected = true; }
-    void onDisconnect(BLEServer* pServer) { deviceConnected = false; }
+    void onConnect(BLEServer* pServer)    { btLinkSetConnected(true); }
+    void onDisconnect(BLEServer* pServer) { btLinkSetConnected(false); }
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
     // **这里绝不能直接调 handleCommand()**
     //
-    // onWrite 跑在 NimBLE 的主机任务里，而 LVGL 的全部对象都归 loop() 那个
+    // onWrite 跑在蓝牙协议栈自己的任务里，而 LVGL 的全部对象都归 loop() 那个
     // Arduino 任务所有。handleCommand() 一进去就是 triggerHud() /
     // drawNotifPanel() / renderCurrentDisplayBase()，全都直接 lv_obj_create /
     // lv_obj_del，既没拿 lvgl_port_lock，又和 loop() 里的
@@ -1404,50 +1300,44 @@ class MyCallbacks : public BLECharacteristicCallbacks {
     // 症状：主机发 ALERT:RED / ALERT:GREEN（或者 DISP_MODE:n 切风格）在弹通知的
     // 瞬间整机死机，而单独用键盘切风格一切正常 —— 差别就在"谁发起的"。
     //
-    // 正确做法：回调里只把原始字节丢进队列，真正的解析和 LVGL 操作留给
-    // loop()（见 drainBleCommands()），那条路径和按键触发的路径在同一个任务里。
+    // 所以这个回调体只剩一行：把原始字节交给 bt_link，剩下的（喂狗、二进制
+    // 分流、按行攒包、入队）都在那边，而解析和 LVGL 操作仍然留在 loop()
+    // （btLinkPoll() → handleCommand），和键盘触发的路径在同一个任务里。
     void onWrite(BLECharacteristic* pCharacteristic) {
         std::string raw = pCharacteristic->getValue();
-        if (bleCmdQueue == nullptr || raw.empty()) return;
-
-        // 壁纸二进制模式：这一包是 JPEG 原始字节，里面有 0x00，
-        // 走下面的 memcpy + 队列会被在第一个 0 处截断，所以在这里就分流掉。
-        // 唯一要放回命令通道的是网页端重传时补发的 LOGO_JPEG_START —— 此时
-        // 固件还卡在上一轮的接收模式里，得让它先看见这条命令才复位。
-        // 用 "LOGO_" 做暗号是安全的：JPEG 首字节必然是 0xFF，撞不上 ASCII。
-        //
-        // 判断条件必须用 logoRxActive，不能用 "logoRxBuf != nullptr"：
-        // 接收缓冲现在是常驻的（传完也不释放），用指针判断会导致传完之后
-        // 蓝牙进来的**所有文本指令**都被当成 JPEG 字节吃掉 —— 表现为
-        // 上传一次壁纸之后，ME 键和其它蓝牙配置全部失灵。
-        if (logoRxActive && !logoRxDone &&
-            !(raw.size() >= 5 && memcmp(raw.data(), "LOGO_", 5) == 0)) {
-            handleLogoChunk((const uint8_t*)raw.data(), raw.size());
-            return;
-        }
-
-        // 文本通道：先按行拼，攒满一整行（\n 结尾，或包间静默 15ms）再入队。
-        // 一个包 = 一条命令的老做法会把长指令（宏、全局动作）切成两半，
-        // 详见 bleLineSubmit() 上面的说明。
-        unsigned long now = millis();
-        if (bleLineLen > 0 && (unsigned long)(now - bleLineLastMs) > BLE_LINE_IDLE_MS) {
-            bleLineSubmit();
-        }
-        for (size_t i = 0; i < raw.size(); i++) {
-            char c = (char)raw[i];
-            if (c == '\0') continue;                       // 补长度的 0，不是内容
-            if (c == '\n' || c == '\r') { bleLineSubmit(); continue; }
-            // 超长行：**丢尾部**，不要 bleLineSubmit()。
-            // 提交的话，剩下的字节会变成一条全新的命令被 handleCommand 解析 ——
-            // 那正是"一条长命令被劈成两半、半截也能匹配上"的毒：截断点
-            // 只要落在冒号之后，残行照样是个合法命令，会静默改坏配置。
-            // 丢尾巴最坏只是这条超长命令不完整、匹配不上，配置不会错。
-            if (bleLineLen >= BLE_CMD_BUF_SIZE - 1) continue;
-            bleLine[bleLineLen++] = c;
-        }
-        bleLineLastMs = now;
+        if (raw.empty()) return;
+        btLinkOnWrite((const uint8_t*)raw.data(), raw.size());
     }
 };
+
+// ===========================
+// 蓝牙二进制旁路（壁纸 JPEG）
+// ===========================
+//
+// 这一段是 bt_link 的"二进制协议"钩子，形状和上面那条文本通道是并列的：
+// 蓝牙发过来的东西到底是**指令**还是**裸数据**，由这里判定，bt_link 负责在
+// 文本通道之前先问一句。新增一种二进制协议（比如以后做固件推送）只要再挂
+// 一组 probe/sink，不用去改 bt_link，也不用碰 onWrite。
+//
+// ⚠ probe / sink 都跑在蓝牙协议栈任务里：不许阻塞、不许碰 LVGL / NVS / SPI。
+//
+// JPEG 原始字节里必然有 0x00，走按行拼的文本通道会被在第一个 0 处截碎，
+// 所以必须在它之前分流。唯一要放回命令通道的是网页端重传时补发的
+// LOGO_JPEG_START —— 此时固件还卡在上一轮的接收模式里，得让它先看见这条
+// 命令才复位。用 "LOGO_" 做暗号是安全的：JPEG 首字节必然是 0xFF，撞不上 ASCII。
+//
+// ⚠ 判断条件必须用 logoRxActive，不能用 "logoRxBuf != nullptr"：
+//   接收缓冲现在是常驻的（传完也不释放），用指针判断会导致传完之后
+//   蓝牙进来的**所有文本指令**都被当成 JPEG 字节吃掉 —— 表现为
+//   上传一次壁纸之后，ME 键和其它蓝牙配置全部失灵。
+static bool logoRxProbe(const uint8_t* data, size_t len) {
+    if (!logoRxActive || logoRxDone) return false;
+    return !(len >= 5 && memcmp(data, "LOGO_", 5) == 0);
+}
+static void logoRxSink(const uint8_t* data, size_t len) {
+    handleLogoChunk(data, len);
+}
+
 
 // ===========================
 // 样式工具
@@ -2089,12 +1979,10 @@ static void abortLogoUpload(const char* reason) {
     // 壁纸是不是经常传到一半就断（多半是蓝牙距离或网页被关掉了）。
     ELWARN("WALL", "壁纸传输中断 %s", reason);
     triggerHud("壁纸传输", reason, lv_color_hex(CLR_RED));
-    // 失败也要回报，否则网页只能干等到超时
-    {
-        char out[80];
-        snprintf(out, sizeof(out), "LOGOSTATUS:FAIL:%.40s", reason);
-        bleNotifyCritical(out, strlen(out));
-    }
+    // 失败也要回报，否则网页只能干等到超时。
+    // ⚠ 网页在传输期间会高频轮 LOGO_STATUS，多发一条同内容的通知会被 BLE
+    //   合并掉（通知不排队），所以这里只发这一条，别再顺手 LOG 一遍。
+    btLinkReplyf("LOGOSTATUS", "FAIL:%.40s", reason ? reason : "?");
 }
 
 // 二进制接收：这段是 JPEG 原始字节，里面必然有 0x00，
@@ -2225,10 +2113,7 @@ static void finishLogoUpload(void) {
     // 主动回报：网页轮询 LOGO_STATUS 时能拿到确定答案。
     // 以前网页"字节发完"就 alert 上传成功，那是假成功 —— BLE 写成功只说明
     // 数据交给蓝牙了，不代表键盘解出来、落盘了。
-    {
-        char okmsg[24] = "LOGOSTATUS:OK:0/0";
-        bleNotifyCritical(okmsg, strlen(okmsg));
-    }
+    btLinkReplyC("LOGOSTATUS", "OK:0/0");
 }
 
 // 开机：SPIFFS 里有 /logo.bin 就读回 PSRAM，重启不用重传。
@@ -5158,7 +5043,7 @@ static void scanKeyboardMatrix(void) {
                             // 强制重置节流,确保 kbPress 里那条 [KB] press code=... 不会被吞掉。
                             // 按键两条日志挨着(<1ms),正常 100ms 节流会把第二条丢了,
                             // 那样就看不到 kbPress 走哪个分支,定位就缺一半证据。
-                            logLastNotifyMs = 0;
+                            btLinkStreamResetThrottle();
                             kbPress((uint8_t)mappedKey);
                             }
                         }
@@ -5428,15 +5313,17 @@ static void handleCommand(const String& cmd) {
         }
     }
     // REMAPREAD:p - 把方案 p 现有的规则回读给网页
-    // （回读只能靠 BLE notify。正文超 20 字节时分片发，详见 bleNotifyRemapDump）
+    // （回读只能靠蓝牙 notify，正文超 20 字节时分片发 —— 分片由 bt_link 做）
     else if (cmd.startsWith("REMAPREAD:")) {
         int prof = cmd.substring(9).toInt();
-        // 这里只拼**正文**（"128,131;131,128"），头部和收尾交给 bleNotifyRemapDump 分片。
-        // 旧代码在这里自己拼完整的 "REMAPDUMP:<p>:<rules>\n"：2 条规则整行 28 字节，
-        // 超过手机端浏览器常见的 20 字节 ATT 载荷上限，**整条通知被协议栈丢掉**，
-        // 网页只等到来一个超时 → 弹「没能从键盘读回确认」、列表刷新成 0 条。
-        // 1 条规则刚好 20 字节能过、2 条就丢，这个不对称一直没人认出来。
-        char body[BLE_CMD_BUF_SIZE];
+        // 这里只拼**正文**（"128,131;131,128"），头部、分片、收尾标记全交给 bt_link。
+        //
+        // 为什么必须分片：单条通知能带多少字节 = 协商后的 ATT MTU - 3，协商失败时
+        // （手机端浏览器很常见）只有 23-3 = 20 字节，超出的**不是被截断而是整条
+        // 通知被协议栈丢掉**。2 条规则整行 28 字节 → 整条丢 → 网页只等来一个超时
+        // → 弹「没能从键盘读回确认」、列表刷新成 0 条。而 1 条规则刚好 20 字节能过，
+        // 这个不对称一直没人认出来（"单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来"）。
+        char body[BT_TX_BODY_MAX];
         body[0] = '\0';
         int n = 0;
         if (prof >= 0 && prof < TOTAL_PROFILES) {
@@ -5447,8 +5334,8 @@ static void handleCommand(const String& cmd) {
             }
             body[n] = '\0';
         }
-        // prof 越界时 body 保持空：网页只会收到一条孤零零的 END，语义是"读不到"。
-        bleNotifyRemapDump(prof, body);
+        // prof 越界时 body 保持空：网页只会收到一条空正文，语义是"读不到"。
+        btLinkReplyC("REMAPDUMP", body);
         // ⚠ 这里原来打的是 `[REMAP] read prof=%d -> %s`，把整条 out 原样灌进 LOG_PORT。
         //   看着像"多打一条调试信息"，实际有两个害处：
         //   1) LOG_PORT 会给每行加 "LOG:" 前缀再 notify，于是同一次读取会发出
@@ -5461,7 +5348,7 @@ static void handleCommand(const String& cmd) {
         //   只记条数、正文字节数和分片数 —— 分片数是要紧的：手机上 ATT 载荷只有
         //   20 时一条规则 1 片、两条 2 片，对不上就说明分片协议又被改坏了。
         const size_t bodyLen = strlen(body);
-        const size_t perFrag = (BLE_NOTIFY_PAYLOAD_MAX - 12 > 0) ? (BLE_NOTIFY_PAYLOAD_MAX - 12) : 1;
+        const size_t perFrag = BT_PAYLOAD_MAX - (sizeof("REMAPDUMP:0:") - 1) - 1;   // 头 + '\n'
         const size_t frags = bodyLen ? (bodyLen + perFrag - 1) / perFrag : 0;
         LOG_PORT.printf("[REMAP] read prof=%d cnt=%d bytes=%u frags=%u\n", prof,
                         (prof >= 0 && prof < TOTAL_PROFILES) ? remapCounts[prof] : 0,
@@ -5480,29 +5367,26 @@ static void handleCommand(const String& cmd) {
         triggerHud("按键重映射", buf, lv_color_hex(CLR_ACCENT));
     }
     // MACRODUMP:p{N}_{MKey} - 把方案 N 的 MKey 宏回读给网页
-    // 协议:`MACRODUMP:p0_M1:SEQ:abc...` / `MACRODUMP:p0_M1:CMB:128,4` /
-    //       `MACRODUMP:p0_M1:NONE`(未设置)
-    // 注意:BLE notify 受 BLE_CMD_BUF_SIZE=256 限制,SEQ 击键流超过 ~240 字节会被截断。
-    // 实际击键流(尤其是带 [ENTER] 的)很少超 100 字节,但极长字符串会丢尾,网页要明确提示。
+    // 响应 key = 宏名（"p0_M1"），正文 = 宏体。
+    //   `MACRODUMP:p0_M1:SEQ:abc...` / `MACRODUMP:p0_M1:CMB:128,4` /
+    //   `MACRODUMP:p0_M1:NONE`（未设置）
+    //
+    // 以前这里是**自己拼一整行再 notify**，而一行 30 字节就够让手机端浏览器
+    // 把整条通知丢掉（ATT 载荷上限 20 字节）。也就是说"M1 有宏"读不回来、
+    // "M1 是空的"反而读得回来 —— 和 REMAPDUMP 那个 1 条/2 条不对称同一个病。
+    // 现在只发正文，分片和收尾标记交给 bt_link。
+    // 正文上限 = BT_TX_BODY_MAX，超了截断并标 ...TRUNC（网页要能提示"读回不完整"）。
     else if (cmd.startsWith("MACRODUMP:")) {
         String key = cmd.substring(10);
         String val = preferences.getString(key.c_str(), "");
-        // 拼成 `MACRODUMP:<key>:<val>`,val 为空时显式 NONE 让网页知道"该键无宏"
-        char out[BLE_CMD_BUF_SIZE];
         bool truncated = false;
-        if (val.length() == 0) {
-            snprintf(out, sizeof(out), "MACRODUMP:%s:NONE\n", key.c_str());
-        } else {
-            // 留 1 字节给 '\0' + 1 字节给结尾 '\n'，val 太长则截断并标 TRUNC
-            size_t keyLen = strlen("MACRODUMP:") + key.length() + 1;  // "MACRODUMP:" + key + ":"
-            if (keyLen + val.length() >= sizeof(out) - 9) {
-                truncated = true;
-                val = val.substring(0, sizeof(out) - 9 - keyLen - 1);
-            }
-            snprintf(out, sizeof(out), "MACRODUMP:%s:%s%s\n",
-                     key.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
+        if (val.length() > BT_TX_BODY_MAX - 10) {
+            truncated = true;
+            val = val.substring(0, BT_TX_BODY_MAX - 10);
         }
-        bleNotifyCritical(out, strlen(out));
+        if (val.length() == 0) val = "NONE";   // 显式 NONE，让网页知道"该键无宏"
+        else if (truncated) val += "...TRUNC";
+        btLinkReplyC("MACRODUMP", val.c_str());
         LOG_PORT.printf("[MACRODUMP] %s len=%u truncated=%d\n",
                         key.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
     }
@@ -5511,7 +5395,9 @@ static void handleCommand(const String& cmd) {
     // 新用法 `GKEYDUMP:MA:a`         → 读 g_MAa   (状态 A, 双状态切换)
     //       `GKEYDUMP:MA:b`          → 读 g_MAb   (状态 B)
     // 协议:`GKEYDUMP:MA:SW:1+CMB:128,4` / `GKEYDUMP:MA:a:NONE`
-    // BLE notify 上限 BLE_CMD_BUF_SIZE=256, payload 太长会被截断并加 ...TRUNC 后缀。
+    // 响应 key 用 '_' 代替请求里的 ':'（"MA:a" → "MA_a"）：协议的 key 是
+    // "VERB:KEY:<正文>" 三段切分，正文里本来就带冒号（"SW:1+CMB:…"），
+    // key 里再带冒号就切不开了。
     else if (cmd.startsWith("GKEYDUMP:")) {
         String rest = cmd.substring(9);              // "MA" / "MA:a" / "MA:b"
         String val;
@@ -5532,27 +5418,19 @@ static void handleCommand(const String& cmd) {
             String gKey = "g_" + rest;
             val = preferences.getString(gKey.c_str(), "");
         }
-        char out[BLE_CMD_BUF_SIZE];
         bool truncated = false;
-        if (val.length() == 0) {
-            snprintf(out, sizeof(out), "GKEYDUMP:%s:NONE\n", dumpTag.c_str());
-        } else {
-            // 留 1 字节给 '\0' + 1 字节给结尾 '\n'，val 太长则截断并标 TRUNC(参考 MACRODUMP 那段)
-            size_t prefixLen = strlen("GKEYDUMP:") + dumpTag.length() + 1;  // "GKEYDUMP:" + tag + ":"
-            if (prefixLen + val.length() >= sizeof(out) - 9) {
-                truncated = true;
-                val = val.substring(0, sizeof(out) - 9 - prefixLen - 1);
-            }
-            snprintf(out, sizeof(out), "GKEYDUMP:%s:%s%s\n",
-                     dumpTag.c_str(), val.c_str(), truncated ? "...TRUNC" : "");
+        if (val.length() > BT_TX_BODY_MAX - 10) {
+            truncated = true;
+            val = val.substring(0, BT_TX_BODY_MAX - 10);
         }
-        bleNotifyCritical(out, strlen(out));
+        if (val.length() == 0) val = "NONE";
+        else if (truncated) val += "...TRUNC";
+        btLinkReplyC("GKEYDUMP", val.c_str());
         LOG_PORT.printf("[GKEYDUMP] %s len=%u truncated=%d\n",
                         dumpTag.c_str(), (unsigned)val.length(), truncated ? 1 : 0);
     }
     // GKEYPHASE:KEY - 读 MA/MB 当前相位(下次按下将执行哪一套状态)
     // 响应:`GKEYPHASE:MA:<0|1>`。缺省 0(下次按 = 状态 A)。
-    // BLE notify 单条上限 256 字节,这里响应很短,不会触发截断。
     else if (cmd.startsWith("GKEYPHASE:")) {
         String key = cmd.substring(10);
         if (key != "MA" && key != "MB") {
@@ -5562,9 +5440,7 @@ static void handleCommand(const String& cmd) {
             snprintf(phKey, sizeof(phKey), "g_%s_ph", key.c_str());
             uint8_t ph = preferences.getUChar(phKey, 0);
             if (ph > 1) ph = 0;   // 容错:被人手动写过 NVS 时强行纠正
-            char out[BLE_CMD_BUF_SIZE];
-            snprintf(out, sizeof(out), "GKEYPHASE:%s:%u\n", key.c_str(), (unsigned)ph);
-            bleNotifyCritical(out, strlen(out));
+            btLinkReplyf("GKEYPHASE", "%u", (unsigned)ph);
             LOG_PORT.printf("[GKEYPHASE] %s = %u\n", key.c_str(), (unsigned)ph);
         }
     }
@@ -5578,9 +5454,7 @@ static void handleCommand(const String& cmd) {
             char phKey[16];
             snprintf(phKey, sizeof(phKey), "g_%s_ph", key.c_str());
             preferences.putUChar(phKey, 0);
-            char out[BLE_CMD_BUF_SIZE];
-            snprintf(out, sizeof(out), "GKEYPHASE:%s:0\n", key.c_str());
-            bleNotifyCritical(out, strlen(out));
+            btLinkReplyC("GKEYPHASE", "0");
             LOG_PORT.printf("[GKEYPHASE_RESET] %s -> 0\n", key.c_str());
             triggerHud("相位重置", key.c_str(), lv_color_hex(CLR_ACCENT));
         }
@@ -5743,76 +5617,54 @@ static void handleCommand(const String& cmd) {
     // 为什么单独拎出来:USB HID 模式下 UART0 基本看不到,调试被掐断,
     // 这里把 LOG_PORT.printf 的所有字节搬上 BLE 实时回传到网页日志面板。
     // 设计:
-    //   LOG:on     - 打开实时流(新日志按行 notify `LOG:<text>\n`,10Hz 节流)
+    //   LOG:on     - 打开实时流(新日志按行 push 进 btLinkStream,10Hz 节流)
     //   LOG:off    - 关掉流转发(缓冲仍然在落,只是不 notify 了)
-    //   LOG:dump   - 把环形缓冲整段按行 notify `LOGDUMP:<chunk>\n` ... `LOGDUMP:END\n`
+    //   LOG:dump   - 把环形缓冲整段流式发出去(见 logDumpPump)
     //   LOG:clear  - 清空环形缓冲(不影响流转发开关)
-    // 网页侧 onBleNotify 已经按 \n 拼行分发,加 LOG: / LOGDUMP: 两条分支即可显示。
-    // **所有响应末尾必须带 \n**:网页端的 split('\n') 才能切出完整行给 LOG_PORT_UI /
-    // appendLogLine,不然会被 parts.pop() 整个吞进 rest,for 循环空跑。
+    // 网页侧已经有一条通用的重组通道(见 BtLink),LOG / LOGDUMP 都在它上面,
+    // 这里不用再关心"一片带多少字节""要不要补 END"这类事。
     else if (cmd == "LOG:on") {
         logStreamOn = true;
-        logLastNotifyMs = 0;            // 立即允许第一条(开流响应那条不卡)
-        bleNotifyCritical("LOG:STREAM_ON\n", 15);
+        btLinkSendC("LOG", "0", "STREAM_ON");
         LOG_PORT.println("[LOG] stream ON");
     }
     else if (cmd == "LOG:off") {
         logStreamOn = false;
-        bleNotifyCritical("LOG:STREAM_OFF\n", 16);
+        btLinkSendC("LOG", "0", "STREAM_OFF");
         LOG_PORT.println("[LOG] stream OFF");
     }
     else if (cmd == "LOG:clear") {
         logRingLen = 0;
-        bleNotifyCritical("LOG:CLEARED\n", 12);
+        btLinkSendC("LOG", "0", "CLEARED");
         LOG_PORT.println("[LOG] buffer cleared");
     }
     else if (cmd == "LOG:dump") {
-        if (pCharacteristic && logRingBuf) {
-            // 单包上限 BLE_CMD_BUF_SIZE - "LOGDUMP:" 前缀开销(~8字节) -
-            // 末尾\0 - 留点余量 -> 一片不超过 220 字节。
-            // 按整行切(不要在行中间断),保证网页那边拼起来是一行一行。
-            // 末尾必加 \n:网页按 \n 切行,缺一个整片就废了。
-            const size_t chunkMax = 220;
-            size_t pos = 0;
-            bool sent = false;
-            while (pos < logRingLen) {
-                size_t end = pos;
-                while (end < logRingLen && end - pos < chunkMax) {
-                    if (logRingBuf[end] == '\n') { end++; break; }
-                    end++;
-                }
-                if (end == pos) { end++; }   // 兜底:行比 chunkMax 还长就硬切
-                char out[BLE_CMD_BUF_SIZE];
-                int m = snprintf(out, sizeof(out) - 2, "LOGDUMP:");
-                int n = 0;
-                if (m > 0 && m < (int)sizeof(out) - 2) {
-                    n = snprintf(out + m, sizeof(out) - 2 - m, "%.*s",
-                                 (int)(end - pos), logRingBuf + pos);
-                }
-                int total = (n > 0) ? m + n : m;
-                if (total < (int)sizeof(out) - 2) {
-                    out[total++] = '\n';     // 末尾必加 \n
-                    out[total]   = '\0';
-                }
-                if (total > 0) {
-                    bleNotifyCritical(out, (size_t)total);
-                    sent = true;
-                }
-                pos = end;
-                // 让 NimBLE 任务跑一下,处理刚才发出的 notify。
-                // delay(5) 在每包之间堵 5ms,8KB 缓冲全 dump 完会卡 200ms+,
-                // 屏幕和键盘扫描都会肉眼可见地抖。yield() 等价于
-                // vTaskDelay(1),NimBLE 任务抢到时间片继续发包,
-                // 但 loop() 这边差不多 1ms 内又回来 —— 实际效果接近不卡。
-                yield();
+        // 这里**不做任何发送**，只是开一条流并记下要回拉多少字节。
+        // 环形缓冲有 8KB，按 20 字节一片就是 400+ 片，一次性同步推完等于把
+        // 主循环按住 8 秒 —— loop() 挂在任务看门狗上（10 秒、panic），
+        // 期间键盘扫描和屏幕全停，用户看到的就是"一点日志就重启"。
+        // 真正的发送在 loop() 的 logDumpPump() 里分摊进行。
+        if (logRingBuf == nullptr || !btLinkReady()) {
+            btLinkSendC("LOGDUMP", "0", "");   // 缓冲还没建好/没连上，也得回一条收尾
+        } else if (logDumpActive) {
+            LOG_PORT.println("[LOG] dump already running");
+        } else if (logDumpSnap == nullptr) {
+            ELWARN("LOG", "回拉快照没内存");
+            btLinkSendC("LOGDUMP", "0", "");
+        } else {
+            memcpy(logDumpSnap, logRingBuf, logRingLen);   // 冻结一份，见下
+            logDumpLen = logRingLen;
+            logDumpPos = 0;
+            if (btLinkStreamBegin("LOGDUMP", "0", logDumpLen)) {
+                logDumpActive = true;
+                logDumpPump();     // 先推一轮，空缓冲也能立刻收到 END
+            } else {
+                // 上一轮回拉还在发（单槽没腾空），或者链路掉线了。
+                // 无论如何要回一条收尾标记，否则网页会干等 15 秒。
+                ELWARN("LOG", "回拉没开出去 上一轮可能还在发");
+                btLinkReplyC("LOGDUMP", "");
             }
-            if (!sent) {
-                // 缓冲空也要回一个,免得网页干等
-                bleNotifyCritical("LOGDUMP:\n", 9);
-            }
-            bleNotifyCritical("LOGDUMP:END\n", 13);
         }
-        LOG_PORT.printf("[LOG] dump %u bytes\n", (unsigned)logRingLen);
     }
     // ME 键文本：网页端把 UTF-8 文本转成 hex 后分片下发，这里只负责落盘。
     // 按下 ME 键时才由 executeMacro("ME") 读出来发给电脑（见那里的 [HEXS] 协议），
@@ -5963,17 +5815,15 @@ static void handleCommand(const String& cmd) {
     // 网页以前是"发完字节就 alert 上传成功"，那是**假成功**：BLE 写成功只说明
     // 数据交给蓝牙了，不代表键盘解出来、落盘了。现在键盘主动回报状态。
     else if (cmd == "LOGO_STATUS") {
-        char out[64];
         const char* state = logoRxActive ? (logoRxDone ? "READY" : "RECV")
                                          : (wpReady ? "OK" : "IDLE");
-        snprintf(out, sizeof(out), "LOGOSTATUS:%s:%lu/%lu",
-                 state, (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
-        bleNotifyCritical(out, strlen(out));
-        // 同 REMAPREAD：不要把 out 原样再灌一遍 LOG_PORT。
-        // 网页那边 waitBleNotify("LOGOSTATUS:") 是 waiter 路径，而带 "LOG:" 前缀的
-        // 这条在 onBleNotify 里会被日志分支先吃掉、永远匹配不上前缀，等于
-        // 白白发一次还多制造一条内容相同的 notify（BLE 会把连续相同通知合并掉）。
-        // 壁纸上传期间网页在高频轮询 LOGO_STATUS，多发一条的代价被放大。
+        btLinkReplyf("LOGOSTATUS", "%s:%lu/%lu", state,
+                     (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+        // 同 REMAPREAD：不要把这条响应原样再灌一遍 LOG_PORT。
+        // 网页那边是 waiter 路径，而带 "LOG:" 动词的这行会被日志面板的处理器
+        // 先吃掉、永远匹配不上前缀，等于白发一次，还多制造一条内容相同的
+        // notify（BLE 会把连续相同通知合并掉）。壁纸上传期间网页在高频轮
+        // LOGO_STATUS，多发一条的代价被放大。
         LOG_PORT.printf("[WALLPAPER] status: %s:%lu/%lu\n", state,
                         (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
     }
@@ -6013,6 +5863,43 @@ static void handleCommand(const String& cmd) {
         } else {
             handleC3Command(cmd);
         }
+    }
+}
+
+// 每轮 loop 推进一点回拉。必须放在 loop() 里（不是 LOG:dump 的处理分支里），
+// 因为发包是分摊的：一次回拉几百片，BT_POLL_BUDGET_MS 之外的时间必须还给
+// 键盘扫描、LVGL 和看门狗。
+static void logDumpPump() {
+    if (!logDumpActive) return;
+    btLinkKeepAlive();
+
+    if (!btLinkStreamBusy()) {        // 链断了 / 对端没了：收摊，别一直挂着
+        logDumpActive = false;
+        return;
+    }
+    size_t room = btLinkStreamRoom();
+    if (room == 0) return;            // 单槽满了，等下一轮再喂
+
+    size_t pos = logDumpPos;
+    // 切在行尾，别在行中间断 —— 网页那边拼起来才是一行一行。
+    size_t end = pos;
+    while (end < logDumpLen && end - pos < 160) {
+        if (logDumpSnap[end] == '\n') { end++; break; }
+        end++;
+    }
+    if (end == pos) end++;            // 兜底：单行超过 160 字节就硬切
+    // ⚠ 必须用 room 封顶，而且只推进真正写进去的字节。btLinkStreamWrite 装不下
+    //   时是**截断**（返回 true），按整段推进游标的话，被截掉的尾巴永远没人
+    //   再喂 —— 8KB 日志回拉会静默丢掉最后一段，网页那边看不出来。
+    size_t n = end - pos;
+    if (n > room) n = room;
+    btLinkStreamWrite(logDumpSnap + pos, n);
+    logDumpPos = pos + n;
+
+    if (logDumpPos >= logDumpLen) {
+        btLinkStreamEnd();            // 剩下的由 btLink 发完并补收尾标记
+        logDumpActive = false;        // 注意别在这里等它发完：StreamBusy() 会告诉你
+        LOG_PORT.printf("[LOG] dump %u bytes handed to link\n", (unsigned)logDumpLen);
     }
 }
 
@@ -6936,6 +6823,10 @@ void setup() {
         logRingBuf = (char*)ps_malloc(LOG_BUF_CAP);
         if (logRingBuf) {
             memset(logRingBuf, 0, LOG_BUF_CAP);
+            // 回拉快照：LOG:dump 期间环形缓冲还会被新日志改写，不冻结一份
+            // 读出来的行是错位的。放 PSRAM，别占内部 DRAM。
+            logDumpSnap = (char*)ps_malloc(LOG_BUF_CAP);
+            if (logDumpSnap) memset(logDumpSnap, 0, LOG_BUF_CAP);
             LOG_PORT.println("[LOG] ring buffer ready (PSRAM 8KB)");
         } else {
             LOG_PORT.println("[LOG] ps_malloc failed, BLE log disabled");
@@ -7091,8 +6982,6 @@ void setup() {
     // BLE
     BLEDevice::init("YYQ-MX9.0");
     BLEDevice::setMTU(517);
-    // 必须在 BLE 起来之前建好：onWrite 里判的就是 bleCmdQueue != nullptr
-    bleCmdQueue = xQueueCreate(BLE_CMD_QUEUE_LEN, BLE_CMD_BUF_SIZE);
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
     BLEService* pService = pServer->createService(SERVICE_UUID);
@@ -7116,6 +7005,17 @@ void setup() {
     // "切了键啥也不显示"。NimBLE 不会自动加 CCCD,得手动。
     pCharacteristic->addDescriptor(new BLE2902());
     pService->start();
+
+    // 把特征和指令派发入口交给 bt_link，然后所有蓝牙的收和发都只经过它。
+    //
+    // 顺序有讲究：
+    //   · 必须在 setCallbacks(new MyCallbacks()) 之后 —— 协议栈一起来就可能
+    //     有包进来，btLinkOnWrite() 会判 s_queue == nullptr 直接丢，不排队。
+    //   · 必须在 startAdvertising() 之前 —— 连上就可能立刻发第一条指令。
+    btLinkInit(pCharacteristic, handleCommand);
+    // 二进制旁路：壁纸 JPEG 是裸字节，走文本通道会被 0x00 截碎。
+    btLinkSetBinaryIo(logoRxProbe, logoRxSink);
+
     BLEDevice::startAdvertising();
 
     // 文件系统：必须用 SPIFFS，不能再用 FFat。
@@ -7256,10 +7156,19 @@ void loop() {
         }
     }
 
-    // BLE 重连
-    // 主机指令在这里统一落到 LVGL 任务：NimBLE 回调只入队，
-    // 解析和所有 lv_* 调用都在这一行之后，和键盘触发的路径同属一个任务。
-    drainBleCommands();
+    // 蓝牙链路：一次搞定四件事，全在主任务里。
+    //   ① 排空发送队列（每轮限时 BT_POLL_BUDGET_MS，大回拉自动摊到后面几轮）
+    //   ② 收行超时兜底
+    //   ③ 派发主机指令 —— 解析和所有 lv_* 调用都在这一行之后，
+    //      和键盘触发的路径同属一个任务，绝不跨任务碰 LVGL 堆
+    //   ④ 喂狗（收包、发片、每派发一条指令各喂一次）
+    btLinkPoll();
+
+    // LOG:dump 的流式回拉：每轮喂一段，喂完就收手。
+    // 为什么不在 LOG:dump 的处理分支里一口气发完：8KB 按 20 字节一片是
+    // 400+ 片，同步推完会把主循环按住好几秒 —— 键盘全卡，而且 loop() 挂在
+    // 任务看门狗上，再多几条就变成"回拉日志把键盘搞重启"。
+    logDumpPump();
 
     // 壁纸：收齐了就解码（几百毫秒，放主任务不占 BLE 主机任务）。
     // 传一半断线（关网页、走出范围）必须超时放掉缓冲，否则后面所有文本
@@ -7289,13 +7198,15 @@ void loop() {
     // 灯光键确认通知要重画面板、旋钮要弹 HUD，都在主任务里做。
     handleC3Events();
 
-    if (!deviceConnected && oldDeviceConnected) {
+    // 连接状态归 bt_link 管（它要在断链时清掉排队中的响应），这里只盯"刚断开"
+    // 这一个边沿来重启广播，让主机能重新扫到。
+    if (!btLinkConnected() && oldDeviceConnected) {
         ct_mark(CT_S_BLE_DELAY);
-        delay(500);
+        btLinkDelay(500);          // 喂狗版 delay()，别在这 500ms 里饿着
         BLEDevice::startAdvertising();
-        oldDeviceConnected = deviceConnected;
+        oldDeviceConnected = btLinkConnected();
     }
-    if (deviceConnected && !oldDeviceConnected) oldDeviceConnected = deviceConnected;
+    if (btLinkConnected() && !oldDeviceConnected) oldDeviceConnected = true;
 
     // Ping
     if (millis() - lastPingTime > 2000) {

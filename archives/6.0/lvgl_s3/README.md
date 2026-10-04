@@ -160,12 +160,95 @@ python check_font.py  # 确认 MISSING 为 0
 - 分区表别改：宏 / 按键重映射 / 方案 / 灯光 / 校准值都在 `nvs` 分区，
   挪动偏移等于把用户配置全抹掉。
 
+## 蓝牙收发（`src/bt_link.h`）
+
+**蓝牙的收和发只走 `bt_link` 一个模块。** 业务代码不碰分片、不碰终止符、
+不碰看门狗，网页那边也只面对同一套规则。改协议必须**两边同时改**
+（`src/bt_link.cpp` + `../s3-setting.html` 里的 `BtLink`）。
+
+### 线上格式
+
+一条消息 = 若干片 + 一条收尾标记，**包终止符是 `\r`**：
+
+```
+VERB:KEY:<正文片段>\r      0~N 条
+VERB:KEY:END\r            每条消息都有（正文 0 字节时也发）
+```
+
+- `VERB` / `KEY` 非空、不含 `:` `\n` `\r`
+- `KEY` 优先用**请求号**（1~9999），不要拿业务字符串当 key
+- 正文按 **UTF-8 字节**算，中文一个字 3 字节
+
+### 固件侧：发
+
+```cpp
+btLinkReplyC("REMAPDUMP", body);            // 处理请求的分支里回话（推荐）
+btLinkReplyf("GKEYPHASE", "%u", ph);        // printf 风格
+btLinkSendC("LOG", "0", "STREAM_ON");       // 推送类：自己指定 key
+btLinkStream("LOG", line);                  // 日志流：内部 10Hz 节流 + 给响应让路
+// 大块（几 KB）：StreamBegin / Write / StreamEnd，正文不进队列
+```
+
+`btLinkSend*` 只是**入队**。真正 notify 发生在 `btLinkPoll()`（loop() 里），
+每轮最多 `BT_POLL_BUDGET_MS` 毫秒、片间喂一次狗。
+
+### 固件侧：收
+
+```cpp
+void onWrite(...)  { btLinkOnWrite(bytes, len); }   // 回调里只有这一行
+void loop()        { btLinkPoll(); logDumpPump(); } // 派发 + 流式回拉
+```
+
+`btLinkPoll()` → `handleCommand()`，**永远在主任务**，所以 handler 里可以
+直接碰 LVGL / NVS / SPI。BLE 回调里绝不解析指令。
+
+### 网页侧
+
+```js
+const body = await BtLink.call("MACRODUMP", "MACRODUMP:p0_M1", 800);  // 发+等
+BtLink.on("LOGDUMP", body => { ... });                              // 推送
+```
+
+### 踩过的坑（改协议前先读）
+
+- **单条通知能带多少字节 = 协商后的 ATT MTU - 3。协商失败时（手机端浏览器
+  常见）只有 20 字节，超出的不是被截断而是整条被协议栈丢掉。** 症状统一是
+  "网页只等得到超时，然后误以为键盘里是 0 条配置"。这解释了那个一直归因错的
+  不对称：1 条规则整行 20 字节能过、2 条 28 字节就丢。
+  ⚠ 别用 `BLEDevice::getMTU()` 算预算：它返回 `m_localMTU`（`setMTU(517)`
+  自己设的本地值），不是协商结果。
+- **分片之后不能一口气同步推完。** 8KB 日志按 20 字节一片是 400+ 片，
+  同步推完要把主循环按住 8 秒；loop() 挂在任务看门狗上（10 秒、panic），
+  再多几条就是"回拉日志把键盘搞重启"。所以发包摊到多次 loop 上。
+- **收尾标记 `END` 那一包本身也必须装得下 20 字节。** `MACRODUMP` + 业务 key
+  `p3_M12` 正好 21 字节 → 整条丢掉 → M10~M12 的宏读不回来，而且日志里什么
+  异常都没有。这就是 key 必须用请求号的原因。
+- **包终止符用 `\r` 不用 `\n`。** `\n` 得留给正文当数据 —— LOG 回拉整个
+  就是一堆换行分隔的行，用 `\n` 收尾的话日志面板里 8KB 历史会挤成一大行。
+- **必须用流式 TextDecoder（`{stream:true}`）。** 一片 20 字节，一个汉字 3
+  字节，分片完全可能从汉字中间切开，非流式解码会吐一串 U+FFFD 豆腐块。
+- **"正文为 0 字节"必须表达成"只有一条 END"。** 读一个空方案、读一个没设的
+  宏，"读到了、确实一条都没有"是有意义的结果；沉默会被网页当成"读不到"。
+- **关键响应和日志流抢同一条通道，而通知不排队。** `btLinkSend*` 入队时会开
+  一小段独占窗口（`BT_CRITICAL_HOLD_MS`），期间日志流自动让路。
+- 空闲兜底提交从 15ms 放宽到 **80ms**（`BT_LINE_IDLE_MS`）：Web Bluetooth 的
+  `writeValue` 会按协商出来的 MTU 拆包，15ms 会在同一个 `writeValue` 的两个包
+  之间误判成"这条发完了"，29 字节的 `REMAP:0:clear:224,227;227,224` 被当成
+  两条命令收下 → "下发 2 条只存进 1 条"。
+
+### 换 MTU 预算要连带改的地方
+
+`BT_PAYLOAD_MAX`（默认 20）改大之前，先确认协商结果真的拿得到；拿不到就维持
+20。要接协商值的话用 `pServer->getPeerMTU(conn_id)`，**不要**用
+`BLEDevice::getMTU()`。
+
 ## 目录结构
 
 ```
 lvgl_s3/
 ├── src/
 │   ├── lvgl_s3.ino          ← 主程序
+│   ├── bt_link.h / .cpp     ← 蓝牙收发统一层（收发都只走它）
 │   ├── lv_conf.h             ← LVGL 配置
 │   ├── lvgl_st7789_driver.cpp/h  ← 驱动
 │   ├── lv_font_simsun_16_cjk.c   ← 中文字体（改文案后需重新生成）

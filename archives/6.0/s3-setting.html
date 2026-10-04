@@ -711,6 +711,9 @@
             const server = await device.gatt.connect();
             const service = await server.getPrimaryService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
             myCharacteristic = await service.getCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8");
+            // 换一条连接 = 上一条连接上没收完的正文缓冲全部作废。
+            // 留着的话，下一次同名消息会把两段半截正文拼起来。
+            BtLink.reset();
             // 必须订阅通知：固件要靠它回报"壁纸到底成没成"和"映射规则读回"。
             // 只 startNotifications 不加事件监听是收不到的。
             try {
@@ -752,113 +755,172 @@
         }
     });
 
-    // 键盘回话通道：固件会用它 notify 上传结果（LOGOSTATUS:）和映射规则回读（REMAPDUMP:）。
-    // 之前特征只有 WRITE，键盘没有任何回话通道，网页上就"发完即当成功"。
-    let bleNotifyLines = [];
-    // REMAPDUMP 分片正文缓存：prof -> 已收到的正文片段拼接。
-    // 固件按 ATT 载荷上限（手机上常只有 20 字节）逐片发，收到 REMAPDUMP:<p>:END 才算完。
-    let remapDumpBuf = {};
-    // 多 waiter 队列：每次 waitBleNotify 把 {prefix, resolve, timer} 推进 pendingWaits，
-    // 来一行 notify 就 FIFO 找第一个前缀匹配的,消费掉。
-    // 旧版用单 handler 链式:MA → MB → M1 三连击时,MA 的响应回来后 handler 被重置成 null,
-    // 后续 MB/M1 的响应没人接收,800ms 后全部超时 UI 显示空。改队列后每个 waiter 独立跟踪。
-    let pendingWaits = [];
+    // ==================================================================
+    // BtLink —— 蓝牙链路层（网页侧）
+    // ==================================================================
+    //
+    // 固件那边是 src/bt_link.cpp，这份是它的另一半：**同一个协议、同一条规则**。
+    // 协议是照着固件的实现写的，改了一边必须改另一边（README 有约定）。
+    //
+    // ---- 线上格式 ----
+    // 一条消息 = 若干片 + 一条收尾标记，**包终止符是 '\r'**（不是 '\n'）：
+    //     VERB:KEY:<正文片段>\r     0~N 条
+    //     VERB:KEY:END\r           每条消息都有，正文 0 字节时也发（这就是"读到了，
+    //                               但确实一条都没有"）
+    // 收齐规则：按 "VERB|KEY" 找缓冲，找到就追加；收到 END 才交出去。
+    //
+    // 为什么包尾是 '\r'：包尾必须是正文里不可能出现的字节。'\n' 恰恰最常见
+    // —— LOG 回拉整个就是一堆换行分隔的日志行，用 '\n' 收尾的话，日志面板里
+    // 8KB 历史会挤成一大行（换行符全被当成分隔符吃掉了）。
+    //
+    // 为什么正文按 UTF-8 流式解码：一片 20 字节，一个汉字 3 字节，分片完全可能
+    // 从汉字中间切开，非流式解码会吐一串 U+FFFD 豆腐块。
+    //
+    // 为什么"必须等到 END"：一片正文和"整条消息刚好装得下"在电路上完全一样，
+    // 没有任何办法区分"这是完整的一条"和"这是第一条、后面还有"。历史上
+    // "单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来"就是这么来的：
+    // 1 条规则整行 20 字节刚好塞进 ATT 载荷上限，2 条 28 字节就被协议栈整条丢掉，
+    // 页面只等得到一个超时，然后误以为键盘里是 0 条配置。
+    //
+    // ---- 两边都要守的纪律 ----
+    // · 正文的 "key" 里不能有 ':'（三段切分）。GKEYDUMP 的状态后缀
+    //   请求用 "MA:a"、响应用 "MA_a"，就是这个原因。
+    // · 一条通知能带多少字节 = 协商后的 ATT MTU - 3，协商失败时只有 20。
+    //   网页发出去的 writeValue 会被浏览器按 MTU 拆包，固件那边按 \n 攒行，
+    //   所以**发**的方向不需要自己分片；**收**的方向固件已经分好了。
+    const BtLink = {
+        _line: "",                       // BLE 通知的拼包缓冲
+        _buf: new Map(),                 // "VERB|KEY" -> 正文
+        _waits: [],                      // 等回复的请求
+        _handlers: new Map(),            // verb -> (body, key) => void，推送类消息
+        // ⚠ 必须是 **stream 模式**的解码器。一片只带 20 字节，而一个汉字在
+        //   UTF-8 里占 3 字节 —— 分片完全可能从汉字中间切开。非 stream 的
+        //   TextDecoder 会把落单的那半个字节变成 U+FFFD（豆腐块），日志面板里
+        //   全是"�"。stream 模式会把这半个字节留着、和下一片拼起来。
+        _dec: new TextDecoder("utf-8"),
+        _seq: 0,                          // 请求号，1~9999
 
-    function onBleNotify(e) {
-        const dv = e.target.value;
-        if (!dv) return;
-        // 通知可能被拆成多片，按 '\n' 拼行
-        bleNotifyLines.push(new TextDecoder().decode(dv.buffer ? dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength) : dv));
-        let all = bleNotifyLines.join('');
-        let parts = all.split('\n');
-        let rest = parts.pop();
-        bleNotifyLines = rest ? [rest] : [];
-        for (const line of parts) {
-            const t = line.trim();
-            if (!t) continue;
-            LOG_PORT_UI("← " + t);
-            // BLE 日志通道:固件按行推 LOG:<text> / LOGDUMP:<chunk> / LOGDUMP:END
-            // / LOG:STREAM_ON / LOG:STREAM_OFF / LOG:CLEARED。 LOG:STREAM_OFF/
-            // LOGDUMP:END 是控制面消息,不显示;LOG: 和 LOGDUMP: 落到日志面板。
-            // 注意 LOG: 优先级最高,要在 waitBleNotify 之前消费,
-            // 否则 "LOG:xx" 会被某个 "LOG" 前缀的 waiter 截胡。
-            if (t.startsWith("LOGDUMP:")) {
-                handleLogDumpLine(t.substring(8));
-                continue;
+        // 发一条请求并等它的回话 —— **读回配置统一走这个**。
+        //
+        // 请求末尾会自动追加一个请求号 `MACRODUMP:p0_M1#7`：固件在进
+        // handleCommand 之前把它摘掉，并用同一个号当回话的 key。于是
+        //   · key 永远是 1~4 位，跟 verb 有多长、多并发都不冲突
+        //     （早期版本用 `MACRODUMP` + `p3_M12` 当 key，收尾那一包正好
+        //      21 字节 > 20，**整条通知被协议栈丢掉**，M10~M12 的宏读不回来）
+        //   · 响应不需要靠"正文长得像"去猜是回给哪个请求的
+        // 返回 Promise：正文（不含 VERB/KEY/END），超时返回 null。
+        async call(verb, line, timeoutMs) {
+            const id = String((this._seq = (this._seq % 9999) + 1));
+            const body = this.request(verb, id, timeoutMs);
+            const ok = await sendBLE(line + "#" + id);
+            return ok ? body : null;
+        },
+
+        // 只等一条消息（不负责发）。key 是回话的 key。
+        request(verb, key, timeoutMs) {
+            const self = this;
+            // 同一 (verb,key) 上一条消息如果因为丢了收尾标记还挂着缓冲，
+            // 不清掉就会和这一条拼成一条错的。主动清一次最省心。
+            this._buf.delete(verb + "|" + key);
+            return new Promise((resolve) => {
+                const entry = { verb, key, resolve, timer: null };
+                entry.timer = setTimeout(() => {
+                    self._waits = self._waits.filter(e => e !== entry);
+                    resolve(null);
+                }, timeoutMs || 3000);
+                self._waits.push(entry);
+            });
+        },
+
+        // 推送类消息（不请求、只通知）：LOG / LOGDUMP
+        on(verb, fn) { this._handlers.set(verb, fn); },
+
+        // BLE 通知回调。**所有**重组逻辑都在这里，和固件的 btLinkOnWrite 对称。
+        //
+        // ⚠ 按 '\r' 切包，不是 '\n'。包终止符是 '\r'（见固件 bt_link.h 里的
+        //   理由：'\n' 得留给正文当数据，日志回拉整个就是一堆换行分隔的行）。
+        // ⚠ **不要 trim 每一段**：trim 会把正文首尾的换行一起吃掉。
+        feed(dv) {
+            if (!dv) return;
+            const bytes = dv.buffer
+                ? dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength)
+                : new Uint8Array(dv);
+            this._line += this._dec.decode(bytes, { stream: true });
+            const parts = this._line.split("\r");
+            this._line = parts.pop();          // 最后一段还没终止符，留着等下一片
+            for (const raw of parts) this._onLine(raw);
+        },
+
+        _onLine(line) {
+            if (line === "") return;
+            // 切三段：VERB / KEY / 正文。正文里可以有 ':'（"SEQ:abc"、"SW:1+CMB:…"）。
+            const c1 = line.indexOf(":");
+            if (c1 <= 0) { LOG_PORT_UI("✗ 收到看不懂的一行：" + line); return; }
+            const c2 = line.indexOf(":", c1 + 1);
+            if (c2 < 0) { LOG_PORT_UI("✗ 收到缺 key 的一行：" + line); return; }
+            const verb = line.substring(0, c1);
+            const key = line.substring(c1 + 1, c2);
+            const body = line.substring(c2 + 1);
+            const id = verb + "|" + key;
+
+            if (body === "END") {
+                const full = this._buf.get(id);
+                this._buf.delete(id);
+                this._deliver(verb, key, full === undefined ? "" : full);
+                return;
             }
-            if (t === "LOGDUMP:END") { handleLogDumpEnd(); continue; }
-            if (t === "LOG:STREAM_ON")  { updateLogStatus("状态:实时开流中..."); continue; }
-            if (t === "LOG:STREAM_OFF") { updateLogStatus("状态:关流(缓冲仍在落)"); continue; }
-            if (t === "LOG:CLEARED")    { logBuffer.length = 0; renderLogBox(); updateLogStatus("状态:缓冲已清空"); continue; }
-            if (t.startsWith("LOG:")) {
-                appendLogLine(t.substring(4));
-                continue;
-            }
-            // ⚠ REMAPDUMP 分片重组。必须排在通用 waiter 匹配**之前**。
-            //
-            //   固件发回来的映射表正文可能超过单条 BLE 通知的载荷上限（ATT MTU
-            //   协商失败时只有 23-3 = 20 字节，手机端浏览器很常见），超了不是被截断
-            //   而是**整条通知被协议栈丢掉**。所以固件改成逐片发：
-            //     REMAPDUMP:<p>:<正文片段>\n   （可 0~N 条）
-            //     REMAPDUMP:<p>:END\n          （收尾，1 条）
-            //   这里按方案号累积正文，收到 END 才算读完，再交回 waiter。
-            //
-            //   1 条规则整行正好 20 字节能过、2 条 28 字节就丢 —— 长期表现为
-            //   "单条 win→ctrl 读得回来、Ctrl/Win 交换读不回来 + 弹没能从键盘读回确认"。
-            //
-            //   为什么不直接让 waiter 匹配第一片：那样只会拿到**半个表**，
-            //   比拿不到更难查。
-            if (t.startsWith("REMAPDUMP:")) {
-                const rest = t.substring(10);
-                if (rest.endsWith(":END")) {
-                    const prof = rest.substring(0, rest.length - 4);
-                    const body = remapDumpBuf[prof] || "";
-                    delete remapDumpBuf[prof];
-                    // 用重组好的完整行去兑现 waiter，保持 readRemap 的解析不变
-                    const full = `REMAPDUMP:${prof}:${body}`;
-                    for (let i = 0; i < pendingWaits.length; i++) {
-                        if (pendingWaits[i].prefix === `REMAPDUMP:END:${prof}`) {
-                            clearTimeout(pendingWaits[i].timer);
-                            const w = pendingWaits[i];
-                            pendingWaits.splice(i, 1);
-                            w.resolve(full);
-                            break;
-                        }
-                    }
-                } else {
-                    const ci = rest.indexOf(':');
-                    if (ci > 0) {
-                        const prof = rest.substring(0, ci);
-                        remapDumpBuf[prof] = (remapDumpBuf[prof] || "") + rest.substring(ci + 1);
-                    }
+            this._buf.set(id, (this._buf.get(id) || "") + body);
+        },
+
+        _deliver(verb, key, body) {
+            const h = this._handlers.get(verb);
+            if (h) { h(body, key); return; }        // 推送类优先
+            for (let i = 0; i < this._waits.length; i++) {
+                const w = this._waits[i];
+                if (w.verb === verb && w.key === key) {
+                    clearTimeout(w.timer);
+                    this._waits.splice(i, 1);
+                    w.resolve(body);
+                    return;
                 }
-                continue;
             }
-            // FIFO 匹配:最早的 waiter 先消费。固件命令处理是单线程顺序执行,
-            // notify 顺序跟 send 顺序一致,FIFO 匹配结果正确。
-            for (let i = 0; i < pendingWaits.length; i++) {
-                if (t.startsWith(pendingWaits[i].prefix)) {
-                    clearTimeout(pendingWaits[i].timer);
-                    const w = pendingWaits[i];
-                    pendingWaits.splice(i, 1);
-                    w.resolve(t);
-                    break;
-                }
-            }
+            LOG_PORT_UI(`← ${verb}:${key}:${body}（没人等这条）`);
+        },
+
+        reset() {
+            this._line = "";
+            this._buf.clear();
+            this._waits.forEach(w => clearTimeout(w.timer));
+            this._waits = [];
+            this._dec = new TextDecoder("utf-8");
+        },
+    };
+
+    // 固件的日志通道就是这条通用链路上的两个 verb，不再有单独一条通道。
+    //
+    // ⚠ 收尾标记 END 本身也是一条 (LOG, 0) 消息，只是正文为空 —— 所以这里
+    //   收到空正文 = "这条完了"。这和"缓冲里确实一条日志都没有"是同一个
+    //   形状，而这正是我们想要的：两种情况网页的处理完全一样（把手上攒的
+    //   行收个尾、报"已拉回 N 行"）。
+    let logDumpBytes = 0;
+    BtLink.on("LOG", (body) => {
+        LOG_PORT_UI("← " + body);
+        if (body === "STREAM_ON")  { updateLogStatus("状态:实时开流中..."); return; }
+        if (body === "STREAM_OFF") { updateLogStatus("状态:关流(缓冲仍在落)"); return; }
+        if (body === "CLEARED")    { logBuffer.length = 0; renderLogBox(); updateLogStatus("状态:缓冲已清空"); return; }
+        appendLogLine(body);
+    });
+    BtLink.on("LOGDUMP", (body) => {
+        if (body.length === 0) {          // 收尾标记到了
+            handleLogDumpEnd();
+            return;
         }
-    }
+        logDumpBytes += body.length;
+        handleLogDumpLine(body);
+        updateLogStatus(`状态:回拉中… 已收到 ${(logDumpBytes / 1024).toFixed(1)} KB`);
+    });
 
-    // 等键盘回一句话（带超时）。键盘主动 notify，不回来的就返回 null。
-    function waitBleNotify(prefix, timeoutMs) {
-        return new Promise((resolve) => {
-            const entry = { prefix, resolve };
-            entry.timer = setTimeout(() => {
-                pendingWaits = pendingWaits.filter(e => e !== entry);
-                resolve(null);
-            }, timeoutMs);
-            pendingWaits.push(entry);
-        });
-    }
+    function onBleNotify(e) { BtLink.feed(e.target.value); }
 
     async function sendBLE(str) {
         if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
@@ -902,10 +964,10 @@
     }
 
     // ========== BLE 日志通道：实时流 + 历史回拉 ==========
-    // 协议:固件 LOG:on 后每行日志 notify `LOG:<text>`(50Hz 节流,丢是常态)。
-    //      LOG:dump 把 8KB PSRAM 缓冲按整行分片 notify 一串 `LOGDUMP:<chunk>`,
-    //      最后一条 `LOGDUMP:END` 表示完毕。
-    // 这里只做:接收 + 拼行 + 显示,不做解析。文本就是 raw 字节。
+    // 协议：固件 LOG:on 之后每行日志作为一条 (LOG, 自动序号) 消息推过来
+    //      （10Hz 节流，丢是常态）；LOG:dump 把 8KB PSRAM 缓冲作为一条
+    //      (LOGDUMP, 0) 消息流式发回来，分片由固件做、拼装由 BtLink 做。
+    // 这里只做显示，不做协议解析。
     let logBuffer = [];           // 已落地的日志行
     let logDumpBuf = "";          // LOG:dump 拉回来的拼接中片段
     const LOG_MAX_LINES = 2000;   // 浏览器端上限,超过丢最老
@@ -968,9 +1030,14 @@
     document.getElementById('logDumpBtn').addEventListener('click', async () => {
         if (!myCharacteristic) return alert("请先连接蓝牙！");
         logDumpBuf = "";
+        logDumpBytes = 0;
         logBuffer = [];    // 清空当前显示,只看刚拉到的历史
         renderLogBox();
         updateLogStatus("状态:正在拉历史...");
+        // 固件不是一口气发完：8KB 按 20 字节一片是几百片，它**分摊到很多轮
+        // 主循环上**慢慢发（不然会把主循环按住好几秒，键盘全卡、甚至触发
+        // 任务看门狗重启）。所以这一条指令发出去就返回，收尾由上面那个
+        // LOGDUMP 处理器在收到 END 时报。
         await sendBLE("LOG:dump");
     });
     document.getElementById('logClearBtn').addEventListener('click', async () => {
@@ -987,8 +1054,8 @@
 
     // ========== 批量读回所有配置 ==========
     // configCache 装从键盘读回的所有 NVS 配置(remap / 宏 / 全局动作),切键时按需喂给 UI。
-    // ME 文本故意不在这里读:ME 内容可能十几 KB,BLE notify 单条上限 BLE_CMD_BUF_SIZE=256,
-    // 而且网页本来就有"我自己要改"的选择,读回来意义不大。
+    // ME 文本故意不在这里读:ME 内容可能十几 KB,而且网页本来就有"我自己要改"
+    // 的选择,读回来意义不大。
     const configCache = {
         remaps: {},     // { 0: [{from,to}, ...], 1: [...], ... }
         macros: {},     // { "p0_M1": "SEQ:abc...", "p0_M2": "CMB:128,4", ... }   null/NONE = 未设
@@ -998,62 +1065,39 @@
                         //   "MA"   / "MB"                       → 老单套(仅 M1-M12 用)
     };
 
-    // 单条读宏,800ms timeout。返回值是 raw body(去掉前缀的 "SEQ:..." / "CMB:..." / "NONE"),
-    // 失败返回 null。串行发即可,蓝牙 WRITE 不能并发。
+    // 下面这五个"读回"都是同一个形状：**先挂上等回复，再发请求**。
+    // 顺序反了会漏掉极快的响应（固件收到就回，快到几十微秒）。
+    //
+    // 返回值就是正文（"SEQ:…" / "CMB:…" / "NONE" / "128,131;131,128"），
+    // 超时返回 null。**分片和收尾标记由 BtLink 处理**，调用方不用管：
+    // 一张 8 条规则的映射表是 200+ 字节，网页这里照样一行代码。
+    // 串行发即可，蓝牙 WRITE 不能并发。
+
+    // 单条读宏
     async function readMacroConfig(prof, mKey) {
-        const key = `p${prof}_${mKey}`;
-        const p = `MACRODUMP:${key}:`;
-        const pr = waitBleNotify(p, 800);
-        await sendBLE(`MACRODUMP:${key}`);
-        const line = await pr;
-        if (!line) return null;
-        return line.substring(p.length);
+        return BtLink.call("MACRODUMP", `MACRODUMP:p${prof}_${mKey}`, 800);
     }
 
+    // 读全局键的老格式（单套，M1-M12 也走这条）
     async function readGlobalkConfig(key) {
-        const p = `GKEYDUMP:${key}:`;
-        const pr = waitBleNotify(p, 800);
-        await sendBLE(`GKEYDUMP:${key}`);
-        const line = await pr;
-        if (!line) return null;
-        return line.substring(p.length);
+        return BtLink.call("GKEYDUMP", `GKEYDUMP:${key}`, 800);
     }
 
-    // 读 MA / MB 的某个状态(a/b)的配置 payload。
-    // 协议:`GKEYDUMP:<KEY>:<a|b>`,响应前缀 `GKEYDUMP:<KEY>:<a|b>:`,
-    // 返回去掉前缀后的 body(NONE = 未设)。
+    // 读 MA / MB 的某个状态(a/b)的配置 payload（NONE = 未设）
     async function readGlobalkStateConfig(key, state) {
-        const tag = `${key}:${state}`;
-        const p = `GKEYDUMP:${tag}:`;
-        const pr = waitBleNotify(p, 800);
-        await sendBLE(`GKEYDUMP:${tag}`);
-        const line = await pr;
-        if (!line) return null;
-        return line.substring(p.length);
+        return BtLink.call("GKEYDUMP", `GKEYDUMP:${key}:${state}`, 800);
     }
 
-    // 读 MA / MB 当前相位(下次按下将执行 A 还是 B)。
-    // 协议:`GKEYPHASE:<KEY>`,响应 `GKEYPHASE:<KEY>:<0|1>`。
-    // 失败返 null(允许用户重试);成功返 "0" 或 "1"。
+    // 读 MA / MB 当前相位(下次按下将执行 A 还是 B)。失败返 null(允许用户重试)。
     async function readGlobalkPhase(key) {
-        const p = `GKEYPHASE:${key}:`;
-        const pr = waitBleNotify(p, 800);
-        await sendBLE(`GKEYPHASE:${key}`);
-        const line = await pr;
-        if (!line) return null;
-        const body = line.substring(p.length);
+        const body = await BtLink.call("GKEYPHASE", `GKEYPHASE:${key}`, 800);
         if (body !== "0" && body !== "1") return null;
         return body;
     }
 
-    // 重置 MA / MB 相位回 0,响应 `GKEYPHASE:<KEY>:0`。
+    // 重置 MA / MB 相位回 0。
     async function sendTogglePhaseReset(key) {
-        const p = `GKEYPHASE:${key}:`;
-        const pr = waitBleNotify(p, 800);
-        await sendBLE(`GKEYPHASE_RESET:${key}`);
-        const line = await pr;
-        if (!line) return null;
-        return line.substring(p.length);
+        return BtLink.call("GKEYPHASE", `GKEYPHASE_RESET:${key}`, 800);
     }
 
     // 单键全局清空(只清 MA 或 MB 的全部 + 相位,不动 M1-M12)。
@@ -1410,17 +1454,11 @@
     //   两次之间隔了 timeoutMs，不存在两条相同 notify 被 BLE 合并的风险
     //   （合并问题来自"两个并发的 readRemap"，那个重复监听器已经删掉了）。
     async function readRemap(prof, timeoutMs, retries) {
-        const p = `REMAPDUMP:${prof}:`;
-        // 等的是**收尾标记**而不是第一片正文：正文可能分好几片，先到的那片不是全表。
-        // onBleNotify 里按 prof 累积正文，收到 REMAPDUMP:<p>:END 才把完整行交回来。
-        const endPrefix = `REMAPDUMP:END:${prof}`;
+        // 一张表可能 32 条规则 ≈ 400 字节，固件会拆成二十来片，BtLink 负责
+        // 拼回来并在收尾标记到达时才交给我们 —— 这里拿到的永远是**完整的**。
         for (let attempt = 0; attempt <= (retries === undefined ? 1 : retries); attempt++) {
-            remapDumpBuf[prof] = '';          // 上一轮的残片不能串进这一轮
-            const pr = waitBleNotify(endPrefix, timeoutMs || 3000);
-            sendBLE(`REMAPREAD:${prof}`);   // 不 await：要先挂上监听再发指令
-            const line = await pr;
-            if (line) {
-                const body = line.substring(p.length);
+            const body = await BtLink.call("REMAPDUMP", `REMAPREAD:${prof}`, timeoutMs || 3000);
+            if (body !== null) {
                 if (body === "ERR") return null;
                 if (!body) return [];       // 真的读到了，且键盘上确实一条都没有
                 return body.split(';').filter(Boolean).map(s => {
@@ -2141,9 +2179,7 @@
     // 问键盘要真实结果：解码 + 写盘都完成了才算成功。
     // 以前这里只等 3 秒就宣布成功，那是"字节写出去了"，不是"键盘装好了"。
     async function queryLogoStatus(timeoutMs) {
-        const pr = waitBleNotify("LOGOSTATUS:", timeoutMs || 8000);
-        sendBLE("LOGO_STATUS");
-        return pr;
+        return BtLink.call("LOGOSTATUS", "LOGO_STATUS", timeoutMs || 8000);
     }
 
     document.getElementById('uploadImageBtn').addEventListener('click', async () => {
@@ -2169,15 +2205,18 @@
             }
             if (lastErr) throw lastErr;
             pBox.innerText = "✅ 数据已发出，等键盘解码并落盘...";
-            const line = await queryLogoStatus(10000);
-            if (!line) {
+            // 正文形如 "OK:0/0" / "RECV:1234/5678" / "FAIL:传输中断"
+            const st = await queryLogoStatus(10000);
+            if (st === null) {
                 pBox.innerText = "⚠️ 键盘没有回话。\n请看键盘屏幕：显示"
                     + "「壁纸更新 / 上传完成」也算成功；显示「传输 / 解码失败」请重传。";
-            } else if (line.startsWith("LOGOSTATUS:OK:")) {
+            } else if (st.startsWith("OK:")) {
                 pBox.innerText = "🎉 键盘已确认：解码完成并写入 /logo.bin。\n"
                     + "切到壁纸风格即可看到，重启后会自动恢复。";
+            } else if (st.startsWith("RECV:")) {
+                pBox.innerText = `⏳ 键盘还在收（${st.substring(5)}），稍等再点一次确认。`;
             } else {
-                pBox.innerText = "❌ 键盘回报失败：" + line;
+                pBox.innerText = "❌ 键盘回报失败：" + st;
             }
         } catch (err) {
             pBox.innerText = "❌ 上传失败: " + err.message;
