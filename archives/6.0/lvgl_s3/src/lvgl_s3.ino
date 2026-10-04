@@ -1138,16 +1138,19 @@ static lv_obj_t* hc_lbl_active      = nullptr;
 static lv_obj_t* hc_lbl_active_num  = nullptr;
 static lv_obj_t* hc_bar_active      = nullptr;
 static lv_obj_t* hc_bar_active_fill = nullptr;
-// 状态行（y=234..240 周边剩余, w=220, h=14）：温度 / 字数 / 湿度
+// 底部状态条（y=178..234, w=220, h=56）：左侧 2/3 是温度 / 湿度两根进度条，
+// 右侧 1/3 是字数。进度条是「槽 + 填充」两层 lv_obj，不是 lv_bar ——
+// 这个项目通篇没引过 lv_bar（见 build_style_high_contrast 的说明）。
 static lv_obj_t* hc_lbl_strip_t     = nullptr;   // "温度" 说明
 static lv_obj_t* hc_lbl_strip_t_val = nullptr;   // 温度数值
 static lv_obj_t* hc_lbl_strip_chars = nullptr;   // "字数" 说明
 static lv_obj_t* hc_lbl_strip_chars_val = nullptr; // 字数数值
 static lv_obj_t* hc_lbl_strip_h     = nullptr;   // "湿度" 说明
 static lv_obj_t* hc_lbl_strip_h_val = nullptr;   // 湿度数值
-static lv_obj_t* hc_icon_temp = nullptr;   // 温度图标色块
-static lv_obj_t* hc_icon_chars = nullptr;  // 字数图标色块
-static lv_obj_t* hc_icon_hum = nullptr;    // 湿度图标色块
+static lv_obj_t* hc_bar_t_track     = nullptr;   // 温度进度条槽（底）
+static lv_obj_t* hc_bar_t_fill      = nullptr;   // 温度进度条填充（0..槽宽）
+static lv_obj_t* hc_bar_h_track     = nullptr;   // 湿度进度条槽
+static lv_obj_t* hc_bar_h_fill      = nullptr;   // 湿度进度条填充
 
 // ===========================
 // 壁纸：JPEG 上传 + 解码缓冲
@@ -1348,7 +1351,8 @@ static void resetStylePointers(void) {
     hc_lbl_strip_t = nullptr; hc_lbl_strip_t_val = nullptr;
     hc_lbl_strip_chars = nullptr; hc_lbl_strip_chars_val = nullptr;
     hc_lbl_strip_h = nullptr; hc_lbl_strip_h_val = nullptr;
-    hc_icon_temp = nullptr; hc_icon_chars = nullptr; hc_icon_hum = nullptr;
+    hc_bar_t_track = nullptr; hc_bar_t_fill = nullptr;
+    hc_bar_h_track = nullptr; hc_bar_h_fill = nullptr;
 
     // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
     // 之前漏在这里清理，就踩了和 ipLockDot[] 一模一样的坑，而且这次更隐蔽：
@@ -2490,13 +2494,15 @@ static void build_style_wallpaper(void) {
 // 版面（240x240，全屏坐标）：
 //   0..6       顶部留 6px 喘息
 //   6..32      顶部 3 颗大锁灯 + 右上系统图标（不再有底色条）
-//   40..96     中间大时钟（montserrat_48，行高 52）
-//   104..168   中间大红色按键名（montserrat_48，行高 52，**无标题**）
-//   180..220   底部 3 项 + 字数
-//              ├ 184..200 方案名（simsun_16，CLR_ACCENT）
-//              ├ 184..200 温度值（montserrat_20）
-//              ├ 184..200 湿度值（montserrat_20）
-//              └ 218..230 右下角字数
+//   46..98     中间大时钟（montserrat_48，行高 52）
+//   98..117    中文日期（simsun_16，行高 19）
+//   124..176   中间大红色按键名（montserrat_48，行高 52，**无标题**）
+//   178..235   底部状态条（w=220, x=10..230）：左 2/3 温湿度（上下堆叠 + 满宽进度条）
+//              │                                            + 右 1/3 字数
+//              ├ 180..198 温度小标（左）/ 温度值（右，行高18）
+//              ├ 199..204 温度进度条（满宽 135px）
+//              ├ 209..227 湿度小标（左）/ 湿度值（右）
+//              └ 228..233 湿度进度条（满宽 135px）
 //
 // 设计要点：
 //   · 不要 6 种风格共用的 dashTopBar() —— 那个是"小灯 + 文字图标 + 文字方案序号"，
@@ -2507,20 +2513,87 @@ static void build_style_wallpaper(void) {
 //     红字键名 Space / Enter / A 杵在中间。montserrat_* 没有 CJK，
 //     所以**显示的就是 ASCII 键名**，CJK 控件绕过它了。字号改成 montserrat_28
 //     是为了让底部温 / 湿卡 + 字数都有空间。
-//   · 底部 3 列：方案图标（L=48，最显眼）+ 温卡 + 湿卡；温 / 湿卡左上角加
-//     "温" / "湿" 中文小标，整张卡用 1px 描边色（CLR_AMBER / CLR_GREEN）
-//     划出来，比纯色温文字更有"分组"感。
-//   · 字数挪到右下角、字号变小（"字数" simsun_16 + 数字 montserrat_14）。
-//     用户要求"右下角小字"，就不再压在按键名旁边干扰视线了。
+//   · 底部状态条按用户要求改成「温湿度占 2/3、字数占 1/3」，而且温湿度是
+//     **上下堆叠**的两根满宽进度条（小标 + 数值一行，下面一条 135px 的条）。
+//     原来是三等分 + 每格一个 16x16 图标色块：并排时每根条只有 63px，
+//     23°C 和 28°C 画出来只差 6px 根本分不出来；堆叠后条长 135px，长度差
+//     一倍就读得出了。图标色块去掉了 —— 它们和顶部三颗锁灯的"大色块"语言打架。
 // ===========================================================
-// B-1「横向战舰」高对比度驾驶舱
-// 240×240 屏：
-//   y=0..40       顶栏（LED 圆点 + 方案图标）
-//   y=52..118     主卡1：时间 + 日期（h=66）
-//   y=130..196    主卡2：大红按键名（h=66）
-//   y=202..234    数据带 3 列：KPM / TODAY / ACTIVE（h=32）
-//   y=234..240    状态行：温度 / 字数 / 湿度（h=14，仅一行小字）
+// 底部状态条的两个小工具
 // ===========================================================
+// 进度条填充宽度：把 0..1 的比例换算成 0..槽宽像素。
+//
+// 为什么要手搓而不用 lv_bar：lv_bar 是 lv_obj + 内部指示器两层的封装，
+// 而这个项目的性能约定是「所有每轮都会变的几何/样式写入都要先读回比对」
+// （见 setBgColor / setSizePos 上面的注释）。lv_bar_set_value() 不走那套比对，
+// 挂在每 100ms 跑一次的 updateDynamicElements() 上就是一次无脑 invalidate，
+// 屏幕永远 dirty、SPI 一直推满屏。手搓两层 lv_obj 才能套 setSizePos()。
+//
+// 进度条的两根条（槽 + 填充）是**兄弟**对象、都直接挂在 hc_bg 上，用绝对坐标摆，
+// 不是父子结构。三个原因：
+//   1. iconRect() 建对象走的是 lv_obj_align()，而 LVGL 8.4 里它是
+//        lv_obj_set_style_align(obj, align, 0) + lv_obj_set_pos(...)
+//      —— 除了定位还会给对象挂一个 **align 样式**。填充每 100ms 改一次宽度，
+//      那个 align 样式会跟着参与父级重排，这条路径没法离线确证。
+//   2. 父子结构下 lv_obj_set_pos() 要补偿父对象的 pad 和滚动量，
+//      子对象又被裁剪在父的内容区里；兄弟关系下这些耦合全部消失。
+//   3. 律动页那 24 根柱子就是 lv_obj_create + lv_obj_set_pos() 的写法，
+//      在这台机器上一直正常工作 —— 直接照抄已验证的写法，不赌。
+#define HC_BAR_W   135
+#define HC_BAR_H   6
+
+// 建一根条。样式逐项写全，不依赖任何继承：bg_opa / border / pad / radius
+// 缺一项都会让默认主题（浅色、pad 13px）漏进来，在纯黑底上表现成一条白杠。
+static lv_obj_t* mkBar(lv_obj_t* parent, lv_coord_t x, lv_coord_t y,
+                       lv_coord_t w, uint32_t color) {
+    lv_obj_t* o = lv_obj_create(parent);
+    lv_obj_set_size(o, w, HC_BAR_H);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_style_bg_color(o, lv_color_hex(color), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(o, HC_BAR_H / 2, LV_PART_MAIN);
+    lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
+static void setBarFill(lv_obj_t* fill, lv_coord_t x, lv_coord_t y, float pct) {
+    if (fill == nullptr) return;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+    lv_coord_t w = (lv_coord_t)((float)HC_BAR_W * pct + 0.5f);
+    // 读数非零却一根都不显示，看上去像传感器挂了 —— 至少留 1px
+    if (w == 0 && pct > 0.0f) w = 1;
+    setSizePos(fill, w, HC_BAR_H, x, y);
+}
+
+// 字数紧凑化：totalKeyCount 是 uint32_t，最大 4294967295（10 位），
+// montserrat_18 光这串数字就有 ~100px，字数那格只有 62px 宽，放不下会被截成
+// "12345..."。所以 5 位起就折成 "12.3k" / "1.2M"——计数器的通行做法，
+// 既保证任何取值都不溢出，也让这格永远是同样宽的一小段。
+//
+// 分支上界特意写成 999_950 而不是 1_000_000：999999 四舍五入到 0.1k
+// 正好是 1000.0k，宁可让它进 M 档，也不要出现四位数 k。
+//
+// 四舍五入用「先整除再看余数」，而不是 (v + 50) / 100：后者在 v 接近
+// UINT32_MAX 时会溢出成很小的数 —— 4294967295 + 50000 回绕成 49999，
+// 字数直接显示成 "0.0M"，而且平时根本看不出来。
+static void formatCountCompact(char* out, size_t n, uint32_t v) {
+    if (v < 10000UL) {
+        snprintf(out, n, "%lu", (unsigned long)v);
+        return;
+    }
+    uint32_t d1;
+    if (v < 999950UL) {
+        d1 = v / 100UL + ((v % 100UL >= 50UL) ? 1UL : 0UL);   // 以 0.1k 为单位
+        snprintf(out, n, "%lu.%luk", (unsigned long)(d1 / 10), (unsigned long)(d1 % 10));
+    } else {
+        d1 = v / 100000UL + ((v % 100000UL >= 50000UL) ? 1UL : 0UL);   // 以 0.1M 为单位
+        snprintf(out, n, "%lu.%luM", (unsigned long)(d1 / 10), (unsigned long)(d1 % 10));
+    }
+}
+
 static void build_style_high_contrast(void) {
     if (hc_bg) { lv_obj_del(hc_bg); hc_bg = nullptr; }
 
@@ -2615,67 +2688,99 @@ static void build_style_high_contrast(void) {
     // ===========================================================
 
     // ===========================================================
-    // 温湿度卡片（y=180..232, w=220, h=52，3 等分；纯黑底+1px CLR_STROKE 描边）
-    //   上行 y=186 (h=16):  色块图标 + 中文"温度"/"字数"/"湿度"
-//   下行 y=212 (h=20):  数值（字号 18）
-// ===========================================================
+    // 底部状态条（框 x=10..230, y=178..235, w=220, h=58）
+    //
+    //   ┌ 左侧 2/3 ────────────────────────┬ 右侧 1/3 ─┐
+    //   │ 温度                      23.5°C  │           │  y=180 中文小标(行高19)
+    //   │ ▬▬▬▬▬▓░░░░░░░░░░░░░░░░░░░░░░░░░  │   字数     │          + 数值(行高18)
+    //   │ 湿度                          58%  │  128.4k   │  y=199 第一根条(高6)
+    //   │ ▬▬▬▬▬▬▬▓▓░░░░░░░░░░░░░░░░░░░░░  │           │  y=228 第二根条(高6)
+    //   └─────────────────────────────────┴───────────┘
+    //
+    // 为什么是「上下堆叠」而不是并排：温度 / 湿度是**进度条**，条形的长度
+    // 就是读数。并排时两格各分一半宽度，每根条只有 63px，23°C 和 28°C
+    // 画出来只差 6px，肉眼分不出来。上下堆叠后每根条独占整个 2/3 的
+    // 135px，量程差一倍差距就明显得多 —— 条才是主角，数字退成副信息。
+    //
+    // 每格 = 「中文小标（左）+ 数值（右）」同一行，下面紧跟一根满宽条。
+    // 小标、数值、条三者左右边缘都是 x=16 / x=150，对齐成两条竖直线。
+    //
+    // 行高（行盒高度取自字库的 .line_height，不是猜的）：
+    //   simsun_16_cjk=19 / montserrat_16=18 / montserrat_48=52
+    //   一行文字的高度取中文的 19。竖向账：
+    //     19 + 6(条) + 4(格间距) + 19 + 6 = 54  ← 正好是框内可用高度
+    //   按键名 y=124 + 52 = 176，框顶 178 只留 2px，不能再往上；
+    //   框底 235 → 屏幕底 240 留 4px。
     {
-        lv_obj_t* box = iconRect(hc_bg, 220, 52, LV_ALIGN_TOP_MID, 0, 180,
+        lv_obj_t* box = iconRect(hc_bg, 220, 58, LV_ALIGN_TOP_MID, 0, 178,
                                  0x000000, 8);
         lv_obj_set_style_border_width(box, 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(box, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+        // 两区之间的竖分隔线：上下各收 3px，比通长更透气
+        iconRect(hc_bg, 1, 48, LV_ALIGN_TOP_LEFT, 156, 183, CLR_STROKE, 0);
     }
 
-    // --- 温度列（左, x≈12..80）---
-    // 图标色块 (16x16, 琥珀色) 模拟温度计
-    lv_obj_t* t_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_LEFT, 18, 186,
-                                CLR_AMBER, 2);
-    hc_icon_temp = t_icon;
-    // 温度说明文字（紧贴图标右侧）
+    // --- 温度格（上）：小标 + 数值同一行，下面一根满宽条 ---
+    // 数值标签和小标标签**故意完全重合**（同 x 同宽同 y）：LVGL 的 label 没有
+    // 底色，后建的数值只是叠在小标文字上，不会互相遮住。省得为两种字号
+    // 去算两个不同的基线 y —— 行盒都是顶部对齐的，重合天然就对得齐。
     hc_lbl_strip_t = lv_label_create(hc_bg);
     mkLabel(hc_lbl_strip_t, &lv_font_simsun_16_cjk, CLR_AMBER);
     lv_label_set_text(hc_lbl_strip_t, "温度");
-    lv_obj_align(hc_lbl_strip_t, LV_ALIGN_TOP_LEFT, 38, 186);
+    lv_obj_set_width(hc_lbl_strip_t, 135);
+    lv_obj_set_style_text_align(hc_lbl_strip_t, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_t, LV_ALIGN_TOP_LEFT, 16, 180);
 
-    // 温度数值
     hc_lbl_strip_t_val = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_t_val, &lv_font_montserrat_18, CLR_TEXT);
+    mkLabel(hc_lbl_strip_t_val, &lv_font_montserrat_16, CLR_TEXT);
     lv_label_set_text(hc_lbl_strip_t_val, "--.-°C");
-    lv_obj_set_width(hc_lbl_strip_t_val, 70);
-    lv_obj_set_style_text_align(hc_lbl_strip_t_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_t_val, LV_ALIGN_TOP_LEFT, 8, 210);
+    lv_obj_set_width(hc_lbl_strip_t_val, 135);
+    lv_obj_set_style_text_align(hc_lbl_strip_t_val, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    lv_label_set_long_mode(hc_lbl_strip_t_val, LV_LABEL_LONG_DOT);
+    lv_obj_align(hc_lbl_strip_t_val, LV_ALIGN_TOP_LEFT, 16, 180);
 
-    // --- 字数列（中, x≈84..156）---
-    lv_obj_t* c_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_MID, -28, 186,
-                                CLR_ACCENT, 2);
-    hc_icon_chars = c_icon;
-    hc_lbl_strip_chars = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_chars, &lv_font_simsun_16_cjk, CLR_ACCENT);
-    lv_label_set_text(hc_lbl_strip_chars, "字数");
-    lv_obj_align(hc_lbl_strip_chars, LV_ALIGN_TOP_MID, 8, 186);
+    // 进度条：槽和填充是 hc_bg 下的兄弟对象，绝对坐标（见 mkBar 上面那段）。
+    // 初值给 0 —— 首次进主屏时 updateDynamicElements() 会按真实读数改写，
+    // 不先画一截假进度条，免得闪一下又被改掉。
+    hc_bar_t_track = mkBar(hc_bg, 16, 199, HC_BAR_W, CLR_SURFACE_2);
+    hc_bar_t_fill  = mkBar(hc_bg, 16, 199, 0,          CLR_AMBER);
 
-    hc_lbl_strip_chars_val = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_chars_val, &lv_font_montserrat_18, CLR_TEXT);
-    lv_label_set_text(hc_lbl_strip_chars_val, "0");
-    lv_obj_set_width(hc_lbl_strip_chars_val, 72);
-    lv_obj_set_style_text_align(hc_lbl_strip_chars_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_chars_val, LV_ALIGN_TOP_MID, 0, 210);
-
-    // --- 湿度列（右, x≈160..228）---
-    lv_obj_t* h_icon = iconRect(hc_bg, 16, 16, LV_ALIGN_TOP_RIGHT, -18, 186,
-                                CLR_GREEN, 2);
-    hc_icon_hum = h_icon;
+    // --- 湿度格（下）---
     hc_lbl_strip_h = lv_label_create(hc_bg);
     mkLabel(hc_lbl_strip_h, &lv_font_simsun_16_cjk, CLR_GREEN);
     lv_label_set_text(hc_lbl_strip_h, "湿度");
-    lv_obj_align(hc_lbl_strip_h, LV_ALIGN_TOP_RIGHT, -34, 186);
+    lv_obj_set_width(hc_lbl_strip_h, 135);
+    lv_obj_set_style_text_align(hc_lbl_strip_h, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_h, LV_ALIGN_TOP_LEFT, 16, 209);
 
     hc_lbl_strip_h_val = lv_label_create(hc_bg);
-    mkLabel(hc_lbl_strip_h_val, &lv_font_montserrat_18, CLR_TEXT);
+    mkLabel(hc_lbl_strip_h_val, &lv_font_montserrat_16, CLR_TEXT);
     lv_label_set_text(hc_lbl_strip_h_val, "--%");
-    lv_obj_set_width(hc_lbl_strip_h_val, 70);
-    lv_obj_set_style_text_align(hc_lbl_strip_h_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(hc_lbl_strip_h_val, LV_ALIGN_TOP_RIGHT, -8, 210);
+    lv_obj_set_width(hc_lbl_strip_h_val, 135);
+    lv_obj_set_style_text_align(hc_lbl_strip_h_val, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    lv_label_set_long_mode(hc_lbl_strip_h_val, LV_LABEL_LONG_DOT);
+    lv_obj_align(hc_lbl_strip_h_val, LV_ALIGN_TOP_LEFT, 16, 209);
+
+    hc_bar_h_track = mkBar(hc_bg, 16, 228, HC_BAR_W, CLR_SURFACE_2);
+    hc_bar_h_fill  = mkBar(hc_bg, 16, 228, 0,          CLR_GREEN);
+
+    // --- 字数列（x=162..223，中心 192.5）：不画条，纯数字 ---
+    // 小标和数值上下分开排，而不是像左边那样同一行左右分 —— 这一格只有
+    // 62px 宽，塞不下"字数" + 数值同一行还不打架。
+    hc_lbl_strip_chars = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_strip_chars, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(hc_lbl_strip_chars, "字数");
+    lv_obj_set_width(hc_lbl_strip_chars, 62);
+    lv_obj_set_style_text_align(hc_lbl_strip_chars, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(hc_lbl_strip_chars, LV_ALIGN_TOP_LEFT, 162, 184);
+
+    hc_lbl_strip_chars_val = lv_label_create(hc_bg);
+    mkLabel(hc_lbl_strip_chars_val, &lv_font_montserrat_16, CLR_TEXT);
+    lv_label_set_text(hc_lbl_strip_chars_val, "0");
+    lv_obj_set_width(hc_lbl_strip_chars_val, 62);
+    lv_obj_set_style_text_align(hc_lbl_strip_chars_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_long_mode(hc_lbl_strip_chars_val, LV_LABEL_LONG_DOT);
+    lv_obj_align(hc_lbl_strip_chars_val, LV_ALIGN_TOP_LEFT, 162, 208);
 }
 
 // ===========================
@@ -8414,15 +8519,32 @@ static void updateDynamicElements(void) {
             // ---- 数据带已删除（KPM/TODAY/ACTIVE）腾出空间 ----
 // 保留 KPM 计算供其他风格使用；不写入任何 lvgl 对象（指针为 nullptr）
 
-            // 温湿度框数值：上面"温度/字数/湿度"已固定,下面写数值
-            static char tbuf[16], hbuf[16];
+            // 底部状态条：温度 / 湿度（带进度条）+ 字数（紧凑计数）
+            //
+            // shtAvailable 为 false（传感器没接上）时照旧显示 "--.-°C" / "--%"，
+            // 跟屏保信息面板 buildSaverPanel() 的处理一致；进度条此时保持空槽，
+            // 不拿 shtTemp 的初值 0 去画一根满格，骗用户以为读到的是 0%。
+            static char tbuf[16], hbuf[16], charsBuf[16];
             snprintf(tbuf, sizeof(tbuf), "%.1f°C", shtTemp);
             snprintf(hbuf, sizeof(hbuf), "%.0f%%", shtHumidity);
-            setText(hc_lbl_strip_t_val, tbuf);
-            static char charsBuf[24];
-            snprintf(charsBuf, sizeof(charsBuf), "%lu", (unsigned long)totalKeyCount);
+            setText(hc_lbl_strip_t_val, shtAvailable ? tbuf : "--.-°C");
+            setText(hc_lbl_strip_h_val, shtAvailable ? hbuf : "--%");
+            formatCountCompact(charsBuf, sizeof(charsBuf), totalKeyCount);
             setText(hc_lbl_strip_chars_val, charsBuf);
-            setText(hc_lbl_strip_h_val, hbuf);
+
+            // 进度条量程：
+            //   温度 0..50°C —— 室内实际落在 15~35，这一档下 23°C 正好在中段，
+            //     条的长度一眼能分辨"偏凉 / 舒服 / 偏热"。用 0..100 的话室内
+            //     永远只有 1/4 长，条就废了。
+            //   湿度 0..100% —— 传感器本来就是这个量程。
+            // 两边都夹紧：温度偏移是 ±20°C，负温和超过 100% 的坏读数不能让条溢出槽外。
+            float tpct = 0.0f, hpct = 0.0f;
+            if (shtAvailable) {
+                tpct = shtTemp / 50.0f;
+                hpct = shtHumidity / 100.0f;
+            }
+            setBarFill(hc_bar_t_fill, 16, 199, tpct);
+            setBarFill(hc_bar_h_fill, 16, 228, hpct);
             break;
         }
     }
