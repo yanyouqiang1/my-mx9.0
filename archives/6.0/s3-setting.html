@@ -2986,12 +2986,19 @@
             const scale = Math.min(240 / img.width, 240 / img.height);
             const w = img.width * scale, h = img.height * scale;
             ctx.drawImage(img, (240 - w) / 2, (240 - h) / 2, w, h);
+            // ⚠ 画质别再往下调。0.82 对**细线稿**是最坏的一档：JPEG 是 8×8
+            //   分块 + DCT，1px 的亮线压在近黑底上正好落在量化系数最陡的区间，
+            //   编码出来是"线发虚 + 线边一圈毛刺"—— 240 的 TFT 上一眼看过去
+            //   就是"糊"。canvas 的 toBlob 固定 4:2:0 色度 subsampling 且改不了，
+            //   所以只能靠提高 quality 换回细节。
+            //   代价是字节数：0.82 → 0.95 大约 240×240 从 6KB 涨到 14KB，
+            //   按 180 字节一片算多传 ~45 片，BLE 几秒就完事，值。
             canvas.toBlob((blob) => {
                 if (!blob) { pBox.innerText = "❌ 转码失败"; return; }
                 uploadBlob = blob;
                 pBox.innerText = `原图 ${(file.size / 1048576).toFixed(2)} MB → 本地压到 `
                     + `${(blob.size / 1024).toFixed(1)} KB，出网就这么多`;
-            }, 'image/jpeg', 0.82);
+            }, 'image/jpeg', 0.95);
             URL.revokeObjectURL(url);
         };
         img.onerror = () => { pBox.innerText = "❌ 不是图片"; URL.revokeObjectURL(url); };
