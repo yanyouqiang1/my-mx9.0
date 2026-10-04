@@ -1437,6 +1437,11 @@ static void pushNotification(AlertType type, const String& text);
 static void drawNotifPanel(void);
 static void showScreen(lv_obj_t* target);
 static void swapScreen(lv_obj_t** slot, lv_obj_t* next);
+// 删屏前先换屏的统一出口。定义在文件后段（挨着倒计时全屏那块），
+// 但 destroyScreensaver() 在前面就要用。.ino 由 Arduino 预处理成 .cpp 时
+// 会自动生成原型，所以不声明也能编过 —— 但那依赖工具链的自动补声明行为，
+// 一旦这个函数被搬进 .cpp 就立刻编不过。自己写上，不给编译期留惊喜。
+static lv_obj_t* swapAwayIfActive(lv_obj_t* doomed, lv_obj_t* replacement);
 static lv_obj_t* ensureMainScreen(void);
 static void gotoMainScreen(void);
 static void mkCard(lv_obj_t* o, uint32_t bg, uint8_t radius);
