@@ -646,7 +646,28 @@
         <!-- 6. 配置 JSON（整份拉取 / 保存） -->
         <div class="card">
             <h2>配置 JSON（整份拉取 / 保存）</h2>
-            <div class="hint">
+            <div style="display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;">
+                <button class="btn btn-orange" id="cfgPullBtn" style="flex: 1; min-width: 140px;">📥 从键盘拉取</button>
+                <button class="btn btn-green" id="cfgSaveBtn" style="flex: 1; min-width: 140px;">💾 保存到键盘</button>
+                <button class="btn btn-tag" id="cfgFormatBtn" style="flex: 0 0 auto;">格式化</button>
+            </div>
+            <div id="cfgStatus" style="font-size: 0.85rem; color: #94a3b8; margin-top: 8px;">
+                状态:还没拉取过
+            </div>
+            <textarea id="cfgJson" spellcheck="false" rows="16" style="width: 100%; margin-top: 8px;
+                 background: #0b1220; color: #a7f3d0; padding: 10px; border-radius: 6px;
+                 font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem;
+                 border: 1px solid #1e293b; resize: vertical;"></textarea>
+            <!-- 说明默认折起来：这一段有 40 行，原来顶在最上面时
+                 把 JSON 框整个挤到首屏之外，想拉一次配置得先滚过
+                 一大段字。收进 <details> 之后"配置在前、说明在后"。 -->
+            <details style="margin-top: 18px;">
+              <summary style="cursor: pointer; color: #38bdf8; font-weight: bold;
+                           background: #334155; padding: 10px 14px; border-radius: 6px;">
+                📖 这份 JSON 到底包含什么 / 怎么发回去的（点开看）
+              </summary>
+              <div class="hint" style="margin-top: 12px;">
+
                 键盘里存的配置会拼成<b>一整份 JSON</b>。下面这个框就是它的原文，
                 <b>连上蓝牙时会自动拉一次</b>，另外两个页签上所有配置表单（显示风格 /
                 闹钟 / 方案 / 映射 / 宏 / 全局键）都会随之填成键盘里的真实值。<br><br>
@@ -673,9 +694,10 @@
                   <code>"M7": "SEQ:abc"</code>；<b>键名不带系统前缀</b>，块名已经说明了是哪一边。
                   没设过的宏<b>不会出现在 JSON 里</b>，所以<b>删掉一行就是删掉一个宏</b><br>
                 · <code>gkeys</code>：<code>MA</code>/<code>MB</code> 老单套、
-                  <code>MAa</code>/<code>MAb</code>/<code>MBa</code>/<code>MBb</code> 双状态，
+                  <code>MAa</code>/<code>MAb</code>/<code>MBa</code>/<code>MBb</code> 双状态、
+                  <code>M1</code>~<code>M12</code> 各自挂的全局动作，
                   以及 <code>MA_ph</code>/<code>MB_ph</code> 两个相位（永远存在，0 或 1）。
-                  它留在顶层、不分系统 —— MA/MB 是"按一下换一套动作"的全局键，
+                  它留在顶层、不分系统 —— 这些是"按这颗键额外做什么"的全局键，
                   和当前跑在哪个系统没关系<br>
                 · <code>timer</code>：倒计时当前状态（<code>run</code> / <code>remain</code> /
                   <code>total</code>）。<b>只读</b>：保存时固件会把它原样忽略，
@@ -708,85 +730,134 @@
                   <b>不会清掉你已有的按键映射和宏</b>：Windows 就是原来的方案 1，
                   macOS 就是原来的方案 2。原来方案 3/4 的数据还留在 NVS 里，
                   但固件不再读取它们。
-            </div>
-            <div style="display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;">
-                <button class="btn btn-orange" id="cfgPullBtn" style="flex: 1; min-width: 140px;">📥 从键盘拉取</button>
-                <button class="btn btn-green" id="cfgSaveBtn" style="flex: 1; min-width: 140px;">💾 保存到键盘</button>
-                <button class="btn btn-tag" id="cfgFormatBtn" style="flex: 0 0 auto;">格式化</button>
-            </div>
-            <div id="cfgStatus" style="font-size: 0.85rem; color: #94a3b8; margin-top: 8px;">
-                状态:还没拉取过
-            </div>
-            <textarea id="cfgJson" spellcheck="false" rows="16" style="width: 100%; margin-top: 8px;
-                 background: #0b1220; color: #a7f3d0; padding: 10px; border-radius: 6px;
-                 font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem;
-                 border: 1px solid #1e293b; resize: vertical;"></textarea>
+              </div>
+            </details>
         </div>
         </div><!-- /sub-sys-json -->
     </div>
 
 <script>
-    // 键码字典：数字 = HID Keyboard Usage ID（USB HID 1.11 spec, Page 7）。
-    // 固件 kbPress() 按这套处理：
-    //   · 0x80-0x87 修饰键 (Arduino KEY_* 风格,会被 +0x60 转成 HID 0xE0-0xE7)
-    //   · 0x53-0x63 小键盘 usage,直接 pressRaw
-    //   · 其它 走 Keyboard.press(),被 _asciimap 翻成大写字母+SHIFT
+    // ==================== 键码字典 ====================
     //
-    // 之前这套字典 A-Z=97-122、0-9=48-57 是按 ASCII 写的,落进 0x53-0x63
-    // 范围的那几位会被固件当成小键盘数字 ("A"=97→Num9、"B"=98→Num0、
-    // "C"=99→Num.)。[] 这类标点也根本没有列出来,设了等于映射到未知键。
-    // 现在全部按 HID Usage ID 写,字母是 0x04-0x1D、标点是 0x2D-0x38、小键盘是
-    // 0x53-0x63,所有范围都跟固件对上。大写字母键需要单独勾 Shift 修饰键才会
-    // 出大写(HID usage 就是小写 a-z,不会自动加 SHIFT)。
-    const KEY_OPTIONS = {
+    // ⚠⚠ 这里曾经只有**一张**表，值直接写裸 HID usage（A=4、1=30…），于是
+    //   "MA/MB 组合键里选 A/B/C/D/0~4 全都不生效"——固件根本不是那么解码的。
+    //
+    //   固件 kbPress() 的实际分支（见 lvgl_s3.ino）：
+    //       0x80~0x87  → 修饰键，pressRaw(code+0x60)
+    //       >= 0x88    → press() 里减掉 0x88，再 pressRaw(剩余值)  ← 裸 HID usage
+    //       <  0x80    → press() 走 _asciimap[code]                    ← **按 ASCII 解**
+    //   而 _asciimap[4]=0x00（ASCII 4 是 EOT）→ A/B/C/D 什么都不发；
+    //   _asciimap[30]=0x00 → 数字 1~2 不发声；_asciimap[8]=0x2A → "E" 发出退格。
+    //   只有落在 >= 0x88 的（F1=194、Num*=221）才是对的 —— 正好就是"这两个能用
+    //   其它都不能"的现象。
+    //
+    // 修法：凡是 HID usage < 0x80 的，统统 +0x88。0x88 是 Arduino 库自带的
+    //   "这是非打印键/裸 usage"标记，减完正好落回 pressRaw，和 >=0x88 的老条目
+    //   走同一条路。这样**一个数都不需要固件改**，而且老宏存的 ASCII 码
+    //   （A=97、1=49）继续按原样工作 —— _asciimap 那条分支没动过。
+    //
+    // 小键盘（TinyUSB 的 usage 是 0x54~0x63，见 hid.h HID_KEY_KEYPAD_*）：
+    //   Num 1=0x88+0x59=225 … Num 9=233、Num 0=234、Num .=235
+    // 之前"Num 1~0/."填的是 ASCII 48~57，_asciimap['1']=0x1E|SHIFT
+    //   → 发出来是 **Shift+a = "A"**。这就是"选了 Num 1 结果不是数字小键盘 1"。
+    //
+    // ---- 为什么要拆成 FROM / TO 两张表 ----
+    //   · TO  = "要让主机收到什么" → 走 kbPress → 上面的 +0x88 编码。
+    //     用在：REMAP「到按键」、以及**所有**组合键面板的普通键列表
+    //     （MA/MB 双状态、全局独立功能键 M1~M12、系统专属宏）。
+    //   · FROM= "键盘上哪一颗物理键" → 必须和固件 baseMatrix 里的码点一致。
+    //     矩阵里字母存的是**小写 ASCII**（baseMatrix[2][9]='n'）、数字存 ASCII、
+    //     特殊键存 0x88+usage、修饰键存 0x80~0x87。getMappedKey() 拿 baseKey
+    //     去比 fromKey，所以 FROM 必须是**矩阵码**，不是 HID usage。
+    //     以前两张下拉共用一张表，于是选"A"存进去 from=4，而按 A 时 baseKey=97
+    //     —— 永远匹配不上，映射配了等于没配，而且当场看不出任何异常。
+
+    // REMAP「从按键」：键盘矩阵里的码点
+    const KEY_OPTIONS_FROM = {
         "无按键": 0,
-        "A": 4, "B": 5, "C": 6, "D": 7, "E": 8, "F": 9, "G": 10,
-        "H": 11, "I": 12, "J": 13, "K": 14, "L": 15, "M": 16, "N": 17,
-        "O": 18, "P": 19, "Q": 20, "R": 21, "S": 22, "T": 23, "U": 24,
-        "V": 25, "W": 26, "X": 27, "Y": 28, "Z": 29,
-        "1": 30, "2": 31, "3": 32, "4": 33, "5": 34,
-        "6": 35, "7": 36, "8": 37, "9": 38, "0": 39,
+        "A": 97, "B": 98, "C": 99, "D": 100, "E": 101, "F": 102, "G": 103,
+        "H": 104, "I": 105, "J": 106, "K": 107, "L": 108, "M": 109, "N": 110,
+        "O": 111, "P": 112, "Q": 113, "R": 114, "S": 115, "T": 116, "U": 117,
+        "V": 118, "W": 119, "X": 120, "Y": 121, "Z": 122,
+        "0": 48, "1": 49, "2": 50, "3": 51, "4": 52, "5": 53, "6": 54, "7": 55, "8": 56, "9": 57,
         "F1": 194, "F2": 195, "F3": 196, "F4": 197, "F5": 198, "F6": 199,
         "F7": 200, "F8": 201, "F9": 202, "F10": 203, "F11": 204, "F12": 205,
-        "Enter 回车": 40, "Esc": 41, "Backspace 退格": 42, "Tab": 43, "Space 空格": 44,
-        "-": 45, "=": 46, "[": 47, "]": 48, "\\": 49, ";": 51,
-        "'": 52, "`": 53, ",": 54, ".": 55, "/": 56,
+        "Enter 回车": 176, "Esc": 177, "Backspace 退格": 178, "Tab": 179, "Space 空格": 32,
+        "-": 45, "=": 61, "[": 91, "]": 93, "\\": 92, ";": 59,
+        "'": 39, "`": 96, ",": 44, ".": 46, "/": 47,
         "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
+        "Insert": 209, "Caps Lock": 193,
         "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
-        // 小键盘符号键：用**键盘矩阵里小键盘那一片自己的码点**(0xDC~0xDF)。
-        //
-        // 为什么不能用 ASCII（这是 Num * 发成 Shift+8 的根因）：
-        //   之前 "Num *" 编成 ASCII 42='*'，固件 kbPress 走 Keyboard.press('*')，
-        //   而 _asciimap[0x2A] = 0x25|SHIFT = "主键盘的 Shift+8"。同理
-        //   "Num +"=43 → _asciimap[0x2B] = SHIFT+'='，出来的都不是小键盘那颗键。
-        //   用户要的是**小键盘的 \***，HID usage 0x55，只有走 pressRaw 才能发出来。
-        //
-        // 为什么不能直接用 HID 0x53~0x63：那段和 ASCII 'a'/'b'/'c'(0x61~0x63)
-        //   数值撞车，基础键盘按 a/b/c 会被发成 Num 9/Num 0/Num .（曾经的 A→9 bug）。
-        //
-        // 0xDC~0xDF 是**两全**的选择：HID 小键盘这一段在矩阵里的编码就是 0x88+usage
-        //   （0x88+0x54=0xDC=Num / … 0x88+0x57=0xDF=Num +），和 a/b/c 不撞车，
-        //   固件 kbPress 对 >=0x88 的值走 pressRaw(code-0x88)，正好落到 0x54~0x57。
-        //   换句话说：宏里选"Num *"和**手按物理小键盘的 \* 键**发出的是同一个码点。
-        //
-        // 数字键(1-9/0/.)保留 ASCII：_asciimap 把它们翻成主键盘数字，字符本身是对的
-        //   ('1' 还是 '1')；而 0xE0~0xE7 那一段和网页"🔹 修饰键"的 224~231 撞车，
-        //   走一遍 normalizeRemapKey 会被折算成 Ctrl/Shift，反而更糟。
-        //   Num Lock 和 Num Enter 同理（后者用 '\n' 也能得到回车），继续留在 ASCII 侧。
-        "Num /": 220, "Num *": 221, "Num -": 222, "Num +": 223, "Num Enter": 10,
-        "Num 1": 49, "Num 2": 50, "Num 3": 51, "Num 4": 52, "Num 5": 53,
-        "Num 6": 54, "Num 7": 55, "Num 8": 56, "Num 9": 57,
-        "Num 0": 48, "Num .": 46,
-        // REMAP 专用修饰键（HID 标准 0xE0-0xE7）
-        "🔹 Left Ctrl": 224, "🔹 Left Shift": 225, "🔹 Left Alt": 226, "🔹 Left GUI/Win": 227,
-        "🔹 Right Ctrl": 228, "🔹 Right Shift": 229, "🔹 Right Alt": 230, "🔹 Right GUI/Win": 231
+        "Num /": 220, "Num *": 221, "Num -": 222, "Num +": 223, "Num Enter": 224,
+        "Num 1": 225, "Num 2": 226, "Num 3": 227, "Num 4": 228, "Num 5": 229,
+        "Num 6": 230, "Num 7": 231, "Num 8": 232, "Num 9": 233,
+        "Num 0": 234, "Num .": 235,
+        "🔹 Ctrl": 128, "🔹 Shift": 129, "🔹 Alt": 130, "🔹 Win/Cmd": 131,
+        "🔹 右 Ctrl": 132, "🔹 右 Shift": 133, "🔹 右 Alt": 134, "🔹 右 Win/Cmd": 135
     };
 
-    // 全局动作里的主键下拉不需要修饰键项（修饰键用复选框）。
+    // 目标键 / 组合键面板：HID usage < 0x80 的一律 +0x88
+    const KEY_OPTIONS_TO = {
+        "无按键": 0,
+        // 字母 0x04~0x1D → 140~165
+        "A": 140, "B": 141, "C": 142, "D": 143, "E": 144, "F": 145, "G": 146,
+        "H": 147, "I": 148, "J": 149, "K": 150, "L": 151, "M": 152, "N": 153,
+        "O": 154, "P": 155, "Q": 156, "R": 157, "S": 158, "T": 159, "U": 160,
+        "V": 161, "W": 162, "X": 163, "Y": 164, "Z": 165,
+        // 数字 0x1E~0x27 → 166~175
+        "1": 166, "2": 167, "3": 168, "4": 169, "5": 170,
+        "6": 171, "7": 172, "8": 173, "9": 174, "0": 175,
+        "F1": 194, "F2": 195, "F3": 196, "F4": 197, "F5": 198, "F6": 199,
+        "F7": 200, "F8": 201, "F9": 202, "F10": 203, "F11": 204, "F12": 205,
+        // 0x28~0x2C → 176~180
+        "Enter 回车": 176, "Esc": 177, "Backspace 退格": 178, "Tab": 179, "Space 空格": 180,
+        // 0x2D~0x38 → 181~192（0x32 是 Euro，没列）
+        "-": 181, "=": 182, "[": 183, "]": 184, "\\": 185, ";": 187,
+        "'": 188, "`": 189, ",": 190, ".": 191, "/": 192,
+        "Delete": 212, "Home": 210, "End": 213, "Page Up": 211, "Page Down": 214,
+        "Insert": 209, "Caps Lock": 193,
+        "↑ 上箭头": 218, "↓ 下箭头": 217, "← 左箭头": 216, "→ 右箭头": 215,
+        // 小键盘 0x54~0x63 → 220~235（和矩阵里的编码一致）
+        "Num /": 220, "Num *": 221, "Num -": 222, "Num +": 223, "Num Enter": 224,
+        "Num 1": 225, "Num 2": 226, "Num 3": 227, "Num 4": 228, "Num 5": 229,
+        "Num 6": 230, "Num 7": 231, "Num 8": 232, "Num 9": 233,
+        "Num 0": 234, "Num .": 235,
+        // 修饰键用 0x80~0x87（kbPress 的专用分支）。这跟 REMAP 原来的
+        // 0xE0~0xE7 也兼容：固件 normalizeRemapKey() 会把后者折算成前者。
+        "🔹 Ctrl": 128, "🔹 Shift": 129, "🔹 Alt": 130, "🔹 Win/Cmd": 131,
+        "🔹 右 Ctrl": 132, "🔹 右 Shift": 133, "🔹 右 Alt": 134, "🔹 右 Win/Cmd": 135
+    };
+
+    // REMAP 的两个下拉要**避开 0xE0~0xE7**。
+    //
+    // 固件 normalizeRemapKey() 里有这么一段历史包袱：
+    //     (code >= 0xE0 && code <= 0xE7) ? (code - 0x60) : code
+    // —— 把 0xE0~0xE7 折算成 128~135。它存在的原因是**旧网页**用 224~231
+    // 表示修饰键，而键盘矩阵里修饰键其实是 0x80~0x87，两边对不上才需要折算。
+    // 现在网页已经改成直接用 128~135 了，但这段折算留着（为了旧规则不失效）。
+    //
+    // 代价是：**0xE0~0xE7 在 REMAP 里已经被修饰键占用了**，而矩阵的小键盘
+    // Enter(0xE0)/1~7(0xE1~0xE7) 恰好就在这一段。所以小键盘这几颗键
+    // 不能当 REMAP 的源或目标 —— 选了会被折算成 Ctrl/Shift/Alt/Win。
+    //
+    // 组合键面板**不走** normalizeRemapKey（那条路只有 REMAP 会经过），
+    // 所以那里的 "Num 1~Num ." 是好的，别一起砍掉。
+    const MOD_AMBIGUOUS = (d) => {
+        const out = {};
+        for (const k in d) {
+            if (d[k] >= 0xE0 && d[k] <= 0xE7) continue;
+            out[k] = d[k];
+        }
+        return out;
+    };
+    const KEY_OPTIONS_REMAP_FROM = MOD_AMBIGUOUS(KEY_OPTIONS_FROM);
+    const KEY_OPTIONS_REMAP_TO   = MOD_AMBIGUOUS(KEY_OPTIONS_TO);
+
+    // 组合键面板的普通键下拉：修饰键用复选框，不在这里重复出现
     const KEY_OPTIONS_NO_MODS = (() => {
         const out = {};
-        for (const k in KEY_OPTIONS) {
-            if (!k.startsWith("🔹")) out[k] = KEY_OPTIONS[k];
+        for (const k in KEY_OPTIONS_TO) {
+            if (!k.startsWith("🔹")) out[k] = KEY_OPTIONS_TO[k];
         }
         return out;
     })();
@@ -798,8 +869,11 @@
     }
 
     function populateAll() {
-        populateSelect(document.getElementById('remapFromSel'), KEY_OPTIONS);
-        populateSelect(document.getElementById('remapToSel'), KEY_OPTIONS);
+        // 三张表各司其职：REMAP 从=矩阵码、到=0x88+HID，且两侧都要避开
+        // 0xE0~0xE7（见上面 MOD_AMBIGUOUS 的说明）。混用任何一张都会让
+        // 映射"配了不生效"而现场看不出异常。
+        populateSelect(document.getElementById('remapFromSel'), KEY_OPTIONS_REMAP_FROM);
+        populateSelect(document.getElementById('remapToSel'), KEY_OPTIONS_REMAP_TO);
         // 宏键 / 全局键的普通键列表都是动态生成的（addComboKey / addGlobalkComboKey
         // → renderComboKeys / renderGlobalkComboKeys），不在这里预先 populate。
     }
@@ -2146,29 +2220,22 @@
         });
     }
 
-    // 键码 → 键名。**两套编码都要认**，否则映射列表回显出来是一串 "#128"。
+    // 键码 → 键名。**两张表都要认**。
     //
-    // ⚠ 为什么会有两套：KEY_OPTIONS 里修饰键存的是 HID 标准码 224~231
-    //   （0xE0~0xE7），而固件的 normalizeRemapKey() 在读 NVS 时会把这一段
-    //   折算成 Arduino 风格的 128~135（224 - 96）**再发给网页**。于是：
-    //     · 用户从下拉里选「🔹 Left Ctrl」→ 存 224
-    //     · 键盘读出来折算成 128 → 回传网页
-    //     · codeToKeyName(128) 在表里找不到 → 返回 null → 显示 "#128"
-    //   用户看到的是"我配的明明是 Left Control，怎么回来变成井号 128 了"。
+    // 固件发回来的 `from` 一定是**矩阵码**（normalizeRemapKey 只折算修饰键，
+    // 其它原样透传），所以先查 FROM；`to` 是用户当时选的目标键编码，查 TO。
+    // 两张表都能命中同一个名字时先到先得 —— 无按键(0)、F1~F12、小键盘这些
+    // 在两表里值本来就一样，返回的名字也一模一样，不会有歧义。
     //
-    //   折算关系是 code - 0x60（见 lvgl_s3.ino 的 normalizeRemapKey），
-    //   这里照着补一张反向表。两边要改必须一起改。
-    const ARDUINO_MOD_TO_HID = {
-        128: 224, 129: 225, 130: 226, 131: 227,
-        132: 228, 133: 229, 134: 230, 135: 231,
-    };
+    // ⚠ 这里曾经还需要一张 ARDUINO_MOD_TO_HID 反向表（128→224）来把固件
+    //   折算出来的修饰键码认回名字。现在两张表里修饰键都直接是 128~135，
+    //   固件 normalizeRemapKey() 折算完正好命中，反向表自然退休。
+    //   留着它反而危险：224~231 在 TO 表里已经**不是**修饰键了
+    //   （224 往后是小键盘 Enter/1/2…），照着映射会把修饰键显示成小键盘键。
     function codeToKeyName(code) {
         if (typeof code === 'string') code = Number(code);
-        for (const k in KEY_OPTIONS) if (KEY_OPTIONS[k] === code) return k;
-        const hid = ARDUINO_MOD_TO_HID[code];
-        if (hid !== undefined) {
-            for (const k in KEY_OPTIONS) if (KEY_OPTIONS[k] === hid) return k;
-        }
+        for (const k in KEY_OPTIONS_FROM) if (KEY_OPTIONS_FROM[k] === code) return k;
+        for (const k in KEY_OPTIONS_TO) if (KEY_OPTIONS_TO[k] === code) return k;
         return null;
     }
 

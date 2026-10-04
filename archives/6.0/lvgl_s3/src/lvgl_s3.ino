@@ -163,6 +163,7 @@ static void logDumpPump(void);
 //                               · <块>.remap   出现 = 整份替换该方案的映射
 //                               · <块>.macros.<键> 出现 = 写/删这一个宏
 //                               · gkeys.<槽>       出现 = 写/删这一个全局键
+//                                 （MA / MB / MAa / MAb / MBa / MBb / M1~M12）
 //                             没提到的键一律**不动**
 //
 // ⚠ 增量**不带 version**，也不做版本闸门：补丁的语义本来就是"只动我点名的
@@ -190,7 +191,7 @@ static void logDumpPump(void);
 // ⚠⚠ 这里原来是 .bss 上的 1536 / 2048 固定数组，**加进方案就不够了**：
 //   48 个宏 × (键名 7 + 引号 2 + 正文上限 CFG_MACRO_MAX) ≈ 12.7KB
 //   4 方案 × 32 条 remap × `{"from":255,"to":255}` ≈ 3.3KB
-//   gkeys 6 个 payload × CFG_GKEY_MAX ≈ 1.5KB
+//   gkeys 18 个 payload × CFG_GKEY_MAX ≈ 4.5KB
 //   标量 ≈ 0.4KB
 //   → 最坏 ~18KB。而 18KB × 2（收发各一份）硬塞进 .bss 会白吃 36KB 静态 RAM，
 //   这块板子内部 DRAM 本来就紧（构建时报 29.5%）。所以改成**按需 ps_malloc**。
@@ -5378,14 +5379,44 @@ static const size_t CFG_FIELD_COUNT = sizeof(CFG_FIELDS) / sizeof(CFG_FIELDS[0])
 // 两张表**必须同序同长** —— 一旦错位，写下去的就是"把 A 的值存进了 B 的键"，
 // 而现场毫无异常（只有下次读回来才发现串了）。
 //
-// 这 6 个槽就是固件 GSET: 能写的全部：
+// 槽位清单（18 个）：
 //   MA / MB    老单套全局动作（保留兼容，网页新 UI 不显示但老配置还在）
 //   MAa / MAb  MA 的状态 A / 状态 B
 //   MBa / MBb  MB 的状态 A / 状态 B
+//   M1~M12     M1~M12 各自额外挂的"全局动作"（先跑它，再播按方案宏）
 // 相位 g_MA_ph / g_MB_ph 不在这张表里 —— 它是数字不是字符串，单开一处处理。
-static const char* const GKEY_SLOT[] = { "MA", "MB", "MAa", "MAb", "MBa", "MBb" };
-static const char* const GKEY_NVS[]  = { "g_MA", "g_MB", "g_MAa", "g_MAb", "g_MBa", "g_MBb" };
+//
+// ⚠⚠ M1~M12 以前**不在**这张表里，而网页的「全局独立功能键」一直在往
+//   `gkeys.M1` 写。于是 cfgGkeySlotOf("M1") 返回 -1，落进"未知键忽略"那条
+//   分支 —— 固件既不落盘也不报错，网页照常回"已保存并生效"。端到端表现是：
+//   · 按 M1 什么都不发生
+//   · 看网页本地模型，gkeys.M1 明明在（那是网页自己写的）
+//   · 一重新拉取就没了（键盘 NVS 里从来没存进去过）
+//   根因是"网页改了通道（GSET: → JSON），固件的槽表没跟着扩"。
+//   NVS 键名沿用 g_M1~g_M12 —— executeGlobalKey() 一直读的就是这几个键，
+//   所以老版本用 GSET:M1:… 存进去的存量配置**不需要迁移**。
+// ⚠ NVS 键名**没有第二张表**，而是从槽名派生的：`g_<槽>`。
+//   原来 GKEY_SLOT[] 和 GKEY_NVS[] 是两张并排的字符串数组，注释里专门写着
+//   "必须同序同长" —— 而这恰恰是最容易出错、又最不可能被测出来的地方：
+//   长度不匹配是静默的越界读，两张表错位则"把 A 的值存进 B 的键"，而当场
+//   一切正常。派生之后这个约定从"靠人记得"变成"结构上不可能违反"。
+//   （executeGlobalKey() 读的一直就是 g_<键名>，所以存量配置无感知。）
+static const char* const GKEY_SLOT[] = {
+    "MA", "MB", "MAa", "MAb", "MBa", "MBb",
+    "M1", "M2", "M3", "M4", "M5", "M6",
+    "M7", "M8", "M9", "M10", "M11", "M12"
+};
 static const int          GKEY_SLOT_COUNT = (int)(sizeof(GKEY_SLOT) / sizeof(GKEY_SLOT[0]));
+
+// 第 i 个槽对应的 NVS 键，形如 "g_MAa"。
+// 按值返回（不是引用）：Preferences::getString/putString/remove 只收 const char*，
+// 一旦传 String 引用进去是编译不过的；而"返回局部静态的引用"这种写法，
+// 调用方随手存一下就悬空了，不如老老实实按值返回 —— 一次 CFGGET 才 18 个
+// 十来个字符的串，拷贝成本可以忽略。
+static String gkeyNvsKey(int slot) {
+    return String("g_") + GKEY_SLOT[slot];
+}
+
 
 // 每个方案的 M 键个数。宏的 NVS 键是 p<方案>_M<序号>，MACROS_RESET 里
 // 硬写的 12、网页的 4×12 批量预加载都是这个数 —— 改一处要改三处。
@@ -5682,17 +5713,18 @@ static size_t cfgBuildJson(char* out, size_t cap) {
         }
     }
 
-    // ---- gkeys：MA/MB 的双状态 + 相位（全局，不分系统）----
+    // ---- gkeys：MA/MB 的双状态 + M1~M12 的全局动作 + 相位（全局，不分系统）----
     //
-    // 留在顶层而不是塞进 windows/mac：MA/MB 是"按一下换一套动作"的全局键，
-    // 和当前跑在哪个操作系统没关系，拆成两套只会让 NVS 多占一倍、页面多出一倍卡片。
+    // 留在顶层而不是塞进 windows/mac：这些是"按这颗键额外做什么"，和当前跑在
+    // 哪个操作系统没关系，拆成两套只会让 NVS 多占一倍、页面多出一倍卡片。
     JsonObject gk = doc["gkeys"].to<JsonObject>();
     for (int i = 0; i < GKEY_SLOT_COUNT; i++) {
-        String v = preferences.getString(GKEY_NVS[i], "");
+        const String nk = gkeyNvsKey(i);
+        String v = preferences.getString(nk.c_str(), "");
         if (v.length() > 0) {
             if (v.length() > CFG_GKEY_MAX) {
                 v = v.substring(0, CFG_GKEY_MAX);
-                ELWARN("CFG", "全局键 %s 超过 %d 字节，回拉时截断", GKEY_NVS[i], (int)CFG_GKEY_MAX);
+                ELWARN("CFG", "全局键 %s 超过 %d 字节，回拉时截断", nk.c_str(), (int)CFG_GKEY_MAX);
             }
             gk[GKEY_SLOT[i]] = v;
         }
@@ -6197,7 +6229,8 @@ for (int p = 0; p < TOTAL_PROFILES; p++) {
 //
 // ⚠ 同样要回读校验，理由见上面 macros 那段（写不下新键时 putString 静默失败）。
 //   全局键这条尤其容易踩：一条 SW:1+CMB:128,4 之类的组合有一两百字节，
-//   而 gkeys 有 6 个槽，加上宏和映射，nvs 那 20KB 很快就满了。
+//   而 gkeys 现在有 18 个槽（MA/MB 六套 + M1~M12），加上宏和映射，
+//   nvs 那 20KB 很快就满了。
 if (!jGkeys.isNull()) {
     for (JsonPairConst kv : jGkeys.as<JsonObjectConst>()) {
         const char* k = kv.key().c_str();
@@ -6205,12 +6238,13 @@ if (!jGkeys.isNull()) {
         if (slot >= 0) {
             JsonVariantConst v = kv.value();
             const char* val = v.isNull() ? "" : v.as<const char*>();
+            const String nk = gkeyNvsKey(slot);
             if (val[0] == '\0') {
-                preferences.remove(GKEY_NVS[slot]);
+                preferences.remove(nk.c_str());
                 ELINFO("CFG", "全局键 %s 已删", k);
             } else {
-                preferences.putString(GKEY_NVS[slot], val);
-                String back = preferences.getString(GKEY_NVS[slot], "");
+                preferences.putString(nk.c_str(), val);
+                String back = preferences.getString(nk.c_str(), "");
                 if (back != val) {
                     // 记失败项（同上，宏）
                     CFG_FAIL_ADD(k);
@@ -6808,6 +6842,15 @@ static void handleCommand(const String& cmd) {
         if (preferences.remove("g_MBb"))  removed++;
         if (preferences.remove("g_MA_ph")) removed++;
         if (preferences.remove("g_MB_ph")) removed++;
+        // M1~M12 各自挂的全局动作（g_M1~g_M12）。
+        // ⚠ 以前这里漏了：网页按钮上写着"清空所有宏（M1~M12 × 2 个系统 + MA + MB）"，
+        //   而 M1~M12 的全局动作留在 NVS 里没被清 —— 用户点了"全部清空"之后
+        //   按 M1 还是会有反应，是那种"怎么又回来了"的幽灵事件。
+        for (int m = 1; m <= 12; m++) {
+            char gk[8];
+            snprintf(gk, sizeof(gk), "g_M%d", m);
+            if (preferences.remove(gk)) removed++;
+        }
         LOG_PORT.printf("[MACROS_RESET] removed %d keys\n", removed);
         char info[24];
         snprintf(info, sizeof(info), "%d 项已清", removed);
