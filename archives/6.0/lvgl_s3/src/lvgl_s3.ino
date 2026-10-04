@@ -5849,7 +5849,10 @@ static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, si
     // ---- 第一遍：先校验，一个都不落地 ----
     // 为什么不先写完再报错：网页发来的 JSON 少一项、多一个逗号都可能，
     // 半途落盘会留下"一半新一半旧"的配置，而用户完全看不出是哪一半。
-    struct Pending { const CfgField* f; double num; bool boolean; };
+    // changed 由第二遍赋值时顺手记下来，后面挂副作用时**只读它**。
+    // 曾经 pendMask 那一段想"再比一次看看变没变"，可第二遍早就把新值写进
+    // 变量了 —— 再比必然相等，于是 pendMask 恒为 0，副作用一个都挂不上。
+    struct Pending { const CfgField* f; double num; bool boolean; bool changed; };
     static Pending pend[CFG_FIELD_COUNT];
     int nPend = 0;
 
@@ -5867,6 +5870,7 @@ static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, si
             pend[nPend].f = &f;
             pend[nPend].boolean = v.as<bool>();
             pend[nPend].num = 0;
+            pend[nPend].changed = false;
             nPend++;
             continue;
         }
@@ -5883,6 +5887,7 @@ static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, si
         pend[nPend].f = &f;
         pend[nPend].num = num;
         pend[nPend].boolean = false;
+        pend[nPend].changed = false;
         nPend++;
     }
 
@@ -6100,6 +6105,7 @@ for (int i = 0; i < nPend; i++) {
             break;
     }
     if (!changed) continue;      // 没变：不写 NVS、不做副作用、不喂狗
+    pend[i].changed = true;      // 记下来给下面的 pendMask 用（见 Pending::changed）
     nChanged++;
     unsigned long tField = millis();
     cfgPutNvs((size_t)(f - CFG_FIELDS));   // 传下标，见 cfgPutNvs 上面的坑
@@ -6246,10 +6252,18 @@ ELINFO("CFG", "已应用 %d 个设置项（其中方案类 %d 条），NVS 提�
 
 // ---- 界面副作用：**只置位**，留给 cfgPostPump 在后面的 loop 里一件一件做 ----
 //
-// ⚠ 只按**真的变了**的字段来挂（上面第二遍里数出来的 nChanged / 逐项的
-//   changed 标记）。原来这里是"JSON 里带了哪个字段就挂哪个"，配合网页的全量
-//   下发，等于每改任何一项都会重建主屏 —— 那正是"改个亮度键盘自己跳到设置
-//   页面"的成因。
+// ⚠ 只按**真的变了**的字段来挂 —— 判据是第二遍记下来的 pend[i].changed。
+//   原来这里是"JSON 里带了哪个字段就挂哪个"，配合网页的全量下发，等于每改
+//   任何一项都会重建主屏 —— 那正是"改个亮度键盘自己跳到设置页面"的成因。
+//
+// ⚠⚠ 后来改成了"再比一遍 `*f->var == pend[i].num` 确认变没变"，那是更糟的一版：
+//   第二遍早就把新值写进那个变量了，所以这个比较**恒为相等**、恒判成"没变"、
+//   恒 continue —— pendMask 永远是 0，**一个副作用都挂不上**。
+//   现场表现：网页回"已保存 1 项配置"、NVS 里也真写进去了，但屏幕纹丝不动。
+//   同步电脑时间也一样：set_epoch 进了 NVS、epochCache 也更新了，唯独
+//   settimeofday() 没人调 —— 键盘上的钟还是旧时间。
+//   "改个亮度键盘自己跳设置页"当时看着是修好了，其实是这个 bug 顺手把
+//   **所有**副作用都掐了；副作用一恢复，这个判据就只能读第二遍的结果。
 //
 // 顺序有讲究：
 //   CLOCK  改系统时间，无 UI 依赖，最先
@@ -6260,15 +6274,7 @@ ELINFO("CFG", "已应用 %d 个设置项（其中方案类 %d 条），NVS 提�
 uint8_t pendMask = 0;
 for (int i = 0; i < nPend; i++) {
     const CfgField* f = pend[i].f;
-    // 和第二遍同一个判据：这个字段是不是真变了
-    bool stillSame = false;
-    switch (f->type) {
-        case CFG_U8:   stillSame = (*(uint8_t*)f->var == (uint8_t)pend[i].num);   break;
-        case CFG_BOOL: stillSame = (*(bool*)f->var == pend[i].boolean);          break;
-        case CFG_F32:  stillSame = (fabsf(*(float*)f->var - (float)pend[i].num) <= 0.0005f); break;
-        case CFG_U32:  stillSame = (*(uint32_t*)f->var == (uint32_t)pend[i].num); break;
-    }
-    if (stillSame) continue;      // 没变 → 不挂副作用（值已经是它了）
+    if (!pend[i].changed) continue;   // 没变 → 不挂副作用（值本来就是它）
     switch (f->post) {
         case CFG_POST_CLOCK: pendMask |= CFG_PEND_CLOCK; break;
         case CFG_POST_DISP:  pendMask |= CFG_PEND_DISP;  break;

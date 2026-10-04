@@ -39,6 +39,41 @@
         .tab-panel { display: none; }
         .tab-panel.active { display: block; }
 
+        /* 二级 Tab（系统设置里"界面设置 / JSON 配置"）。
+           它是**并级**关系 —— 和顶部 Tab 不是同一层：顶部 Tab 切完之后，
+           系统设置这一页内部还要再切一次，两组按钮互不影响。
+           刻意用另一种配色（青底 vs 蓝底）+ 圆角而不是接在顶部那条下边线上，
+           免得看成分层 Tab 的下一级、或者和顶部 Tab 打架。 */
+        .sub-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+        .sub-tabs button { background: #334155; color: #cbd5e1; border: 1px solid #475569; padding: 9px 18px; font-size: 0.92rem; font-weight: bold; border-radius: 20px; cursor: pointer; transition: all 0.2s; }
+        .sub-tabs button.active { background: #0ea5e9; border-color: #0ea5e9; color: #06283a; }
+        .sub-tabs button:hover { border-color: #38bdf8; }
+        .sub-panel { display: none; }
+        .sub-panel.active { display: block; }
+
+        /* 方案配置页的两大块：全局配置 / 方案配置。
+           用一条渐隐的横线把块和块隔开，比再套一层 div 轻。 */
+        .group-title { display: flex; align-items: center; gap: 12px; margin: 30px 0 16px; color: #38bdf8; font-size: 1.15rem; font-weight: bold; }
+        .group-title::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, #334155, transparent); }
+        .group-title .sub { font-size: 0.8rem; color: #64748b; font-weight: normal; }
+        /* 第一个块标题紧贴面板顶，别在页面上方留一条 30px 的空白带 */
+        #tab-profile > .group-title:first-child { margin-top: 0; }
+
+        /* 方案配置页：两块用 flex 的 order 换视觉顺序。
+           DOM 顺序 = 读代码的顺序（remap 在前、MA/MB 在后，和它们各自的
+           提交历史一致），order 只负责把"全局配置"整块提到前面。这样重排
+           就只是给几个块加 class，不用把上百行卡片搬来搬去 —— 搬一次就少
+           一次把某个 id 抄错的 chance，而 id 抄错的表现是"点某个按钮没反应"，
+           现场极难定位。 */
+        #tab-profile.active { display: flex; flex-direction: column; }
+        .pf-title-global { order: 1; }
+        .pf-card-mamb    { order: 2; }
+        .pf-card-gkey    { order: 3; }
+        .pf-title-prof   { order: 4; }
+        .pf-card-picker  { order: 5; }
+        .pf-card-remap   { order: 6; }
+        .pf-card-macro   { order: 7; }
+
         /* 紧凑列表样式 */
         .rule-row { display: flex; gap: 8px; align-items: center; padding: 8px; background: #334155; border-radius: 4px; margin-bottom: 6px; }
         .rule-row .arrow { color: #38bdf8; font-weight: bold; }
@@ -113,36 +148,41 @@
             <button class="btn btn-green" id="meSendBtn" style="width: 100%; margin-top: 8px;">📡 下发并存入 ME 键</button>
         </div>
 
-        <!-- 蓝牙收发流水：出问题时先看这里 -->
+        <!-- 3. 壁纸 / LOGO 画板上传 -->
         <div class="card">
-            <h2>3. 蓝牙收发流水（排错用）</h2>
-            <div class="hint">显示每条发出的指令和键盘回话。网页上"保存成功"到底成没成，看键盘回话最准。</div>
-            <div id="bleLog" style="margin-top: 8px; max-height: 220px; overflow-y: auto;
-                background:#0b1220; border:1px solid #1e293b; border-radius:6px;
-                padding:8px; font-family:Consolas,monospace; font-size:12px; color:#94a3b8;
-                white-space:pre-wrap; word-break:break-all;">（还没有任何收发记录）</div>
+            <h2>3. 设置壁纸 / LOGO 画板 (240x240)</h2>
+            <div class="hint">
+                随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
+                <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
+            </div>
+            <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
+                <input type="file" id="imageInput" accept="image/*" style="width: auto;">
+                <canvas id="previewCanvas" width="240" height="240" style="border: 1px solid #475569; width: 120px; height: 120px; border-radius: 6px;"></canvas>
+                <button class="btn btn-orange" id="uploadImageBtn">压缩并上传到键盘壁纸</button>
+            </div>
+            <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
         </div>
     </div>
 
     <!-- =================== 方案配置 Tab =================== -->
     <div id="tab-profile" class="tab-panel">
 
+        <!-- ===== 一、全局配置（不分系统，两个系统下都生效）===== -->
+        <div class="group-title pf-title-global">一、全局配置 <span class="sub">不分 Windows / macOS，两边下都生效</span></div>
+
         <!-- 1. 按方案按键映射 REMAP -->
-        <div class="card">
+        <div class="card pf-card-remap">
             <h2>1. 按方案按键映射 (REMAP) — 例：把 Win 映射为 Ctrl</h2>
             <div class="hint">
                 映射按方案独立保存，互不影响。底层用的是键盘 HID 键码（HID Usage ID），
                 常见修饰键：Ctrl=128, Shift=129, Alt=130, Win/Cmd=131。
-                按下 MR 录制时进入 NORMAL 模式的键也会走映射，方便游戏改键。
+                按下 MR 录制时进入 NORMAL 模式的键也会走映射，方便游戏改键。<br>
+                当前编辑的是上面 <b style="color:#38bdf8;">「二、方案配置」</b>里选中的那个系统。
             </div>
 
-            <div style="display: flex; gap: 10px; margin-top: 10px; align-items: center;">
-                <label style="white-space: nowrap;">目标方案：</label>
-                <select id="remapProfile" style="flex: 1;">
-                    <!-- 同上：value 必须和 CFG_PROFILES 下标 + 固件 CFG_PROF_NAMES 同序 -->
-                    <option value="0">Windows</option>
-                    <option value="1">macOS</option>
-                </select>
+            <div style="display: flex; gap: 10px; margin-top: 10px; align-items: center; flex-wrap: wrap;">
+                <span class="hint" style="margin: 0;">正在编辑：</span>
+                <span id="remapProfName" style="font-weight: bold; color: #38bdf8; min-width: 72px;">Windows</span>
                 <button class="btn btn-tag" id="remapLoadBtn">📥 从键盘读取</button>
                 <button class="btn btn-red" id="remapClearBtn">🗑️ 清空此方案</button>
                 <button class="btn btn-red" id="remapResetAllBtn" title="一键清掉两个系统的按键映射,解决老 REMAP 残留(按 A 变 9 这类)">⚠️ 清空全部映射</button>
@@ -171,12 +211,12 @@
         </div>
 
         <!-- 3. M1-M12 全局动作合并 -->
-        <div class="card">
+        <div class="card pf-card-gkey">
             <h2>2. 全局独立功能键 (M1~M12)</h2>
             <div class="hint">
                 这里配的是"按下这一颗键，除了按方案宏外，还会做什么"。
                 例如 M1 设成"切到 macOS + Ctrl+Alt+T"，按 M1 会先切系统再发热键。
-                <br>（MA / MB 是双状态切换键，不在这里配 —— 它们在下面第 3 区。）
+                <br>（MA / MB 是双状态切换键，不在这里配 —— 它们在上面第 1 区。）
             </div>
 
             <div class="grid-2" style="margin-top: 10px;">
@@ -252,10 +292,10 @@
         </div>
 
         <!-- 3. MA / MB 双状态切换 -->
-        <div class="card">
-            <h2>3. MA / MB 双状态切换 — 按一次翻一次</h2>
+        <div class="card pf-card-mamb">
+            <h2>1. MA / MB 双状态切换 — 按一次翻一次</h2>
             <div class="hint">
-                MA / MB 已从上方"全局独立功能键"里独立出来。每按一次就在 <b style="color:#38bdf8;">状态 A ⇄ 状态 B</b> 之间切换,
+                MA / MB 已从"全局独立功能键"里独立出来。每按一次就在 <b style="color:#38bdf8;">状态 A ⇄ 状态 B</b> 之间切换,
                 每次按下都执行当前那套里的「切换方案 + 组合键/快捷键」。
                 <br>常用场景:MA 设成 <i>静音模式(切到 macOS + 静音)</i> / <i>桌面模式(切到 Windows + Win+D 显桌面)</i>,一键来回切。
             </div>
@@ -423,22 +463,27 @@
             </div>
         </div>
 
-        <!-- 4. 方案专属宏 M1-M12 -->
-        <div class="card">
-            <h2>3. 系统专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
-            <div class="hint">这里编辑的是按系统宏：Windows 和 macOS 各自的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
+        <!-- ===== 二、方案配置（先选系统，下面的映射和宏都归它）===== -->
+        <div class="group-title pf-title-prof">二、方案配置 <span class="sub">先选系统，下面的「映射」和「系统专属宏」都编辑这个系统</span></div>
 
-            <div>
-                <label style="font-weight: bold; color: #38bdf8;">编辑目标方案 (Profile)：</label>
-                <select id="activeProfile">
-                    <!-- ⚠ 这两个 value 必须和 CFG_PROFILES 的下标严格对应，
-                         也必须和固件 CFG_PROF_NAMES[] 同序：网页靠下标定位块，
-                         固件靠下标读名字。顺序错位会把 Windows 的配置写到 mac 上，
-                         而页面上看不出任何异常。 -->
-                    <option value="0">Windows</option>
-                    <option value="1">macOS</option>
-                </select>
-            </div>
+        <!-- 方案选择器：整个「二、方案配置」只有一个方案下拉，映射和宏共用它 -->
+        <div class="card pf-card-picker">
+            <label style="font-weight: bold; color: #38bdf8;">正在编辑的系统：</label>
+            <select id="activeProfile">
+                <!-- ⚠ 这两个 value 必须和 CFG_PROFILES 的下标严格对应，
+                     也必须和固件 CFG_PROF_NAMES[] 同序：网页靠下标定位块，
+                     固件靠下标读名字。顺序错位会把 Windows 的配置写到 mac 上，
+                     而页面上看不出任何异常。 -->
+                <option value="0">Windows</option>
+                <option value="1">macOS</option>
+            </select>
+            <div class="hint">切这里的下拉，下面两块（按键映射 / 系统专属宏）会同时跟着切到这个系统。改动不会自动切到主屏当前正在跑的那个系统 —— 要切系统本身，去键盘上按 <b>MA/MB</b>，或用全局功能键里配的「切换方案」。</div>
+        </div>
+
+        <!-- 4. 方案专属宏 M1-M12 -->
+        <div class="card pf-card-macro">
+            <h2>2. 系统专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
+            <div class="hint">这里编辑的是上面选中的那个系统的宏：Windows 和 macOS 各自的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
 
             <div style="margin-top: 10px;">
                 <label>目标宏按键：</label>
@@ -495,6 +540,16 @@
     <!-- =================== 系统设置 Tab =================== -->
     <div id="tab-system" class="tab-panel">
 
+        <!-- 系统设置内部分两个**并级**小 Tab：表单 和 JSON 原文。
+             两边读写的是同一条路（都在 cfgModel 上改），所以切到哪个都不丢改动。 -->
+        <div class="sub-tabs">
+            <button id="sub-sys-ui-btn" class="active" onclick="switchSubTab('sys-ui')">🖥️ 界面设置</button>
+            <button id="sub-sys-json-btn" onclick="switchSubTab('sys-json')">📄 JSON 配置</button>
+        </div>
+
+        <!-- ---- 系统设置 · 子页 1：界面设置 ---- -->
+        <div id="sub-sys-ui" class="sub-panel active">
+
         <!-- 1. 时钟 / 闹钟 / 倒计时 -->
         <div class="card">
             <h2>1. 时钟 / 闹钟 / 倒计时</h2>
@@ -549,24 +604,12 @@
             </div>
         </div>
 
-        <!-- 4. 壁纸 / LOGO 画板上传 -->
-        <div class="card">
-            <h2>3. 屏幕自定义壁纸 / LOGO 画板上传 (240x240)</h2>
-            <div class="hint">
-                随便挑多大的图都行——缩放和 JPEG 压缩都在你的浏览器里本地完成，
-                <b>原图不会上传</b>，真正发给键盘的只有压好的十几 KB。可用于画板模式及 60 秒无操作睡眠屏保。
-            </div>
-            <div style="display: flex; gap: 15px; align-items: center; margin-top: 10px;">
-                <input type="file" id="imageInput" accept="image/*" style="width: auto;">
-                <canvas id="previewCanvas" width="240" height="240" style="border: 1px solid #475569; width: 120px; height: 120px; border-radius: 6px;"></canvas>
-                <button class="btn btn-orange" id="uploadImageBtn">压缩并上传到键盘壁纸</button>
-            </div>
-            <div id="uploadProgress" style="font-size: 0.9rem; color: #38bdf8; margin-top: 6px;"></div>
-        </div>
+        <!-- 壁纸上传已挪到「📶 蓝牙」页的第 3 区（和蓝牙通道相关的都放一起） -->
+        <div class="hint" style="margin: -6px 0 18px;">💡 设置壁纸 / LOGO 画板上传在 <b style="color:#38bdf8;">「📶 蓝牙」</b> 页的第 3 区。</div>
 
         <!-- 5. BLE 日志通道（USB HID 模式下的调试退路） -->
         <div class="card">
-            <h2>4. BLE 实时日志通道</h2>
+            <h2>3. BLE 实时日志通道</h2>
             <div class="hint">
                 刷成 USB Keyboard 后 UART0 在大多数电脑上没法再读串口了,
                 <b>所有 LOG_PORT.printf 的字节改走 BLE notify</b> 回传到这里。
@@ -595,14 +638,19 @@
                  border: 1px solid #1e293b;">（还没有日志。按"开流"开始接收实时日志,或"拉历史"一次性拉回最近 80 行）</pre>
         </div>
 
+        </div><!-- /sub-sys-ui -->
+
+        <!-- ---- 系统设置 · 子页 2：JSON 配置 ---- -->
+        <div id="sub-sys-json" class="sub-panel">
+
         <!-- 6. 配置 JSON（整份拉取 / 保存） -->
         <div class="card">
-            <h2>5. 配置 JSON（整份拉取 / 保存）</h2>
+            <h2>配置 JSON（整份拉取 / 保存）</h2>
             <div class="hint">
                 键盘里存的配置会拼成<b>一整份 JSON</b>。下面这个框就是它的原文，
-                <b>连上蓝牙时会自动拉一次</b>，上面所有配置表单（显示风格 / 闹钟 /
-                方案 / 映射 / 宏 / 全局键）都会随之填成键盘里的真实值。<br><br>
-                整个页面<b>只有这一份配置</b>：在上面的表单里改、在下面的框里手改，
+                <b>连上蓝牙时会自动拉一次</b>，另外两个页签上所有配置表单（显示风格 /
+                闹钟 / 方案 / 映射 / 宏 / 全局键）都会随之填成键盘里的真实值。<br><br>
+                整个页面<b>只有这一份配置</b>：在表单里改、在下面的框里手改，
                 读写的都是同一条路 —— 改模型，再发回键盘。所以「从键盘拉取」
                 一次就等于以前的「一次性预加载全部」（那个按钮原来是 54 条指令、
                 要跑 30 秒，现在是一次往返）。<br><br>
@@ -674,6 +722,7 @@
                  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem;
                  border: 1px solid #1e293b; resize: vertical;"></textarea>
         </div>
+        </div><!-- /sub-sys-json -->
     </div>
 
 <script>
@@ -762,6 +811,20 @@
         for (const p of pages) {
             document.getElementById('tab-' + p).classList.toggle('active', name === p);
             document.getElementById('tab-' + p + '-btn').classList.toggle('active', name === p);
+        }
+    }
+
+    // 系统设置**内部**的二级 Tab。
+    //
+    // 为什么是并级而不是分层：它不是"下一级页面"，只是同一页里的两块内容
+    // （表单 / JSON 原文），两边读写的还是同一个 cfgModel。所以它自己一套
+    // 按钮 + 一套 class，不复用顶部那套 switchTab —— 顶部切走再切回来时
+    // 这里记着自己停在哪一页，回来还是停在那儿。
+    function switchSubTab(name) {
+        const subs = ['sys-ui', 'sys-json'];
+        for (const s of subs) {
+            document.getElementById('sub-' + s).classList.toggle('active', name === s);
+            document.getElementById('sub-' + s + '-btn').classList.toggle('active', name === s);
         }
     }
 
@@ -1472,7 +1535,15 @@
     function cfgFillForms() {
         const $ = id => document.getElementById(id);
         if (typeof cfgModel.disp_mode === 'number') $('dispModeSelect').value = String(cfgModel.disp_mode);
-        if (typeof cfgModel.curr_prof === 'number') $('activeProfile').value = String(cfgModel.curr_prof);
+        // ⚠ 这里**故意不再**把 activeProfile 设成 cfgModel.curr_prof。
+        //
+        //   这两个是不同的东西：curr_prof 是"键盘此刻正在跑哪个系统"，
+        //   activeProfile 是"用户正在编辑哪个系统"。以前只有一个宏编辑器时，
+        //   顺手跟着 curr_prof 走还能忍；现在这一个下拉同时决定**映射**和
+        //   **宏**两块，于是每拉一次配置（连上蓝牙就会自动拉）都会把用户
+        //   刚选好的目标系统顶回键盘当前那个 —— 表现是"我明明选了 macOS，
+        //   点一下拉取又变回 Windows 了"，而且映射列表跟着一起换，很难联想到
+        //   是这一行的锅。编辑目标是用户的选择，不该被拉取动作改写。
         if (cfgModel.alarm_on && typeof cfgModel.alarm_h === 'number' && typeof cfgModel.alarm_m === 'number') {
             const p = n => String(n).padStart(2, '0');
             $('alarmTime').value = `${p(cfgModel.alarm_h)}:${p(cfgModel.alarm_m)}`;
@@ -1980,13 +2051,26 @@
         renderGlobalkComboKeys();
     }
 
+    // 映射卡片顶上那行"正在编辑：Windows / macOS"。
+    // 映射区自己没有方案下拉了（统一由「二、方案配置」顶上那个 #activeProfile
+    // 决定），所以这里只是把那个下拉的当前值显示出来，省得用户还得滚回去看。
+    // 从 select 的 option 文本取，而不是自己再写一份名字表 —— 两份表迟早会对不上，
+    // 而对不上的表现是"下拉写着 macOS、卡片写着 Windows"。
+    function refreshRemapProfName() {
+        const sel = document.getElementById('activeProfile');
+        const box = document.getElementById('remapProfName');
+        if (!sel || !box) return;
+        const opt = sel.options[sel.selectedIndex];
+        box.textContent = opt ? opt.text : sel.value;
+    }
+
     async function loadRemapFromCache() {
-        const prof = document.getElementById('remapProfile').value;
+        const prof = document.getElementById('activeProfile').value;
         const rules = await ensureRemapLoaded(prof);
 
         // 快速连切方案时，后发起的那个 await 可能不是最后返回的 —— 方案对不上就丢弃，
         // 否则会把别的方案的规则填进当前方案。
-        if (document.getElementById('remapProfile').value !== prof) return;
+        if (document.getElementById('activeProfile').value !== prof) return;
 
         // ⚠ 读失败(null)和"这个方案真的没有规则"([])是两件事，绝不能同等对待。
         //
@@ -2118,7 +2202,7 @@
 
     document.getElementById('remapClearBtn').addEventListener('click', async () => {
         if (!confirm("确定要清空当前方案的所有按键映射？")) return;
-        const prof = document.getElementById('remapProfile').value;
+        const prof = document.getElementById('activeProfile').value;
         // JSON 里"清空这个方案"就是把 remap[prof] 写成空数组。
         // 固件那边 remap[p] 一旦出现就是**整份替换**，空数组 = 0 条。
         const pname = cfgProfName(prof);
@@ -2164,7 +2248,7 @@
     }
 
     document.getElementById('remapSaveBtn').addEventListener('click', async () => {
-        const prof = document.getElementById('remapProfile').value;
+        const prof = document.getElementById('activeProfile').value;
         // ⚠⚠ 列表为空时**直接拒绝保存**，不再弹 confirm 放行。
         //
         //   旧代码这里是"弹窗问一句，用户点确定就照发"。但规则为空时，
@@ -2203,9 +2287,15 @@
         }
     });
 
-    document.getElementById('remapProfile').addEventListener('change', () => {
-        // 切方案:从 cache 加载该方案的规则。没点过读回时 cache 是空的,就保持空。
+    // 「二、方案配置」只有一个方案下拉（#activeProfile），映射和宏共用它。
+    // 切它的时候两边的内容都要跟着换，所以这里一个监听器同时干两件事。
+    document.getElementById('activeProfile').addEventListener('change', () => {
+        // 映射：从 cache 加载该方案的规则。没点过读回时 cache 是空的,就保持空。
         loadRemapFromCache();
+        // 宏：同样从 cache 加载该方案该键的宏。
+        loadMacroFromCache();
+        // 映射卡片顶上那个"正在编辑：xxx"跟着换。
+        refreshRemapProfName();
     });
 
     // "📥 从键盘读取" —— 点一次、读一次。
@@ -2221,7 +2311,7 @@
     // `back || []` 会把"键盘没回话"固化成"0 条"，然后 ensureRemapLoaded
     // 只认 !== undefined，于是本次会话里这个方案永远显示 0 条）。
     document.getElementById('remapLoadBtn').addEventListener('click', async () => {
-        const prof = document.getElementById('remapProfile').value;
+        const prof = document.getElementById('activeProfile').value;
         const ok = await cfgPull(true);
         if (!ok) {
             alert("键盘没回话（整份配置拉取失败）。\n请确认蓝牙已连接、固件是最新那版。\n当前配置未改动。");
@@ -2233,9 +2323,8 @@
             : `方案 ${Number(prof) + 1} 在键盘上确实没有任何映射规则。`);
     });
 
-    // 切宏键 / 切方案:从 cache 加载该键的宏
+    // 切宏键:从 cache 加载该键的宏（切方案的那个监听器在上面，已合并）
     document.getElementById('macroKey').addEventListener('change', loadMacroFromCache);
-    document.getElementById('activeProfile').addEventListener('change', loadMacroFromCache);
 
     // ========== 3. 全局动作 MA / MB / M1-M12 合并 ==========
     // 跟宏键那边一样的多键组合 + CMB/SEQ 互斥可视化（见 toggleGlobalkMode）。
@@ -2618,6 +2707,7 @@
         }
     }
     toggleMacroMode();   // 页面刚加载就根据默认选中的模式跑一次
+    refreshRemapProfName();  // 映射卡片顶上"正在编辑：xxx"跟上下拉默认值
 
     // 宏键多键组合：每个元素是 {code: number}，渲染成一 [select][✕] 行。
     // 不预置一行空键 —— "⚠ 还没添加" 的红色提示让用户自己知道要点 + 添加键。
