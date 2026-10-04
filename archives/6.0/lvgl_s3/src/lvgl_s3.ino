@@ -619,14 +619,18 @@ static int      todayDateYmd = -1;              // YYYYMMDD
 // 推算，运行时不必持久化。
 
 // 菜单
-static uint8_t menuSel = 0;
-#define MENU_ITEMS 13
+//
+// 两级：menuInSub = false 时选的是 menuGroups[] 里的大类，
+// = true 时选的是那一组下面的具体项（menuItemSel）。
+// 一级项数 = MENU_GROUP_COUNT，二级项数 = 那一组的 count，两者都取最大
+// 值 MENU_ROW_MAX 建一行行对象，切换层级时只改可见性和文字、不重建，
+// 免得进二级时整屏删建（LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL）。
+static uint8_t menuSel = 0;          // 兼容旧名字：现在指一级大类下标
+static uint8_t menuItemSel = 0;      // 二级：组内项下标
+static bool   menuInSub = false;     // 当前在二级
 
-// 菜单项下标。build_menu() 里给"当前值角标"用 —— 之前写的是 MENU_ITEMS-1，
-// 也就是"最后一项永远是带角标的那项"。追加第 13 项之后这个假设就错了
-// （角标会跑到日志项上、把屏保风格的当前值挤掉），所以改成显式下标。
-#define MENU_IDX_SAVER 11   // 屏保风格：角标显示当前屏保模式
-#define MENU_IDX_LOG   12   // 错误日志：角标显示错误条数
+// 列表最多能同时显示几行（一级 6 个大类，二级最多 3 项，6 够用）
+#define MENU_ROW_MAX 6
 
 // 宏录制
 #define MAX_REC_KEYS 64
@@ -642,44 +646,106 @@ static lv_obj_t* rec_lbl_count = nullptr;
 static lv_obj_t* rec_lbl_keys = nullptr;
 static lv_obj_t* rec_lbl_mode = nullptr;
 
-// 菜单项（中文）
-static const char* menuItemsCN[MENU_ITEMS] = {
-    "1. 返回主屏",
-    "2. 切换主屏风格",
-    "3. 切换配置方案",
-    "4. 按键回显开关",
-    "5. 灯光设置",
-    "6. 设置时间",
-    "7. 闹钟设置",
-    "8. 倒计时",
-    "9. 刷新温湿度",
-    "10. 温度校准",
-    "11. 计数清零",
-    "12. 屏保风格",
-    "13. 错误日志"
+// 菜单项要执行什么。用枚举而不是"下标 → switch"，是因为菜单已经改成两级：
+// 下标会随分组重排变，而"这一项做什么"必须稳定。
+enum MenuAction {
+    MA_CYCLE_DISP,      // 切换主屏风格
+    MA_CYCLE_SAVER,     // 切换屏保风格
+    MA_OPEN_LIGHT,      // 灯光设置
+    MA_OPEN_TIME,       // 设置时间
+    MA_OPEN_ALARM,      // 闹钟设置
+    MA_OPEN_TIMER,      // 倒计时
+    MA_CYCLE_PROFILE,   // 切换配置方案
+    MA_REFRESH_SHT,     // 刷新温湿度
+    MA_OPEN_CALTEMP,    // 温度校准
+    MA_CLEAR_COUNTERS,  // 计数清零
+    MA_OPEN_ELOG        // 错误日志
+};
+
+struct MenuEntry {
+    const char* cn;
+    MenuAction   act;
+};
+
+// 菜单分组。一级只列这 6 个大类，回车进去才看到具体项。
+// 之前是 13 项一长条平铺，动作项（刷新温湿度 / 计数清零）和子页面
+// （灯光 / 时间 / 闹钟 / 倒计时 / 校准 / 日志）混排在一张列表里，
+// 既看不出哪几项是一类的，找一个设置还得上下翻大半屏。
+// 分组顺序按"多久会用到一次"排：显示 → 灯光 → 时间 → 键盘 → 温湿度 → 系统。
+static const MenuEntry menuEntriesDisplay[] = {
+    { "切换主屏风格", MA_CYCLE_DISP },
+    { "切换屏保风格", MA_CYCLE_SAVER }
+};
+static const MenuEntry menuEntriesLight[] = {
+    { "灯光设置",     MA_OPEN_LIGHT }
+};
+static const MenuEntry menuEntriesTime[] = {
+    { "设置时间",     MA_OPEN_TIME },
+    { "闹钟设置",     MA_OPEN_ALARM },
+    { "倒计时",       MA_OPEN_TIMER }
+};
+static const MenuEntry menuEntriesKeyboard[] = {
+    { "切换配置方案", MA_CYCLE_PROFILE }
+};
+static const MenuEntry menuEntriesSensor[] = {
+    { "刷新温湿度",   MA_REFRESH_SHT },
+    { "温度校准",     MA_OPEN_CALTEMP }
+};
+static const MenuEntry menuEntriesSystem[] = {
+    { "计数清零",     MA_CLEAR_COUNTERS },
+    { "错误日志",     MA_OPEN_ELOG }
+};
+
+struct MenuGroup {
+    const char*     cn;
+    const char*     en;
+    const MenuEntry* items;
+    uint8_t          count;
+};
+
+#define MENU_GROUP_COUNT 6
+static const MenuGroup menuGroups[MENU_GROUP_COUNT] = {
+    { "显示",   "DISPLAY",  menuEntriesDisplay,  sizeof(menuEntriesDisplay)  / sizeof(MenuEntry) },
+    { "灯光",   "LIGHTING", menuEntriesLight,    sizeof(menuEntriesLight)    / sizeof(MenuEntry) },
+    { "时间",   "TIME",     menuEntriesTime,     sizeof(menuEntriesTime)     / sizeof(MenuEntry) },
+    { "键盘",   "KEYBOARD", menuEntriesKeyboard, sizeof(menuEntriesKeyboard) / sizeof(MenuEntry) },
+    { "温湿度", "SENSOR",   menuEntriesSensor,   sizeof(menuEntriesSensor)   / sizeof(MenuEntry) },
+    { "系统",   "SYSTEM",   menuEntriesSystem,   sizeof(menuEntriesSystem)   / sizeof(MenuEntry) }
 };
 
 // 辅助变量
-static bool showKeystrokes = true;
+//
+// 原来这里还有一个 showKeystrokes（菜单里的"按键回显开关"），已经删掉：
+// 它是纯内存变量、**不落 NVS**，所以每次开机都被初始化回 true —— 用户白天关掉、
+// 拔电或重启一次就自己开回来了，等于一个骗人的开关。而它唯一的用途就是让
+// 四块主屏风格里那颗"最后按下的键"显示 "--"；对一块键盘来说，把刚才按了什么都
+// 盖住没有任何好处。真要隐藏按键名，直接把 lastKeyPressed 喂 "--" 就行。
 static char lastKeyPressed[8] = "-";
 
 // ===========================
 // 息屏 / 屏保风格
 // ===========================
 // 原来 SLEEP_TIMEOUT_MS 到了就 destroyMainScreen() 把主屏整个拆掉，屏幕全黑。
-// 现在多给两种屏保：
+// 现在给三种屏保 + 一个"完全不进屏保"：
 //   SAVER_WALL 壁纸铺满，和"信息面板"每隔几秒**轮播**一张 —— 一直是图片
 //              会看不到时间，一直是面板又浪费了壁纸
 //   SAVER_INFO 只显示信息面板，不轮播
-// 两种模式共用同一块 `sv_panel`（时间 / 日期 / 温湿度都收在这一块里，
+//   SAVER_OFF  整个屏保功能不启用：空闲到点什么都不做，主屏原样留着
+// 三种屏保共用同一块 `sv_panel`（时间 / 日期 / 温湿度都收在这一块里，
 // 不再是四个散落在屏幕四角的 label）。
 // 屏保是一块独立屏幕（scr_saver），和主屏并存，唤醒时直接切回主屏即可。
-#define SAVER_OFF   0
-#define SAVER_WALL  1
-#define SAVER_INFO  2
-#define TOTAL_SAVER_MODES 3
-static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板" };
-static uint8_t saverMode = SAVER_OFF;
+//
+// ⚠ 档位编号是 NVS 持久化的，**只能往后追加、不能往前插**。
+// 原来 SAVER_OFF=0 的含义是"黑屏"（拆主屏全黑），那个语义现在归 SAVER_BLACK。
+// 如果把"关闭"插成 0，老用户开机就变成"屏保关着"，属于静默改设置。
+// 所以 SAVER_OFF=3 追加在末尾，0/1/2 三个旧值的含义一字不变。
+#define SAVER_BLACK 0   // 黑屏（拆主屏，屏幕全黑）—— 老 SAVER_OFF 的语义
+#define SAVER_WALL  1   // 壁纸轮播
+#define SAVER_INFO  2   // 信息面板
+#define SAVER_OFF   3   // 关闭：空闲也不息屏
+#define TOTAL_SAVER_MODES 4
+static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板", "关闭" };
+static uint8_t saverMode = SAVER_OFF;   // 默认不自动息屏
 static lv_obj_t* scr_saver = nullptr;
 static lv_obj_t* sv_img = nullptr;
 static lv_obj_t* sv_panel = nullptr;      // 信息面板容器（时间/日期/温湿度都在里面）
@@ -703,11 +769,17 @@ static uint8_t indLevel = 3;
 static uint8_t indBrightness = 255;
 
 // 菜单滚动相关
-// 布局常量：6 行 × 28 步进 = 168px，从 y=50 起排到 218，底部留 22px 给按键提示
+// 纵向预算（屏 240 高）：
+//   12~31    标题「系统菜单」+ 右上角页码胶囊
+//   42~196   列表：6 行 × 24 高、步进 26（行间 2px）
+//   199~237  底部两行按键提示
+// 行高/步进是从原来的 26/28 收下来过的：底部提示改成两行后要占 38px
+// （原来一行只占 19px），原来的 50+6×28=218 直接压到提示上面。
+// 一级正好 6 个大类，所以这 6 行是一屏全放得下的，不用翻页。
 #define MENU_VISIBLE_ITEMS 6
-#define MENU_ITEM_H        26
-#define MENU_PITCH         28
-#define MENU_LIST_TOP      50
+#define MENU_ITEM_H        24
+#define MENU_PITCH         26
+#define MENU_LIST_TOP      42
 static int menuScrollOffset = 0;
 
 // ===========================
@@ -1215,10 +1287,12 @@ static lv_obj_t* topIconBox    = nullptr;      // 系统图标的槽位（lv_img
 
 // 菜单
 static lv_obj_t* menu_cont = nullptr;
-static lv_obj_t* menu_items[MENU_ITEMS];
-static lv_obj_t* menu_items_val[MENU_ITEMS];
+static lv_obj_t* menu_items[MENU_ROW_MAX];
+static lv_obj_t* menu_items_val[MENU_ROW_MAX];
 static lv_obj_t* menu_title = nullptr;
 static lv_obj_t* menu_position = nullptr;
+static lv_obj_t* menu_hint1 = nullptr;   // 底部按键提示第一行
+static lv_obj_t* menu_hint2 = nullptr;   // 第二行
 
 // 样式
 static lv_style_t style_bg;
@@ -1415,7 +1489,11 @@ static void destroyScreensaver(void);
 // 回到主屏的统一出口：保证主屏和主屏内容都还在，然后真正切过去。
 static void gotoMainScreen(void) {
     currentSysMode = SYS_MODE_NORMAL;
+    // 退出菜单时把两级状态都归零。下次按 MC 进菜单是从大类列表开始，
+    // 而不是停在上次翻到的那一层的第几项。
     menuSel = 0;
+    menuItemSel = 0;
+    menuInSub = false;
     menuScrollOffset = 0;
     recStage = REC_STAGE_EXIT;   // 退出演录状态机，下次 MR 重新从 SEQ 开始
     lightFieldIdx = 0;
@@ -1462,6 +1540,11 @@ static void cycleScreensaverMode(void);
 static void updateScreensaver(bool force);
 static void triggerKeyReaction(void);
 static void handleMenuSelect(void);
+// build_menu() 在定义之前就被 setScreensaverMode() 调到了（改屏保模式要刷新菜单角标）。
+// Arduino 把 .ino 预处理成 .cpp 时会自动补原型，能编过；但那依赖工具链行为，
+// 显式写上，不给编译期留惊喜。
+static void build_menu(void);
+static const MenuGroup* curMenuGroup(void);
 static const char* getKeyName(uint16_t code);
 static void build_settings_time(void);
 static void build_settings_alarm(void);
@@ -1667,6 +1750,51 @@ static void mkChip(lv_obj_t* o, uint32_t bg, uint32_t fg, uint8_t radius) {
 static void mkLabel(lv_obj_t* l, const lv_font_t* f, uint32_t color) {
     lv_obj_set_style_text_font(l, f, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+}
+
+// ===========================
+// 底部按键提示：统一两行 + 硬性宽度上限
+// ===========================
+// 为什么必须改：提示行是用 16px 中文字体渲染的，屏只有 240px 宽。
+// 原来那些提示有多宽是量出来的（见 text_width.py，adv_w 是 1/16px 单位）：
+//   "←→ 切换 · ↑↓ 调整 · 回车保存 · ESC 取消"   368px ← 设置页，超出 128px
+//   "←→ 切换 · ↑↓ 调整 · 回车开始/停止 · ESC 取消" 408px ← 倒计时页，超出 168px
+//   "↑↓ 翻看 · DEL 清空 · ESC 返回"              264px ← 日志页，超出 24px
+//   "上下选择 · 回车确认 · ESC 返回"              256px ← 菜单页，超出 16px
+// 居中对齐之后左右各裁掉一半，用户看到的就是"底部的字跑出屏幕"。
+//
+// 字库是 Windows simhei.ttf 生成的 16px 固定字号，重生成小一号中文字库需要
+// Windows 字体源，不在开发机上，所以只能靠拆行 + 砍字。
+// 两行是唯一能**一条按键说明都不丢**的办法（ESC 是设置页唯一的"不保存退出"
+// 路径，压成一行就得砍掉它）。
+#define HINT_W        224   // 屏宽 240，两侧各留 8px 余量
+#define HINT_LINE_H   19    // = lv_font_simsun_16_cjk 的 line_height
+// 两行提示占据的高度，以及它离屏幕底边留多少
+#define HINT_BLOCK_H  (HINT_LINE_H * 2)
+#define HINT_BOTTOM   3
+#define HINT_LINE1_Y  (240 - HINT_BOTTOM - HINT_BLOCK_H)   // ≈ 199
+#define HINT_LINE2_Y  (HINT_LINE1_Y + HINT_LINE_H)          // ≈ 218
+
+// 建一行提示。width / LV_LABEL_LONG_DOT 是**兜底**：即使以后有人加了一条
+// 超宽文案，超出的部分也会变成省略号，而不是画到屏幕外去。
+static lv_obj_t* mkHintLine(lv_obj_t* parent, lv_coord_t y, const char* text) {
+    lv_obj_t* l = lv_label_create(parent);
+    mkLabel(l, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_obj_set_width(l, HINT_W);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(l, text);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
+    return l;
+}
+
+// 改一行提示的文案（页面已建好、只刷文字时用）
+static void setHintText(lv_obj_t* l, const char* text) {
+    if (l == nullptr) return;
+    setText(l, text);
+    lv_obj_set_width(l, HINT_W);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 }
 
 // ===========================
@@ -2787,9 +2915,10 @@ static void build_style_high_contrast(void) {
 // 息屏 / 屏保
 // ===========================
 // 屏保是一块独立的屏幕对象，和主屏并存：
-//   SAVER_OFF  沿用老行为 —— 拆掉主屏，屏幕全黑
+//   SAVER_BLACK 沿用老行为 —— 拆掉主屏，屏幕全黑
 //   SAVER_WALL 壁纸铺满，和"信息面板"每 5 秒轮播一次
 //   SAVER_INFO 只显示信息面板
+//   SAVER_OFF  根本不建屏保屏（这一档压根到不了这里，调用方会先拦掉）
 // 唤醒统一走 gotoMainScreen()：先 showScreen(主屏) 再 destroyScreensaver()，
 // 顺序反了就会删掉活动屏，LVGL 8.4 会把 disp->act_scr 置成 NULL。
 static void destroyScreensaver(void) {
@@ -2848,7 +2977,7 @@ static void buildSaverPanel(void) {
     lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 52, -6);
 }
 
-// 菜单第 12 项：黑屏 → 壁纸轮播 → 信息面板 → 黑屏
+// 菜单里"屏保风格"那一项：黑屏 → 壁纸轮播 → 信息面板 → 关闭 → 黑屏
 // 设成指定的屏保模式（含落盘 + 正在屏保时立刻按新模式重建）。
 // 原来这段逻辑长在 cycleScreensaverMode 里，只能"转一格"。配置 JSON 要能直接
 // 设成任意一档（网页上勾哪项就是哪项），所以把主体抽出来，cycle 只负责 +1。
@@ -2860,10 +2989,19 @@ static void setScreensaverMode(uint8_t m) {
     // 正在屏保状态下切换：立刻按新模式重建，用户不用等下一次超时
     if (currentSysMode == SYS_MODE_SLEEP) {
         destroyScreensaver();
-        if (saverMode == SAVER_OFF) destroyMainScreen();
-        else enterScreensaver();
-    } else if (saverMode == SAVER_OFF && scr_main == nullptr) {
-        // 从屏保模式退回来，但主屏早就被拆了 —— 现在就得补回来
+        if (saverMode == SAVER_OFF) {
+            // 刚从屏保切到"关闭"：主屏可能早就被 SAVER_BLACK 拆过，
+            // 现在得把它建回来，否则屏幕就一直黑着。
+            renderCurrentDisplayBase();
+            showScreen(ensureMainScreen());
+            currentSysMode = SYS_MODE_NORMAL;
+        } else if (saverMode == SAVER_BLACK) {
+            destroyMainScreen();
+        } else {
+            enterScreensaver();
+        }
+    } else if (saverMode == SAVER_BLACK && scr_main == nullptr) {
+        // 从屏保退回来，但主屏早就被拆了 —— 现在就得补回来
         renderCurrentDisplayBase();
     }
     build_menu();
@@ -2875,7 +3013,10 @@ static void cycleScreensaverMode(void) {
 }
 
 static void enterScreensaver(void) {
-    if (saverMode == SAVER_OFF) {
+    // "关闭"这一档不该走到这里（loop() 里的超时判定会先拦掉），
+    // 但留一道保险：万一别处调进来，也不能把主屏拆了。
+    if (saverMode == SAVER_OFF) return;
+    if (saverMode == SAVER_BLACK) {
         destroyMainScreen();
         return;
     }
@@ -2972,35 +3113,33 @@ static void cycleDisplayStyle(void) {
     triggerHud("显示风格", dispModeNames[currentDispMode], lv_color_hex(CLR_ACCENT));
 }
 
-static void handleMenuSelect(void) {
-    switch (menuSel) {
-        case 0:  // 返回主屏
-            gotoMainScreen();
-            break;
-        case 1:  // 切换主屏风格 - 循环切换
+// 二级里选中项要执行的动作。
+// 一级和二级共用一个入口：一级按回车 = 进入那一组（不算执行任何动作），
+// 二级按回车 = 真正跑这个动作。
+static void runMenuAction(MenuAction act) {
+    switch (act) {
+        case MA_CYCLE_DISP:      // 循环切换主屏风格
             cycleDisplayStyle();
             break;
-        case 2:  // 切换配置方案 - 循环切换
-            switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+        case MA_CYCLE_SAVER:     // 循环切换屏保风格（黑屏→壁纸→信息→关闭）
+            cycleScreensaverMode();
             break;
-        case 3:  // 按键回显开关
-            showKeystrokes = !showKeystrokes;
-            triggerHud("按键回显", showKeystrokes ? "开启" : "关闭",
-                lv_color_hex(showKeystrokes ? CLR_GREEN : CLR_RED));
-            break;
-        case 4:  // 灯光设置（背光开关 / 亮度 / 灯效 / 状态灯亮度 都在里面）
+        case MA_OPEN_LIGHT:      // 背光开关 / 亮度 / 灯效 / 状态灯亮度 / 按键灯效
             build_settings_light();
             break;
-        case 5:  // 设置时间
+        case MA_OPEN_TIME:
             build_settings_time();
             break;
-        case 6:  // 闹钟设置
+        case MA_OPEN_ALARM:
             build_settings_alarm();
             break;
-        case 7:  // 倒计时
+        case MA_OPEN_TIMER:
             build_settings_timer();
             break;
-        case 8:  // 刷新温湿度
+        case MA_CYCLE_PROFILE:   // 循环切换配置方案
+            switchProfile((currentProfile + 1) % TOTAL_PROFILES);
+            break;
+        case MA_REFRESH_SHT:
             if (shtAvailable) {
                 sht31_update();
                 triggerHud("温湿度", "已刷新", lv_color_hex(CLR_GREEN));
@@ -3008,43 +3147,82 @@ static void handleMenuSelect(void) {
                 triggerHud("温湿度", "未找到", lv_color_hex(CLR_RED));
             }
             break;
-        case 9:  // 温度校准
+        case MA_OPEN_CALTEMP:
             build_settings_caltemp();
             break;
-        case 10: // 计数清零
+        case MA_CLEAR_COUNTERS:
             totalKeyCount = 0;
             todayKeyCount = 0;
             preferences.putUInt("keyCount", 0);
             preferences.putUInt("today_key", 0);
             triggerHud("击键计数", "已清零", lv_color_hex(CLR_ACCENT));
             break;
-        case 11: // 屏保风格（黑屏 / 壁纸 / 时间温湿度）
-            cycleScreensaverMode();
-            break;
-        case 12: // 错误日志：重启后在这里翻出错内容
+        case MA_OPEN_ELOG:       // 错误日志：重启后在这里翻出错内容
             build_elog();
             break;
     }
 }
 
-// ===========================
-// 构建：菜单（12 项，真滚动）
-// ===========================
-// 之前滚动是假的：yPos 恒等于 i*32，menuScrollOffset 只用来改透明度。
-// 滚到第二页时，可见窗口是第 1~6 项、y 落在 32~192，而容器只有 192 高，
-// 第 4/5/6 项直接被容器裁掉 —— 所以看起来"一翻页就全黑了"。
-// 现在 yPos 跟着 menuScrollOffset 走，是真的把列表窗口往上滚。
-static void build_menu(void) {
-    // 计算滚动偏移（保证选中项始终在可见窗口内，且不越界）
-    if (menuSel < menuScrollOffset) {
-        menuScrollOffset = menuSel;
-    } else if (menuSel >= menuScrollOffset + MENU_VISIBLE_ITEMS) {
-        menuScrollOffset = menuSel - MENU_VISIBLE_ITEMS + 1;
+static void handleMenuSelect(void) {
+    // 一级：回车 = 进这一组
+    if (!menuInSub) {
+        menuInSub = true;
+        menuItemSel = 0;
+        menuScrollOffset = 0;
+        build_menu();
+        return;
     }
-    int maxOffset = MENU_ITEMS - MENU_VISIBLE_ITEMS;
+    // 二级：回车 = 执行
+    uint8_t g = menuSel;
+    if (g >= MENU_GROUP_COUNT) return;
+    const MenuGroup* grp = &menuGroups[g];
+    if (menuItemSel >= grp->count) return;
+    runMenuAction(grp->items[menuItemSel].act);
+}
+
+// ===========================
+// 构建：菜单（两级）
+// ===========================
+// 一级列 6 个大类，回车进去列该组的具体项。列表本身还是真滚动：
+// 之前 yPos 恒等于 i*32、menuScrollOffset 只用来改透明度，滚到第二页时
+// 可见窗口是第 1~6 项、y 落在 32~192 而容器只有 192 高，第 4/5/6 项被裁掉 ——
+// 看起来就是"一翻页全黑"。现在 yPos 跟着 menuScrollOffset 走。
+//
+// 一级：分组列表。二级：该分组下的具体项。
+static const MenuGroup* curMenuGroup(void) {
+    if (menuSel >= MENU_GROUP_COUNT) return &menuGroups[0];
+    return &menuGroups[menuSel];
+}
+
+// 当前层级一共几行
+static uint8_t menuRowCount(void) {
+    if (menuInSub) return curMenuGroup()->count;
+    return MENU_GROUP_COUNT;
+}
+
+static uint8_t menuCurRow(void) {
+    return menuInSub ? menuItemSel : menuSel;
+}
+
+// 菜单滚动相关
+// 一级 6 行、二级最多 3 行，都不超过 MENU_VISIBLE_ITEMS，所以实际用不到滚动；
+// 但滚动逻辑留着，二级项以后变多也不会被卡在窗口外。
+static void build_menu(void) {
+    uint8_t rows  = menuRowCount();
+    uint8_t cur   = menuCurRow();
+
+    // 计算滚动偏移（保证选中项始终在可见窗口内，且不越界）
+    if ((int)cur < menuScrollOffset) {
+        menuScrollOffset = cur;
+    } else if ((int)cur >= menuScrollOffset + MENU_VISIBLE_ITEMS) {
+        menuScrollOffset = cur - MENU_VISIBLE_ITEMS + 1;
+    }
+    int maxOffset = (int)rows - MENU_VISIBLE_ITEMS;
     if (maxOffset < 0) maxOffset = 0;
     if (menuScrollOffset > maxOffset) menuScrollOffset = maxOffset;
     if (menuScrollOffset < 0) menuScrollOffset = 0;
+
+    const MenuGroup* grp = curMenuGroup();
 
     if (scr_menu == nullptr) {
         init_styles();
@@ -3077,7 +3255,7 @@ static void build_menu(void) {
 
         menu_position = lv_label_create(pos_chip);
         mkLabel(menu_position, &lv_font_montserrat_12, CLR_TEXT_DIM);
-        lv_label_set_text(menu_position, "1/12");
+        lv_label_set_text(menu_position, "1/6");
         lv_obj_center(menu_position);
 
         // ---- 列表容器（只做裁剪，不画底）----
@@ -3088,16 +3266,19 @@ static void build_menu(void) {
         lv_obj_set_style_border_width(menu_cont, 0, LV_PART_MAIN);
         lv_obj_set_style_pad_all(menu_cont, 0, LV_PART_MAIN);
 
-        // ---- 12 个菜单项（只建一次，之后只改位置和配色）----
-        for (int i = 0; i < MENU_ITEMS; i++) {
+        // ---- MENU_ROW_MAX 行（只建一次，之后只改位置、文字和配色）----
+        // 建满上限、切换层级时只改可见性：既避免每次进出都整屏删建
+        // （LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL），也省掉一层分支。
+        for (int i = 0; i < MENU_ROW_MAX; i++) {
             lv_obj_t* btn = lv_obj_create(menu_cont);
             lv_obj_set_size(btn, 212, MENU_ITEM_H);
             mkCard(btn, CLR_SURFACE, 7);
 
-            // 选中态左侧强调条
+            // 选中态左侧强调条。上下各留 3px（MENU_ITEM_H - 6），
+            // 行高收到 24 之后不能再用 8 的留白，那会剩下 0px 上下边、顶到卡片边上。
             lv_obj_t* sel = lv_obj_create(btn);
-            lv_obj_set_size(sel, 3, MENU_ITEM_H - 8);
-            lv_obj_set_pos(sel, 0, 4);
+            lv_obj_set_size(sel, 3, MENU_ITEM_H - 6);
+            lv_obj_set_pos(sel, 0, 3);
             lv_obj_set_style_bg_color(sel, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
             lv_obj_set_style_bg_opa(sel, LV_OPA_COVER, LV_PART_MAIN);
             lv_obj_set_style_radius(sel, 2, LV_PART_MAIN);
@@ -3106,73 +3287,116 @@ static void build_menu(void) {
 
             lv_obj_t* lbl = lv_label_create(btn);
             mkLabel(lbl, &lv_font_simsun_16_cjk, CLR_TEXT);
-            lv_label_set_text(lbl, menuItemsCN[i]);
+            lv_label_set_text(lbl, "");
             lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 14, 0);
 
             // 右侧序号
             lv_obj_t* num = lv_label_create(btn);
             mkLabel(num, &lv_font_montserrat_12, CLR_TEXT_MUTE);
-            static char numBuf[MENU_ITEMS][4];
-            snprintf(numBuf[i], sizeof(numBuf[i]), "%02d", i + 1);
-            lv_label_set_text(num, numBuf[i]);
+            lv_label_set_text(num, "");
             lv_obj_align(num, LV_ALIGN_RIGHT_MID, -12, 0);
 
-            // 右侧当前值角标：屏保风格显示当前模式、错误日志显示错误条数，
-            // 其余项留空并设成透明。用显式下标判断（不是 MENU_ITEMS-1，
-            // 追加菜单项时那个"最后一项"假设会失效）。
+            // 右侧当前值角标：一级放"该组有幾项"，二级放屏保模式 / 错误条数
             lv_obj_t* val = lv_label_create(btn);
             mkLabel(val, &lv_font_simsun_16_cjk, CLR_ACCENT);
             lv_label_set_text(val, "");
             lv_obj_align(val, LV_ALIGN_RIGHT_MID, -34, 0);
-            if (i != MENU_IDX_SAVER && i != MENU_IDX_LOG) {
-                lv_obj_add_flag(val, LV_OBJ_FLAG_HIDDEN);
-            }
             menu_items_val[i] = val;
 
             menu_items[i] = btn;
         }
+
+        // ---- 底部两行按键提示（建一次，之后只改文案）----
+        // 一级：回车进组、ESC 退出菜单
+        // 二级：回车执行、ESC 回上一级
+        menu_hint1 = mkHintLine(scr_menu, HINT_LINE1_Y, "↑↓ 选择 · 回车进入");
+        menu_hint2 = mkHintLine(scr_menu, HINT_LINE2_Y, "ESC 返回主屏");
     }
 
-    // 屏保风格那一项把当前值直接顶在条目右边，省得进二级界面才知道选了什么
-    if (menu_items_val[MENU_IDX_SAVER]) {
-        setText(menu_items_val[MENU_IDX_SAVER],
-                saverMode < TOTAL_SAVER_MODES ? saverModeNames[saverMode] : "");
+    // ---- 标题：一级是"系统菜单"，二级带上组名，让人知道自己在哪 ----
+    if (menu_title) {
+        static char titleBuf[40];
+        if (menuInSub) snprintf(titleBuf, sizeof(titleBuf), "%s", grp->cn);
+        else           snprintf(titleBuf, sizeof(titleBuf), "系统菜单");
+        setText(menu_title, titleBuf);
     }
-    // 错误日志项同理：直接把错误条数顶在右边。这样**不用进日志页也知道
-    // 有没有东西出过问题** —— 之前"屏上不出提示、只能靠猜"就是最难查的一类。
-    if (menu_items_val[MENU_IDX_LOG]) {
-        int errs = elog_error_count();
-        if (errs > 0) {
-            static char ebuf[16];
-            snprintf(ebuf, sizeof(ebuf), "%d 条", errs);
-            setText(menu_items_val[MENU_IDX_LOG], ebuf);
-            lv_obj_set_style_text_color(menu_items_val[MENU_IDX_LOG],
-                lv_color_hex(CLR_RED), LV_PART_MAIN);
-        } else {
-            setText(menu_items_val[MENU_IDX_LOG], "无");
-            lv_obj_set_style_text_color(menu_items_val[MENU_IDX_LOG],
-                lv_color_hex(CLR_GREEN), LV_PART_MAIN);
+
+    // ---- 每行的文字 ----
+    for (int i = 0; i < MENU_ROW_MAX; i++) {
+        lv_obj_t* btn = menu_items[i];
+        if (btn == nullptr) continue;
+        lv_obj_t* lbl = lv_obj_get_child(btn, 1);
+        lv_obj_t* num = lv_obj_get_child(btn, 2);
+        lv_obj_t* val = menu_items_val[i];
+
+        if ((uint8_t)i >= rows) {
+            // 这一行当前层级用不到
+            setHidden(btn, true);
+            if (val) setHidden(val, true);
+            continue;
         }
+        setHidden(btn, false);
+
+        if (!menuInSub) {
+            // 一级：组名 + 右侧"有幾项"
+            setText(lbl, menuGroups[i].cn);
+            static char cntBuf[8];
+            snprintf(cntBuf, sizeof(cntBuf), "%d 项", menuGroups[i].count);
+            setText(val, cntBuf);
+            setHidden(val, false);
+            lv_obj_set_style_text_color(val, lv_color_hex(CLR_TEXT_MUTE), LV_PART_MAIN);
+        } else {
+            MenuAction act = grp->items[i].act;
+            setText(lbl, grp->items[i].cn);
+            setText(num, "");
+            // 只有屏保风格 / 错误日志这两项需要角标，其余留空
+            setHidden(val, act != MA_CYCLE_SAVER && act != MA_OPEN_ELOG);
+            if (act == MA_CYCLE_SAVER) {
+                setText(val, saverMode < TOTAL_SAVER_MODES ? saverModeNames[saverMode] : "");
+                lv_obj_set_style_text_color(val, lv_color_hex(CLR_ACCENT), LV_PART_MAIN);
+            } else if (act == MA_OPEN_ELOG) {
+                // 错误条数直接顶在右边：不用进日志页也知道有没有东西出过问题
+                int errs = elog_error_count();
+                static char ebuf[16];
+                if (errs > 0) {
+                    snprintf(ebuf, sizeof(ebuf), "%d 条", errs);
+                    lv_obj_set_style_text_color(val, lv_color_hex(CLR_RED), LV_PART_MAIN);
+                } else {
+                    snprintf(ebuf, sizeof(ebuf), "无");
+                    lv_obj_set_style_text_color(val, lv_color_hex(CLR_GREEN), LV_PART_MAIN);
+                }
+                setText(val, ebuf);
+            }
+        }
+    }
+
+    // ---- 底部提示跟着层级换 ----
+    if (!menuInSub) {
+        setHintText(menu_hint1, "↑↓ 选择 · 回车进入");
+        setHintText(menu_hint2, "ESC 返回主屏");
+    } else {
+        setHintText(menu_hint1, "↑↓ 选择 · 回车执行");
+        setHintText(menu_hint2, "ESC 返回上一级");
     }
 
     // ---- 更新页码 ----
     if (menu_position) {
         static char posBuf[16];
-        snprintf(posBuf, sizeof(posBuf), "%d/%d", menuSel + 1, MENU_ITEMS);
+        snprintf(posBuf, sizeof(posBuf), "%d/%d", (int)cur + 1, (int)rows);
         setText(menu_position, posBuf);
     }
 
     // ---- 更新每项的位置（真滚动）与配色 ----
-    for (int i = 0; i < MENU_ITEMS; i++) {
+    for (int i = 0; i < MENU_ROW_MAX; i++) {
         lv_obj_t* btn = menu_items[i];
         if (btn == nullptr) continue;
 
         int slot = i - menuScrollOffset;                 // 在窗口里的第几行
-        bool isVisible = (slot >= 0 && slot < MENU_VISIBLE_ITEMS);
-        bool isSelected = (i == menuSel);
+        bool isVisible = (slot >= 0 && slot < MENU_VISIBLE_ITEMS) && ((uint8_t)i < rows);
+        bool isSelected = (i == (int)cur);
 
         if (isVisible) lv_obj_set_pos(btn, 0, slot * MENU_PITCH);
-        // 窗口外的项移出容器并隐藏（不删，重建成本高）
+        // 窗口外的行移出容器并隐藏（不删，重建成本高）
         lv_obj_set_style_opa(btn, isVisible ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
 
         lv_obj_set_style_bg_color(btn,
@@ -3194,18 +3418,16 @@ static void build_menu(void) {
         }
         lv_obj_t* num = lv_obj_get_child(btn, 2);
         if (num) {
+            // 一级不显示序号（组序号没有意义），二级才显示组内序号
+            if (!menuInSub) setText(num, "");
+            else {
+                static char numBuf[MENU_ROW_MAX][4];
+                snprintf(numBuf[i], sizeof(numBuf[i]), "%02d", i + 1);
+                setText(num, numBuf[i]);
+            }
             lv_obj_set_style_text_color(num,
                 lv_color_hex(isSelected ? CLR_ACCENT : CLR_TEXT_MUTE), LV_PART_MAIN);
         }
-    }
-
-    // ---- 底部按键提示 ----
-    static lv_obj_t* hint = nullptr;
-    if (hint == nullptr) {
-        hint = lv_label_create(scr_menu);
-        mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-        lv_label_set_text(hint, "上下选择 · 回车确认 · ESC 返回");
-        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
     }
 
     showScreen(scr_menu);
@@ -3947,8 +4169,13 @@ static void update_setting_light_display(void) {
 // 原因：原来每次进来都 lv_obj_del(旧屏) + lv_obj_create(NULL)，而旧屏往往正是
 // 当前活动屏 —— LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL，紧接着的刷新就
 // 解引用空指针 → panic → 重启（MR 进录制必崩就是这个）。顺带整屏删建也太重。
+// 设置页外壳。返回的是"第二行提示"那个 label，方便调用方整块改文案
+// （见 build_elog / build_recording）；第一行是第 3 个子对象。
+// 子对象顺序是有讲究的，别乱插：0=竖条 1=标题 2=英文副标题 3=提示第一行 4=提示第二行。
+// hintCN 传 nullptr 就用默认那套（第一行切字段/调值，第二行保存/取消）。
 static lv_obj_t* settingShell(lv_obj_t* scr, const char* titleCN, const char* titleEn,
-                              const char* hintCN = "←→ 切换 · ↑↓ 调整 · 回车保存 · ESC 取消") {
+                              const char* hintCN1 = "←→ 切换 · ↑↓ 调整",
+                              const char* hintCN2 = "回车保存 · ESC 取消") {
     lv_obj_set_style_bg_color(scr, lv_color_hex(CLR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(scr, 0, LV_PART_MAIN);
@@ -3972,11 +4199,14 @@ static lv_obj_t* settingShell(lv_obj_t* scr, const char* titleCN, const char* ti
     lv_label_set_text(sub, titleEn);
     lv_obj_align(sub, LV_ALIGN_TOP_RIGHT, -16, 16);
 
-    lv_obj_t* hint = lv_label_create(scr);
-    mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-    lv_label_set_text(hint, hintCN);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
-    return scr;
+    // 底部两行按键提示。宽度上限 HINT_W + LONG_DOT 是硬兜底，
+    // 文案再长也只会变省略号，不会画到屏幕外面去。
+    lv_obj_t* hint1 = mkHintLine(scr, HINT_LINE1_Y, hintCN1);
+    lv_obj_t* hint2 = mkHintLine(scr, HINT_LINE2_Y, hintCN2);
+    // 让引用"两块提示"的调用方好拿：把第二行挂成第一行的子对象不行（会跟着移动），
+    // 这里只保证第一行固定是第 3 个子对象，跟旧代码的 lv_obj_get_child(scr, 3) 对得上。
+    (void)hint1;
+    return hint2;
 }
 
 // 字段标签（当前字段点亮成强调色）。返回里面的 label，供 update_* 改配色。
@@ -4116,9 +4346,10 @@ static void build_settings_timer(void) {
     if (scr_settings_timer == nullptr) {
         scr_settings_timer = lv_obj_create(NULL);
         // 这一屏的回车是"开始/停止"，不是"保存"（见 toggleCountdownFromKeyboard），
-        // 所以提示行不能沿用通用的"回车保存"，否则会教用户按一个不起作用的键。
+        // 所以第二行提示不能沿用通用的"回车保存"，否则会教用户按一个不起作用的键。
         settingShell(scr_settings_timer, "倒计时", "TIMER",
-                     "←→ 切换 · ↑↓ 调整 · 回车开始/停止 · ESC 取消");
+                     "←→ 切换 · ↑↓ 调整",
+                     "回车启停 · ESC 取消");
 
         lv_obj_t* card = lv_obj_create(scr_settings_timer);
         lv_obj_set_size(card, 200, 108);
@@ -4155,7 +4386,11 @@ static void build_settings_caltemp(void) {
 
     if (scr_settings_caltemp == nullptr) {
         scr_settings_caltemp = lv_obj_create(NULL);
-        settingShell(scr_settings_caltemp, "温度校准", "CALIBRATE");
+        settingShell(scr_settings_caltemp, "温度校准", "CALIBRATE",
+                     // 这一屏只有一个字段，"←→ 切换"没有意义（切不到别处去），
+                     // 第一行只留"↑↓ 调偏移量"，比通用的那行更准。
+                     "↑↓ 调整偏移量",
+                     "回车保存 · ESC 取消");
 
         lv_obj_t* card = lv_obj_create(scr_settings_caltemp);
         lv_obj_set_size(card, 200, 110);
@@ -4177,10 +4412,9 @@ static void build_settings_caltemp(void) {
         lv_label_set_text(set_cal_lbl_offset, "偏移 +0.0");
         lv_obj_align(set_cal_lbl_offset, LV_ALIGN_BOTTOM_MID, 0, -12);
 
-        lv_obj_t* hint2 = lv_label_create(scr_settings_caltemp);
-        mkLabel(hint2, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-        lv_label_set_text(hint2, "↑↓ 调整偏移量");
-        lv_obj_align(hint2, LV_ALIGN_CENTER, 0, 92);
+        // 原来这里还有一条 "↑↓ 调整偏移量" 的副提示，挂在 y=212，
+        // 正好压在两行按键提示（199~237）上面。现在底部提示已经写了同一句话，
+        // 这条重复的删掉，卡片也顺势上移一点。
     }
     update_setting_caltemp_display();
     showScreen(scr_settings_caltemp);
@@ -4206,10 +4440,13 @@ static void build_settings_light(void) {
         scr_settings_light = lv_obj_create(NULL);
         settingShell(scr_settings_light, "灯光设置", "LIGHTING");
 
-        // 大字预览卡
+        // 大字预览卡。
+        // 高度和 y 都往下（往上）挪过一轮：底部两行按键提示占 y=199~237，
+        // 原来这页第三排胶囊落在 189~211，正好压在上面。现在整块内容收在
+        // 40~197 之间，和提示之间留 9px。
         lv_obj_t* card = lv_obj_create(scr_settings_light);
-        lv_obj_set_size(card, 204, 80);
-        lv_obj_align(card, LV_ALIGN_CENTER, 0, -34);
+        lv_obj_set_size(card, 204, 76);
+        lv_obj_align(card, LV_ALIGN_CENTER, 0, -40);
         mkCard(card, CLR_SURFACE, 12);
 
         set_light_lbl_cap = lv_label_create(card);
@@ -4233,8 +4470,10 @@ static void build_settings_light(void) {
         // 五个字段胶囊：前四个 2x2，第五个（按键灯效）单独占一整行。
         // 第五个做成通栏是因为它是个"开/关型"的新开关，和上面四个调量分成两排，
         // 视觉上不容易和"灯效"那一格看混（两者名字太像了）。
+        // chipY 三排分别是 125~147 / 150~172 / 175~197，最底下一排刚好收在
+        // 两行按键提示（199 起）之上。
         const int chipX[2] = { -52, 52 };
-        const int chipY[3] = { 26, 53, 80 };
+        const int chipY[3] = { 16, 41, 66 };
         for (int i = 0; i < LIGHT_FIELD_COUNT; i++) {
             if (i == 4) {
                 set_light_field_labels[i] = fieldChip(scr_settings_light,
@@ -4331,13 +4570,9 @@ static void build_recording(void) {
         lv_obj_align(rec_lbl_mode, LV_ALIGN_TOP_RIGHT, -16, 16);
 
         // 底部按键提示：settingShell 默认写的是设置页那套，这里换成录制页的
-        lv_obj_t* shell_hint = lv_obj_get_child(scr_recording, 3);
-        if (shell_hint) {
-            setText(shell_hint, "M1-M12 保存 · MR 下一步 · ESC 取消");
-            lv_obj_set_width(shell_hint, 204);
-            lv_label_set_long_mode(shell_hint, LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_align(shell_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        }
+        // 子对象顺序：0=竖条 1=标题 2=英文副标题 3=提示第一行 4=提示第二行
+        setHintText(lv_obj_get_child(scr_recording, 3), "M1-M12 保存 · MR 下一步");
+        setHintText(lv_obj_get_child(scr_recording, 4), "ESC 取消");
     } else {
         // 已存在：只切标题 / 配色
         lv_obj_t* shell_bar = lv_obj_get_child(scr_recording, 0);
@@ -4404,17 +4639,20 @@ static void cancelRecording(void) {
 //
 // 纵向预算（屏 240 高）：
 //   12~31    标题「错误日志」+ 右上「共 N 条」
-//   36~210   列表：3 行 × 58
-//   215~234  底部按键提示
+//   36~168   列表：3 行 × 44
+//   199~237  底部按键提示（两行）
+//
+// 行高从 58 压到 44：底部提示改成两行之后要占 38px（原来一行只占 19px），
+// 而列表 3 行 × 58 排到 210，正好压在第一行提示上。44px 一行放得下
+// 正文那两行（19 + 19 = 38，余 6px 当行距），行数还是 3 行没少。
 //
 // 为什么只有 3 行：正文要留两行的余量（一条崩溃记录能到 20 多个字，
-// 206px 宽一行只放得下 12 个汉字），行高就压到 58。4 行 × 58 = 232 就顶到
-// 提示条了。翻页用 PgUp/PgDn 一次跳 3 行。
+// 206px 宽一行只放得下 12 个汉字）。翻页用 PgUp/PgDn 一次跳 3 行。
 //
 // 为什么没有"错误/警告/信息 各多少条"的汇总行：它和每行自带的级别字样
-// + 左侧色条 + 菜单里那条红色角标信息重复，而这 20px 正是放不下第三条的
-// 那 20px。错误条数在菜单第 13 项的角标上，进这一页之前就能看到。
-#define ELOG_ROW_H      58
+// + 左侧色条 + 菜单里那条红色角标信息重复。错误条数在「系统 → 错误日志」
+// 那一项的角标上，进这一页之前就能看到。
+#define ELOG_ROW_H      44
 #define ELOG_ROWS       3
 #define ELOG_LIST_TOP   36
 #define ELOG_SEL_MAX    (ELOG_CAP - 1)
@@ -4548,14 +4786,10 @@ static void build_elog(void) {
         scr_elog = lv_obj_create(NULL);
         settingShell(scr_elog, "错误日志", "ERROR LOG");
 
-        // settingShell 默认的提示语是设置页那套，这里换成日志页的
-        lv_obj_t* shell_hint = lv_obj_get_child(scr_elog, 3);
-        if (shell_hint) {
-            setText(shell_hint, "↑↓ 翻看 · DEL 清空 · ESC 返回");
-            lv_obj_set_width(shell_hint, 224);
-            lv_label_set_long_mode(shell_hint, LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_align(shell_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        }
+        // settingShell 建的两行提示在这里换成日志页自己的。
+        // 子对象顺序：0=竖条 1=标题 2=英文副标题 3=提示第一行 4=提示第二行
+        setHintText(lv_obj_get_child(scr_elog, 3), "↑↓ 翻看 · DEL 清空");
+        setHintText(lv_obj_get_child(scr_elog, 4), "ESC 返回菜单");
         // 标题竖条改成红色：这一页专门看故障，跟其它设置页一个颜色容易滑过去
         lv_obj_t* shell_bar = lv_obj_get_child(scr_elog, 0);
         if (shell_bar) {
@@ -5680,18 +5914,28 @@ static void scanKeyboardMatrix(void) {
                             if (inElogMode) {
                                 elogKey(baseKey);
                             }
-                            // 菜单：方向键移动 / 回车选中 / ESC·MC 退回主屏
+                            // 菜单（两级）：方向键移动 / 回车进组或执行 / ESC·MC 逐级退回
+                            // 二级里 ESC 是"回一级"而不是直接退出 —— 两级菜单必须能往回走，
+                            // 否则进了一个组就只能一路 ESC 到底才知道自己在哪。
                             else if (currentSysMode == SYS_MODE_MENU) {
+                                uint8_t rows = menuInSub ? curMenuGroup()->count : MENU_GROUP_COUNT;
+                                uint8_t& sel = menuInSub ? menuItemSel : menuSel;
                                 if (baseKey == KEY_DOWN_ARROW || baseKey == KEY_RIGHT_ARROW) {
-                                    menuSel = (menuSel + 1) % MENU_ITEMS;
+                                    sel = (uint8_t)((sel + 1) % rows);
                                     build_menu();
                                 } else if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
-                                    menuSel = (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
+                                    sel = (uint8_t)((sel + rows - 1) % rows);
                                     build_menu();
                                 } else if (baseKey == KEY_RETURN) {
                                     handleMenuSelect();
                                 } else if (baseKey == KEY_ESC || baseKey == K_MC) {
-                                    gotoMainScreen();
+                                    if (menuInSub) {
+                                        menuInSub = false;   // 二级 → 回一级
+                                        menuScrollOffset = 0;
+                                        build_menu();
+                                    } else {
+                                        gotoMainScreen();
+                                    }
                                 }
                             }
                             // 设置子界面：左右切字段 / 上下调值 / 回车保存 / ESC·MC 取消
@@ -5739,7 +5983,13 @@ static void scanKeyboardMatrix(void) {
                             // MC 进入菜单
                             else if (baseKey == K_MC) {
                                 currentSysMode = SYS_MODE_MENU;
+                                // 每次进来都从一级大类列表开始。上一轮如果停在二级
+                                // （menuInSub=true），不重置的话 build_menu() 会照着
+                                // 那个层级渲染，用户按 MC 想"回到主菜单再进来"，
+                                // 结果直接落在某个具体项上，看着像按了没反应。
                                 menuSel = 0;
+                                menuItemSel = 0;
+                                menuInSub = false;
                                 menuScrollOffset = 0;
                                 menuNeedsRebuild = true;
                                 // 不再弹"系统菜单/请选择功能"HUD：菜单本身就是提示，
@@ -7923,8 +8173,11 @@ static void logDumpPump() {
 // 只能把 usage 丢给主机，由操作系统去调（这和原版 s3.ino 的做法一致）。
 static void knobAdjust(int dir) {
     if (currentSysMode == SYS_MODE_MENU) {
-        menuSel = (dir > 0) ? (menuSel + 1) % MENU_ITEMS
-                            : (menuSel + MENU_ITEMS - 1) % MENU_ITEMS;
+        // 旋钮在菜单里是"上下翻"，跟着当前层级走（一级翻大类、二级翻组内项）
+        uint8_t rows = menuInSub ? curMenuGroup()->count : MENU_GROUP_COUNT;
+        uint8_t& sel = menuInSub ? menuItemSel : menuSel;
+        sel = (dir > 0) ? (uint8_t)((sel + 1) % rows)
+                        : (uint8_t)((sel + rows - 1) % rows);
         build_menu();
         return;
     }
@@ -8424,9 +8677,9 @@ static void updateDynamicElements(void) {
             setText(gk_lbl_hum, hbuf);
             // 累计次数是卡片右上角的角标，纯数字就够，不用再加单位
             setText(gk_lbl_keys, num_buf);
-            // 中间的按键反馈，跟"按键回显开关"走（"--" 而不是中文，
-            // 这个 label 是 montserrat_28，画不出汉字）
-            setText(gk_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
+            // 中间的按键反馈。常量显示，不再有"按键回显开关"（那个开关不落盘，
+            // 重启就自己弹回来）。这个 label 是 montserrat_28，画不出汉字。
+            setText(gk_lbl_lastkey, lastKeyPressed);
             break;
         }
 
@@ -8440,12 +8693,10 @@ static void updateDynamicElements(void) {
             setText(ip_lbl_clock, time_buf);
             setText(ip_lbl_date, date_buf);
             setText(ip_lbl_keys, num_buf);
-            // 菜单第 4 项「按键回显开关」控制的就是这里：关掉后不再显示具体按键名。
-            // 关闭态用 "--" 而不是中文"已关闭"：这个 label 挂的是 montserrat_48，
-            // 而 Montserrat 里没有汉字也没有 CJK 回退（CJK 字体的 fallback 是单向的
-            // —— simsun→montserrat 有，montserrat→simsun 没有），
-            // 写中文上去就是一片空白，看着像坏了。
-            setText(ip_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
+            // 最后一颗是"刚按下的键"。这个 label 挂的是 montserrat_48，
+            // Montserrat 里没有汉字、也没有 CJK 回退（CJK 字体的 fallback 是单向的
+            // —— simsun→montserrat 有，montserrat→simsun 没有），写中文上去是一片空白。
+            setText(ip_lbl_lastkey, lastKeyPressed);
             // 锁状态三层一起变：圆点亮语义色、文字提到主文字色、整颗胶囊底色抬起来。
             // 之前 ip_circle_* 建完之后根本没人刷新，三颗灯从头到尾都是灭的。
             // setBgColor/setTextColor 会先读回比对，值没变就不写 —— 这是关键，
@@ -8460,9 +8711,8 @@ static void updateDynamicElements(void) {
         }
 
         case DISP_MODE_KEY_MON: {
-            // "--" 而不是"已关闭"：同 INFO_PANEL 分支，这个 label 是 montserrat_48，
-            // 画不出汉字。
-            setText(km_lbl_lastkey, showKeystrokes ? lastKeyPressed : "--");
+            // 最后一颗是"刚按下的键"。montserrat_48 没有汉字、也没有 CJK 回退。
+            setText(km_lbl_lastkey, lastKeyPressed);
             setText(km_lbl_keys, num_buf);
             setText(km_lbl_profile, profileNamesCN[currentProfile]);
             break;
@@ -8502,7 +8752,7 @@ static void updateDynamicElements(void) {
             lv_img_set_src(hc_img_profile, profile_icon_get(currentProfile, PROF_ICON_L));
 
             // 大红键名：双字号预创建，按字符数切换可见性。
-            const char* keyText = showKeystrokes ? lastKeyPressed : "--";
+            const char* keyText = lastKeyPressed;
             size_t keyLen = strlen(keyText);
             if (keyLen <= 4) {
                 // 短键名：48 号
@@ -9402,13 +9652,17 @@ if (lockStateDirty) {
     // 响铃中 / 倒计时全屏期间**不许**息屏：这两个状态的全部意义就是
     // "抬头看一眼"，屏幕一黑就等于没有。startRinging() 已经把
     // lastActivityTime 拨到当下，所以这里只要不放响铃漏过去就行。
+    //
+    // saverMode == SAVER_OFF（"屏保风格"选成"关闭"）时整段跳过：
+    // 空闲到点什么都不做，主屏一直留在那儿。
     if (currentSysMode == SYS_MODE_NORMAL
         && ringingKind == RING_NONE
+        && saverMode != SAVER_OFF
         && !(countdownShown && timerRunning)
         && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
         currentSysMode = SYS_MODE_SLEEP;
         ct_mark(CT_S_SLEEP);
-        // SAVER_OFF 走老路径拆主屏；壁纸/时间温湿度则另起一块屏保屏，
+        // SAVER_BLACK 走老路径拆主屏；壁纸/时间温湿度则另起一块屏保屏，
         // 主屏原样留着，唤醒时切回去就行，省掉一次重建。
         enterScreensaver();
     }
