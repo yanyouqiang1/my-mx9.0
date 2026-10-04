@@ -139,14 +139,13 @@
             <div style="display: flex; gap: 10px; margin-top: 10px; align-items: center;">
                 <label style="white-space: nowrap;">目标方案：</label>
                 <select id="remapProfile" style="flex: 1;">
-                    <option value="0">方案 1 (Windows)</option>
-                    <option value="1">方案 2 (macOS)</option>
-                    <option value="2">方案 3 (游戏模式)</option>
-                    <option value="3">方案 4 (工作模式)</option>
+                    <!-- 同上：value 必须和 CFG_PROFILES 下标 + 固件 CFG_PROF_NAMES 同序 -->
+                    <option value="0">Windows</option>
+                    <option value="1">macOS</option>
                 </select>
                 <button class="btn btn-tag" id="remapLoadBtn">📥 从键盘读取</button>
                 <button class="btn btn-red" id="remapClearBtn">🗑️ 清空此方案</button>
-                <button class="btn btn-red" id="remapResetAllBtn" title="一键清掉所有方案的按键映射,解决老 REMAP 残留(按 A 变 9 这类)">⚠️ 清空全部 4 方案映射</button>
+                <button class="btn btn-red" id="remapResetAllBtn" title="一键清掉两个系统的按键映射,解决老 REMAP 残留(按 A 变 9 这类)">⚠️ 清空全部映射</button>
             </div>
 
             <div class="grid-3" style="margin-top: 12px;">
@@ -176,7 +175,7 @@
             <h2>2. 全局独立功能键 (MA / MB / M1~M12)</h2>
             <div class="hint">
                 这里配的是"按下这一颗键，除了按方案宏（M1-M12 才有）外，还会做什么"。
-                例如 M1 设成"切到方案 2 + Ctrl+Alt+T"，按 M1 会先切方案再发热键。
+                例如 M1 设成"切到 macOS + Ctrl+Alt+T"，按 M1 会先切系统再发热键。
                 MA / MB 是纯全局键（没按方案宏），M1-M12 是按方案宏 + 全局动作双层叠加。
             </div>
 
@@ -201,10 +200,8 @@
                     <label style="margin-top: 6px; display:block;">① 切换配置方案：</label>
                     <select id="globalkSwAction">
                         <option value="NONE">不切换方案 (无动作)</option>
-                        <option value="0">方案 1 (Windows 默认)</option>
-                        <option value="1">方案 2 (macOS 默认)</option>
-                        <option value="2">方案 3 (游戏定制)</option>
-                        <option value="3">方案 4 (工作定制)</option>
+                        <option value="0">切到 Windows</option>
+                        <option value="1">切到 macOS</option>
                         <option value="NEXT">循环切换到下一个方案</option>
                     </select>
 
@@ -261,7 +258,7 @@
             <div class="hint">
                 MA / MB 已从上方"全局独立功能键"里独立出来。每按一次就在 <b style="color:#38bdf8;">状态 A ⇄ 状态 B</b> 之间切换,
                 每次按下都执行当前那套里的「切换方案 + 组合键/快捷键」。
-                <br>常用场景:MA 设成 <i>游戏模式(切方案 3 + 静音)</i> / <i>工作模式(切方案 1 + Win+D 显桌面)</i>,一键来回切。
+                <br>常用场景:MA 设成 <i>静音模式(切到 macOS + 静音)</i> / <i>桌面模式(切到 Windows + Win+D 显桌面)</i>,一键来回切。
             </div>
 
             <div class="grid-2" style="margin-top: 10px;">
@@ -281,10 +278,8 @@
                             <label>切换配置方案:</label>
                             <select id="ma_aSwAction">
                                 <option value="NONE">不切换方案 (无动作)</option>
-                                <option value="0">方案 1 (Windows 默认)</option>
-                                <option value="1">方案 2 (macOS 默认)</option>
-                                <option value="2">方案 3 (游戏定制)</option>
-                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="0">切到 Windows</option>
+                                <option value="1">切到 macOS</option>
                                 <option value="NEXT">循环切换到下一个方案</option>
                             </select>
                             <div class="mode-tabs" style="margin-top: 6px;">
@@ -316,10 +311,8 @@
                             <label>切换配置方案:</label>
                             <select id="ma_bSwAction">
                                 <option value="NONE">不切换方案 (无动作)</option>
-                                <option value="0">方案 1 (Windows 默认)</option>
-                                <option value="1">方案 2 (macOS 默认)</option>
-                                <option value="2">方案 3 (游戏定制)</option>
-                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="0">切到 Windows</option>
+                                <option value="1">切到 macOS</option>
                                 <option value="NEXT">循环切换到下一个方案</option>
                             </select>
                             <div class="mode-tabs" style="margin-top: 6px;">
@@ -365,10 +358,8 @@
                             <label>切换配置方案:</label>
                             <select id="mb_aSwAction">
                                 <option value="NONE">不切换方案 (无动作)</option>
-                                <option value="0">方案 1 (Windows 默认)</option>
-                                <option value="1">方案 2 (macOS 默认)</option>
-                                <option value="2">方案 3 (游戏定制)</option>
-                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="0">切到 Windows</option>
+                                <option value="1">切到 macOS</option>
                                 <option value="NEXT">循环切换到下一个方案</option>
                             </select>
                             <div class="mode-tabs" style="margin-top: 6px;">
@@ -400,10 +391,8 @@
                             <label>切换配置方案:</label>
                             <select id="mb_bSwAction">
                                 <option value="NONE">不切换方案 (无动作)</option>
-                                <option value="0">方案 1 (Windows 默认)</option>
-                                <option value="1">方案 2 (macOS 默认)</option>
-                                <option value="2">方案 3 (游戏定制)</option>
-                                <option value="3">方案 4 (工作定制)</option>
+                                <option value="0">切到 Windows</option>
+                                <option value="1">切到 macOS</option>
                                 <option value="NEXT">循环切换到下一个方案</option>
                             </select>
                             <div class="mode-tabs" style="margin-top: 6px;">
@@ -437,16 +426,18 @@
 
         <!-- 4. 方案专属宏 M1-M12 -->
         <div class="card">
-            <h2>3. 方案专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
-            <div class="hint">这里编辑的是按方案宏：每个方案下的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
+            <h2>3. 系统专属宏 (M1 ~ M12) — MR 现场录制的另一种编辑方式</h2>
+            <div class="hint">这里编辑的是按系统宏：Windows 和 macOS 各自的 M1-M12 独立保存。在键盘上按 MR 也能现场录。</div>
 
             <div>
                 <label style="font-weight: bold; color: #38bdf8;">编辑目标方案 (Profile)：</label>
                 <select id="activeProfile">
-                    <option value="0">方案 1 (Windows)</option>
-                    <option value="1">方案 2 (macOS)</option>
-                    <option value="2">方案 3 (游戏模式)</option>
-                    <option value="3">方案 4 (工作模式)</option>
+                    <!-- ⚠ 这两个 value 必须和 CFG_PROFILES 的下标严格对应，
+                         也必须和固件 CFG_PROF_NAMES[] 同序：网页靠下标定位块，
+                         固件靠下标读名字。顺序错位会把 Windows 的配置写到 mac 上，
+                         而页面上看不出任何异常。 -->
+                    <option value="0">Windows</option>
+                    <option value="1">macOS</option>
                 </select>
             </div>
 
@@ -497,7 +488,7 @@
 
                 <button class="btn btn-green" id="saveMacroBtn" style="width: 100%; margin-top: 8px;">保存宏配置到当前方案</button>
                 <button class="btn btn-tag" id="clearMacroBtn" style="width: 100%; margin-top: 6px;">🗑️ 清空当前键宏（清掉键盘里存的所有内容）</button>
-                <button class="btn btn-red" id="resetAllMacrosBtn" style="width: 100%; margin-top: 6px;">⚠️ 清空所有宏（M1~M12 × 4 方案 + MA + MB）</button>
+                <button class="btn btn-red" id="resetAllMacrosBtn" style="width: 100%; margin-top: 6px;">⚠️ 清空所有宏（M1~M12 × 2 个系统 + MA + MB）</button>
             </div>
         </div>
     </div>
@@ -626,31 +617,47 @@
                 <b>包含什么</b>：<br>
                 · 十三个标量设置：显示风格、屏保、当前方案、背光、亮度、灯效、
                   状态灯亮度、按键特效、闹钟开关/时/分、温度偏移、时间<br>
-                · <code>remap</code>：4 个方案的按键映射，每个方案一个数组，
-                  元素是 <code>{"from": 键码, "to": 键码}</code><br>
-                · <code>macros</code>：4 方案 × M1~M12 共 48 个宏，形如
-                  <code>"p0_M1": "SEQ:abc"</code> 或 <code>"p0_M2": "CMB:128,4"</code>；
+                · <code>windows</code> / <code>mac</code> 两个<b>方案块</b>，每个块下面
+                  挂这个系统自己的个性化配置：<br>
+                  &nbsp;&nbsp;· <code>remap</code>：按键映射，一个数组，元素是
+                  <code>{"from": 键码, "to": 键码}</code>；没配就写 <code>[]</code><br>
+                  &nbsp;&nbsp;· <code>macros</code>：M1~M12 共 12 个宏，形如
+                  <code>"M7": "SEQ:abc"</code>；<b>键名不带系统前缀</b>，块名已经说明了是哪一边。
                   没设过的宏<b>不会出现在 JSON 里</b>，所以<b>删掉一行就是删掉一个宏</b><br>
                 · <code>gkeys</code>：<code>MA</code>/<code>MB</code> 老单套、
                   <code>MAa</code>/<code>MAb</code>/<code>MBa</code>/<code>MBb</code> 双状态，
-                  以及 <code>MA_ph</code>/<code>MB_ph</code> 两个相位（永远存在，0 或 1）<br><br>
+                  以及 <code>MA_ph</code>/<code>MB_ph</code> 两个相位（永远存在，0 或 1）。
+                  它留在顶层、不分系统 —— MA/MB 是"按一下换一套动作"的全局键，
+                  和当前跑在哪个系统没关系<br>
+                · <code>timer</code>：倒计时当前状态（<code>run</code> / <code>remain</code> /
+                  <code>total</code>）。<b>只读</b>：保存时固件会把它原样忽略，
+                  既不写 NVS 也不改正在跑的倒计时 —— 放进 JSON 只是为了让你看得到
+                  键盘此刻在跑什么；它本来就是断电归零的运行时状态，落盘反而会
+                  让"重启后倒计时复活"<br><br>
                 <b>不包含</b>（各有原因，故意保留自己的通道）：<br>
                 · <b>ME 键文本</b> 和 <b>壁纸</b> —— 前者可能十几 KB 要转 hex、
                   后者是 JPEG 裸字节，本来就走的二进制通道，塞进 JSON 没意义<br>
-                · <b>倒计时</b> —— 它是运行时的一次性倒数，固件里不落盘、重启归零。
-                  放进"配置"会造出假象：存一次配置顺手把正在跑的倒计时重置了<br>
                 · <b>日志 / 告警</b> —— 那些是运行时事件，不是设置<br><br>
                 几个约定：<br>
                 · <b>version 是版本闸门，不能改</b>。固件只认它自己那一个版本号
-                  （当前 v2），改成别的会被整份拒绝并提示"版本对不上，请重新拉取"。<br>
+                  （当前 v3），改成别的会被整份拒绝并提示"版本对不上，请重新拉取"。<br>
                 · <b>没写的字段保持原样</b>（不会被清零），所以可以只改一个数再存。<br>
                 · <b>超出范围的字段会整份拒绝</b>并告诉你错在哪一项，不会偷偷夹取值 ——
                   比如 brightness 只接受 0~255。<br>
                 · 不认识的字段会被<b>忽略</b>（所以网页比固件新时也能用）。<br>
                 · <code>remap</code> 是唯一的例外：<b>它一旦出现就是整份替换</b>
-                  （写成 <code>[]</code> 就是清空那个方案）。<br>
+                  （写成 <code>[]</code> 就是清空那个系统）。<br>
+                · <code>macros</code> / <code>gkeys</code> 是<b>逐键</b>的：出现 = 写这一条，
+                  值给 <code>null</code> 或 <code>""</code> = 删这一条，不提 = 不动。<br>
+                · 宏键名里<b>可以</b>带老的 <code>p0_</code> 前缀（<code>"p0_M7"</code>），
+                  但它必须和所在块对得上 —— 写在 <code>mac</code> 块里的
+                  <code>"p0_M7"</code> 会被<b>拒绝</b>，因为那几乎一定是复制 Windows
+                  那段忘了改。写成 <code>"M7"</code> 最省事。<br>
                 · 点保存时固件会<b>显式提交 flash</b>，所以"已保存"之后断电也不会丢。<br>
-                · 这些值仍然存在原来那套 NVS 键里，<b>不会清掉你已有的按键映射和宏</b>。
+                · 这些值仍然存在原来那套 NVS 键里（<code>p0_*</code> / <code>p1_*</code>），
+                  <b>不会清掉你已有的按键映射和宏</b>：Windows 就是原来的方案 1，
+                  macOS 就是原来的方案 2。原来方案 3/4 的数据还留在 NVS 里，
+                  但固件不再读取它们。
             </div>
             <div style="display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;">
                 <button class="btn btn-orange" id="cfgPullBtn" style="flex: 1; min-width: 140px;">📥 从键盘拉取</button>
@@ -1238,11 +1245,29 @@
     // 3. **CFGBEGIN 里的总长必须是 UTF-8 字节数**，不是字符串长度。固件按字节
     //    核对收没收齐，写成字符数会在有中文时误判成"没收齐"然后整份丢弃。
     const CFG_JSON_MAX_CHUNK = 180;   // 固件那边 CFG_RX_CHUNK_MAX=200，留足余量
-    const CFG_SCHEMA_VERSION = 2;     // 必须和固件 src/lvgl_s3.ino 的 CFG_SCHEMA_VERSION 一致
+    const CFG_SCHEMA_VERSION = 3;     // 必须和固件 src/lvgl_s3.ino 的 CFG_SCHEMA_VERSION 一致
     // 这三个必须和固件一致，改一边要改另一边（README「配置 JSON」那节有登记）
     const CFG_BUF_MAX = 20480;        // CFG_BUF_SIZE
     const CFG_MACRO_MAX = 256;        // CFG_MACRO_MAX
     const CFG_GKEY_MAX = 256;         // CFG_GKEY_MAX
+    // 方案在 JSON 里的对象名。⚠ 必须和固件 CFG_PROF_NAMES[] 一致、顺序也一样 ——
+    //   固件按下标 p 去读 CFG_PROF_NAMES[p]，两边顺序错位会把 Windows 的配置
+    //   写到 mac 上去，而页面上看不出任何异常。
+    const CFG_PROFILES = ["windows", "mac"];
+    const CFG_PROFILE_LABEL = { windows: "Windows", mac: "macOS" };
+
+    // 方案下标（activeProfile 下拉的 value，可能是字符串）→ JSON 里的块名
+    function cfgProfName(prof) { return CFG_PROFILES[Number(prof)]; }
+    // 统计一下"总共配了多少条映射 / 多少个宏"，状态行和日志都要用
+    function cfgCountAll() {
+        let nRule = 0, nMacro = 0;
+        for (const name of CFG_PROFILES) {
+            const blk = cfgModel[name];
+            if (blk && Array.isArray(blk.remap)) nRule += blk.remap.length;
+            if (blk && blk.macros) nMacro += Object.keys(blk.macros).length;
+        }
+        return { nRule, nMacro, nGkey: Object.keys(cfgModel.gkeys || {}).length };
+    }
 
     // ---- 单一模型 ----
     //
@@ -1259,10 +1284,16 @@
         disp_mode: 0, saver_mode: 0, curr_prof: 0,
         light_on: true, brightness: 128, effect: 0, ind_level: 2, key_fx: 0,
         alarm_on: false, alarm_h: 7, alarm_m: 30, sht_offset: 0, set_epoch: 0,
-        // 方案三件套（v2 加的）
-        remap: [],      // 4 个数组，下标=方案号；每个里面是 {from,to}
-        macros: {},     // {"p0_M1":"SEQ:ab"}，没设的键不出现
+        // 方案块（v3 改成按操作系统分，不再是 remap[4] + 顶层 macros）
+        //   每个块下面挂它自己的 remap（定长数组，[] = 清空这个系统）
+        //   和 macros（稀疏对象，键名 M7 之类，块名已经说明是哪个系统了）
+        windows: { remap: [], macros: {} },
+        mac:     { remap: [], macros: {} },
+        // 全局键：不分系统，MA/MB 双状态 + 相位
         gkeys: {},      // {"MAa":"SW:1+…", "MA_ph":0}
+        // 倒计时：**只读**。固件每次拉取时现报运行时状态，保存时被原样忽略。
+        // 它不是配置，是"键盘此刻正在跑什么"的一个快照。
+        timer: { run: false, remain: 0, total: 0 },
     };
 
     let cfgLoaded = false;   // 有没有成功拉过一次（没拉过就别让用户往空模型上改）
@@ -1375,12 +1406,15 @@
         for (const k of Object.keys(cfgModel)) {
             if (Object.prototype.hasOwnProperty.call(obj, k)) cfgModel[k] = obj[k];
         }
-        // 兜底：固件保证 remap 是 4 个数组，但万一拿到一份手改过的，
-        // 别让后面的 [0][1][2][3] 直接 undefined 崩掉整个渲染。
-        if (!Array.isArray(cfgModel.remap)) cfgModel.remap = [];
-        while (cfgModel.remap.length < 4) cfgModel.remap.push([]);
-        cfgModel.remap = cfgModel.remap.slice(0, 4).map(a => Array.isArray(a) ? a : []);
-        if (typeof cfgModel.macros !== 'object' || !cfgModel.macros) cfgModel.macros = {};
+        // 兜底：固件保证每个方案块都有 remap/macros，但万一拿到一份手改过的，
+        // 别让后面的 blk.remap.length 直接 undefined 崩掉整个渲染。
+        for (const name of CFG_PROFILES) {
+            if (!cfgModel[name] || typeof cfgModel[name] !== 'object') cfgModel[name] = {};
+            const blk = cfgModel[name];
+            if (!Array.isArray(blk.remap)) blk.remap = [];
+            blk.remap = blk.remap.filter(r => r && typeof r === 'object');
+            if (typeof blk.macros !== 'object' || !blk.macros) blk.macros = {};
+        }
         if (typeof cfgModel.gkeys !== 'object' || !cfgModel.gkeys) cfgModel.gkeys = {};
 
         // 拉回来的东西**不保证就一定存得回去**。两类情况会在保存时被固件拒：
@@ -1388,8 +1422,11 @@
         //   · 拉回来的配置本身就已经接近 20KB 上限，再加一项就超
         // 在这里点名，比等到点保存、传了 90 多片之后才回一句"固件拒绝"要好。
         const tooLong = [];
-        for (const [k, v] of Object.entries(cfgModel.macros)) {
-            if (typeof v === 'string' && v.length > CFG_MACRO_MAX) tooLong.push(`宏 ${k}（${v.length} 字节）`);
+        for (const name of CFG_PROFILES) {
+            for (const [k, v] of Object.entries(cfgModel[name].macros)) {
+                if (typeof v === 'string' && v.length > CFG_MACRO_MAX)
+                    tooLong.push(`${CFG_PROFILE_LABEL[name]} 的宏 ${k}（${v.length} 字节）`);
+            }
         }
         for (const [k, v] of Object.entries(cfgModel.gkeys)) {
             if (typeof v === 'string' && v.length > CFG_GKEY_MAX) tooLong.push(`全局键 ${k}（${v.length} 字节）`);
@@ -1403,13 +1440,24 @@
         cfgFillForms();
         await cfgRefreshAllLists();
         if (!quiet) {
-            const nRule = cfgModel.remap.reduce((s, a) => s + a.length, 0);
+            const c = cfgCountAll();
+            const t = cfgModel.timer || {};
+            const tInfo = t.run
+                ? ` / 倒计时运行中 ${cfgFmtSec(t.remain)}`
+                : (t.total > 0 ? ` / 倒计时已停 ${cfgFmtSec(t.total)}` : "");
             cfgSetStatus(`已拉回 ${Object.keys(obj).length} 项：`
-                       + `${Object.keys(cfgModel.macros).length} 个宏 / ${nRule} 条映射 / `
-                       + `${Object.keys(cfgModel.gkeys).length} 个全局键`, "#4ade80");
+                       + `${c.nMacro} 个宏 / ${c.nRule} 条映射 / `
+                       + `${c.nGkey} 个全局键${tInfo}`, "#4ade80");
         }
         LOG_PORT_UI(`[CFG] 整份拉取完成 ${body.length} 字节`);
         return true;
+    }
+
+    // 秒 → HH:MM:SS。倒计时那块用它显示，别让页面上出现一个裸的秒数。
+    function cfgFmtSec(s) {
+        s = Math.max(0, Math.floor(Number(s) || 0));
+        const p = n => String(n).padStart(2, '0');
+        return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
     }
 
     // 把模型里的标量项填进"系统设置"那一排表单
@@ -1452,18 +1500,26 @@
     //
     // 这些卡片原来都是各自去问键盘要（MACRODUMP/GKEYDUMP/REMAPREAD），
     // 现在统一从 configCache 读，而 configCache 由整份 JSON 一次填满。
+    //
+    // ⚠ configCache 里的宏键名**故意保持老格式** `p0_M7`，尽管 JSON 里已经
+    //   改成"块名 + 裸槽位名"（windows.macros.M7）。这样宏编辑器那一大片
+    //   代码（loadMacroFromCache / 保存 / 清空 / 读回）一行都不用动 ——
+    //   差别只在这一层做一次名字翻译。翻译错位的后果是"在 mac 块里编辑
+    //   出来的宏跑去了 Windows"，所以这里的下标必须和固件 CFG_PROF_NAMES
+    //   严格同序。
     async function cfgRefreshAllLists() {
         configCache.remaps = {};
         configCache.macros = {};
         configCache.gkeys = {};
 
-        for (let p = 0; p < 4; p++) {
-            configCache.remaps[p] = cfgModel.remap[p].map(r => ({ from: r.from, to: r.to }));
-        }
-        // 固件不发没设过的宏，这里把"没出现"和"空串"统一成 'NONE' ——
-        // loadMacroFromCache 只认 null / 'NONE' / 'SEQ:…' / 'CMB:…' 四种
-        for (const [k, v] of Object.entries(cfgModel.macros)) {
-            configCache.macros[k] = (v === '' ? 'NONE' : v);
+        for (let p = 0; p < CFG_PROFILES.length; p++) {
+            const blk = cfgModel[CFG_PROFILES[p]];
+            configCache.remaps[p] = blk.remap.map(r => ({ from: r.from, to: r.to }));
+            // 固件不发没设过的宏，这里把"没出现"和"空串"统一成 'NONE' ——
+            // loadMacroFromCache 只认 null / 'NONE' / 'SEQ:…' / 'CMB:…' 四种
+            for (const [k, v] of Object.entries(blk.macros)) {
+                configCache.macros[`p${p}_${k}`] = (v === '' ? 'NONE' : v);
+            }
         }
         for (const k of ['MA', 'MB']) {
             const v = cfgModel.gkeys[k];
@@ -1478,9 +1534,9 @@
             configCache.gkeys[`${k}_ph`] = (ph === 1 ? '1' : '0');
             updatePhaseBadge(k, configCache.gkeys[`${k}_ph`]);
         }
-        // 宏那 48 个格子里没设过的也要显式标成 NONE，否则 loadMacroFromCache
+        // 宏那 24 个格子里没设过的也要显式标成 NONE，否则 loadMacroFromCache
         // 的 ensureMacroLoaded 会因为"cache 里是 undefined"再去问键盘一次
-        for (let p = 0; p < 4; p++) {
+        for (let p = 0; p < CFG_PROFILES.length; p++) {
             for (let m = 1; m <= 12; m++) {
                 const ck = `p${p}_M${m}`;
                 if (configCache.macros[ck] === undefined) configCache.macros[ck] = 'NONE';
@@ -1658,9 +1714,9 @@
         const ok = await cfgPull(true);
         if (onProgress) onProgress(2, "完成");
         if (ok) {
-            const nRule = cfgModel.remap.reduce((s, a) => s + a.length, 0);
-            LOG_PORT_UI(`[读回] 一次整份拉取完成：${Object.keys(cfgModel.macros).length} 宏 / `
-                + `${nRule} 条映射 / ${Object.keys(cfgModel.gkeys).length} 全局键，`
+            const c = cfgCountAll();
+            LOG_PORT_UI(`[读回] 一次整份拉取完成：${c.nMacro} 宏 / `
+                + `${c.nRule} 条映射 / ${c.nGkey} 全局键，`
                 + `${((Date.now() - t0) / 1000).toFixed(1)}秒`);
         } else {
             LOG_PORT_UI('[读回] 整份拉取失败');
@@ -1919,7 +1975,8 @@
         const prof = document.getElementById('remapProfile').value;
         // JSON 里"清空这个方案"就是把 remap[prof] 写成空数组。
         // 固件那边 remap[p] 一旦出现就是**整份替换**，空数组 = 0 条。
-        const ok = await cfgPush(m => { m.remap[Number(prof)] = []; });
+        const pname = cfgProfName(prof);
+        const ok = await cfgPush(m => { m[pname].remap = []; });
         if (ok) {
             // 用回读结果刷新：cfgPush 成功后会自己 cfgPull 一次，
             // 所以这里 remapRules 已经是键盘上的真实值了。
@@ -1928,16 +1985,18 @@
         }
     });
 
-    // 一键清掉所有 4 个方案的按键映射。主要给老 HTML 时期 ASCII 编码
+    // 一键清掉两个系统的按键映射。主要给老 HTML 时期 ASCII 编码
     // (97=A、98=B、99=C)留下的脏规则用 —— 那套映射落进 kbPress 的
     // 0x53~0x63 区间会发成 Num9/Num0/Num.，按 A 出来是 9。
     document.getElementById('remapResetAllBtn').addEventListener('click', async () => {
-        if (!confirm("⚠️ 真的要清空全部 4 个方案的按键映射?\n\n会清掉:\n  • 所有方案的按键映射 (REMAP)\n\n保留:\n  • 宏 (M1~M12 × 4 方案)\n  • 全局动作 (MA / MB)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光 / 壁纸\n\n此操作不可撤销,确定继续?")) return;
+        if (!confirm("⚠️ 真的要清空全部按键映射?\n\n会清掉:\n  • Windows 和 macOS 的按键映射 (REMAP)\n\n保留:\n  • 宏 (M1~M12 × 2 个系统)\n  • 全局动作 (MA / MB)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光 / 壁纸\n\n此操作不可撤销,确定继续?")) return;
         if (!confirm("再确认一次:真的要清空吗?")) return;
-        await cfgPush(m => { m.remap = [[], [], [], []]; }, "全部 4 个方案的按键映射已清空。");
+        await cfgPush(m => {
+            for (const name of CFG_PROFILES) m[name].remap = [];
+        }, "Windows / macOS 的按键映射都已清空。");
     });
 
-    // 读回：整份 JSON 一次拉全（remap + 48 个宏 + 全局键），顺带把
+    // 读回：整份 JSON 一次拉全（两个系统的 remap + 24 个宏 + 全局键），顺带把
     // 上面几个表单也填上。原来的"只读这一个方案的映射"那条路
     // （REMAPREAD）保留在 readRemap() 里，作为 cache 没命中时的兜底。
     async function readRemap(prof, timeoutMs, retries) {
@@ -1980,7 +2039,8 @@
             return;
         }
         const rules = remapRules.map(r => ({ from: r.from, to: r.to }));
-        const ok = await cfgPush(m => { m.remap[Number(prof)] = rules; });
+        const pname = cfgProfName(prof);
+        const ok = await cfgPush(m => { m[pname].remap = rules; });
         if (!ok) return;
         // cfgPush 成功后会 cfgPull 一次，configCache 里已经是键盘的真实值。
         // 条数对不上只有两种可能，两种都会让用户以为"保存成功了"：
@@ -2011,7 +2071,7 @@
     //   这就是"从键盘读取永远读到 0 条"的直接原因。
     //
     // 现在这里也走整份 JSON：一次拉回来既填了这个列表，也把上面那些表单
-    // 和 48 个宏格一起同步了。失败时**什么都不改**（旧代码里
+    // 和 24 个宏格一起同步了。失败时**什么都不改**（旧代码里
     // `back || []` 会把"键盘没回话"固化成"0 条"，然后 ensureRemapLoaded
     // 只认 !== undefined，于是本次会话里这个方案永远显示 0 条）。
     document.getElementById('remapLoadBtn').addEventListener('click', async () => {
@@ -2496,8 +2556,9 @@
             if (codes.length === 0) return alert("请至少勾选一个修饰键或添加一个普通键！");
             payload = `CMB:${codes.join(',')}`;
         }
-        await cfgPush(m => { m.macros[ck] = payload; },
-            `已保存${mode === "SEQ" ? "打字/延时" : "组合键"}宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
+        const pname = cfgProfName(prof);
+        await cfgPush(m => { m[pname].macros[mKey] = payload; },
+            `已保存${mode === "SEQ" ? "打字/延时" : "组合键"}宏到${CFG_PROFILE_LABEL[pname]}的 ${mKey}！`);
     });
 
     // 清空当前键宏：在 JSON 里就是**把这个宏键整个删掉**。
@@ -2506,7 +2567,8 @@
         const prof = document.getElementById('activeProfile').value;
         const mKey = document.getElementById('macroKey').value;
         if (!confirm(`确定要清空方案 ${Number(prof) + 1} 的 ${mKey} 宏?\n键盘里之前存的所有内容都会被清掉。`)) return;
-        const ok = await cfgPush(m => { delete m.macros[`p${prof}_${mKey}`]; });
+        const pname = cfgProfName(prof);
+        const ok = await cfgPush(m => { delete m[pname].macros[mKey]; });
         if (ok) {
             // 本地视图也清掉，免得下次切换看到一堆旧条目以为还在
             document.getElementById('seqInput').value = '';
@@ -2515,14 +2577,14 @@
         }
     });
 
-    // 一键清空所有宏：4 方案 × M1-M12 + MA/MB 全部双状态。
+    // 一键清空所有宏：2 个系统 × M1-M12 + MA/MB 全部双状态。
     // 走 JSON 的"把这些键从模型里删掉"，和逐个删是同一条路径。
     document.getElementById('resetAllMacrosBtn').addEventListener('click', async () => {
-        if (!confirm("⚠️ 真的要清空所有宏?\n\n会清掉:\n  • 4 个方案 × M1~M12 = 48 个方案专属宏\n  • MA / MB 全局动作（含双状态）\n\n保留:\n  • 按键映射 (REMAP)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光配置\n  • 屏幕壁纸\n\n此操作不可撤销,确定继续?")) return;
+        if (!confirm("⚠️ 真的要清空所有宏?\n\n会清掉:\n  • Windows / macOS 各 M1~M12 = 24 个系统专属宏\n  • MA / MB 全局动作（含双状态）\n\n保留:\n  • 按键映射 (REMAP)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光配置\n  • 屏幕壁纸\n\n此操作不可撤销,确定继续?")) return;
         // 二次确认,防误点
         if (!confirm("再确认一次:真的要清空吗?")) return;
         await cfgPush(m => {
-            m.macros = {};
+            for (const name of CFG_PROFILES) m[name].macros = {};
             for (const k of ['MA', 'MB', 'MAa', 'MAb', 'MBa', 'MBb']) delete m.gkeys[k];
         }, "所有宏已清空。");
     });

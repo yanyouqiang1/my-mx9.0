@@ -162,7 +162,7 @@ static void logDumpPump(void);
 // v2 = 加上**方案那一整套**：remap（4 方案 × 最多 32 条）、macros（4×12）、
 //      gkeys（MA/MB 双状态 + 相位）。也就是"除了 ME 文本和壁纸，
 //      键盘里存的配置全部走这一份 JSON"。
-#define CFG_SCHEMA_VERSION    2
+#define CFG_SCHEMA_VERSION    3
 
 // 缓冲大小。
 //
@@ -729,15 +729,29 @@ typedef struct {
 static HudEntry hud = {0};
 
 // Profile
-#define TOTAL_PROFILES 4
+//
+// ⚠ 4 → 2：方案这一维度从"四个玩法档"改成"按操作系统分"。
+//   留下的两个是 Windows 和 macOS —— 这也正好对上 profile_icons.h 里
+//   prof_icon_win / prof_icon_mac 那两个（那两个图标本来就是 win 和 mac，
+//   game/work 是另外两档，现在用不上了；profile_icon_get 自带越界保护，
+//   currentProfile 只会在 0~1 之间，所以不用动那个头文件）。
+//
+//   **NVS 键名一个都没改**：方案 0 还是 p0 / rmp_0_*，方案 1 还是 p1 / rmp_1_*。
+//   也就是说"方案 0 = windows、方案 1 = mac"只是给已有的 0/1 重新起了名字，
+//   里面已经配好的 remap 和宏原样接着用。p2/p3 的数据留在 NVS 里不再读取
+//   （用户明确要求"彻底废掉"），键还占着分区，但 NVS 本来就只增不减、
+//   新键写不进去才叫问题，留着旧键不占新键的位置。
+#define TOTAL_PROFILES 2
 #define MAX_REMAP_RULES 32
 struct RemapRule { uint16_t fromKey; uint16_t toKey; };
 static RemapRule profileRemaps[TOTAL_PROFILES][MAX_REMAP_RULES];
 static int remapCounts[TOTAL_PROFILES] = { 0 };
 static uint8_t currentProfile = 0;
 static const char* profileNamesCN[TOTAL_PROFILES] = {
-    "方案1-Windows", "方案2-macOS", "方案3-游戏模式", "方案4-工作模式"
+    "Windows", "macOS"
 };
+// 方案在配置 JSON 里的对象名。**JSON 的键名以这里为准**，改这里就等于改线上格式。
+static const char* CFG_PROF_NAMES[TOTAL_PROFILES] = { "windows", "mac" };
 
 // BLE
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -5327,24 +5341,75 @@ static const int          GKEY_SLOT_COUNT = (int)(sizeof(GKEY_SLOT) / sizeof(GKE
 //   任意字符串，一个手滑的 "p99_M1" 或 "hello" 就会在 NVS 里留下一个**永远
 //   没人读、也永远删不掉**的键 —— 而 NVS 分区只有 20KB 且只增不减，这种键
 //   攒几个就把分区写满了，表现是"别的配置突然存不进去了"。宁可当场报错。
-static bool cfgMacroKeyValid(const char* k) {
-    if (k == nullptr) return false;
-    if (k[0] != 'p' || k[1] < '0' || k[1] > '9' || k[2] != '_' || k[3] != 'M') return false;
-    if (k[1] - '0' >= TOTAL_PROFILES) return false;
-    // ⚠ 还要挡掉**前导零**（"p0_M01"）：它按十进制解析等于槽 1，能过下面那条
-    //   范围检查，但 NVS 里存下的键是 `p0_M01`，而 executeMacro 读的是 `p0_M1`
-    //   —— 两者永远对不上。表现出来就是"保存返回成功、这个宏按 M1 毫无反应"，
-    //   而且那把键还留在 NVS 里谁都删不掉。
-    if (k[4] == '0') return false;                 // 前导零 / 零号
-
-    int slot = 0, digits = 0;
-    for (const char* q = k + 4; *q != '\0'; q++) {
-        if (*q < '0' || *q > '9') return false;   // 出现非数字 = 键名脏了
-        slot = slot * 10 + (*q - '0');
-        if (++digits > 3) return false;            // 防 "p0_M99999999" 溢出
+// 把 JSON 里的宏键名翻译成 NVS 键名。
+//
+// v3 之后 JSON 按操作系统分块（"windows" / "mac"），所以块名已经说明了方案，
+// 宏键名里的方案前缀就是冗余的 —— 写成 "M7" 即可，不再是 "p0_M7"。
+// 但**旧的 p<n>_M<slot> 形式仍然接受**：v2 的 JSON（含用户手改过、存进浏览器
+// 历史的）不能因为升个版本就全部失效。
+//
+// 三条规则，都是为了不制造"看着存进去了、其实落到别处"的静默错位：
+//   "M7"    在 prof 块里 → p<prof>_M7            （新写法，块即方案）
+//   "p0_M7" 在 prof 块里 → 方案号必须等于 prof，否则**拒**（而不是"按块的来"）
+//   "p0_M01"             → 拒（前导零，理由见下面）
+//
+// 为什么"方案号与所在块不符"要拒而不是听块的：用户把一段 v2 的旧 JSON 直接
+// 粘进来时，"p0_M7" 出现在 "mac" 块里几乎一定是"从 windows 复制过来忘了改"。
+// 默默存成 mac 的 M7 等于"按了 M7 结果 Windows 的宏跑在了 mac 上"，
+// 而页面上看不出任何异常 —— 这比直接报错难查一百倍。
+static bool cfgMacroNvsKey(int prof, const char* k, char* out, size_t cap,
+                           char* err, size_t errCap) {
+    if (k == nullptr || prof < 0 || prof >= TOTAL_PROFILES) return false;
+    const char* slotPart = nullptr;
+    if (k[0] == 'M' || k[0] == 'm') {
+        slotPart = k + 1;                       // 新写法：M7
+    } else if (k[0] == 'p' && k[2] == '_' && (k[3] == 'M' || k[3] == 'm')) {
+        // 旧写法：p<n>_M<slot>，必须确认 n 就是当前块
+        if (k[1] < '0' || k[1] > '9') return false;
+        int n = k[1] - '0';
+        if (n != prof) {
+            snprintf(err, errCap,
+                     "宏键名 \"%s\" 写的是方案%d,但放在了 \"%s\" 块里(方案%d);"
+                     "去掉 p%d_ 前缀直接写 M%s 即可",
+                     k, n, CFG_PROF_NAMES[prof], prof, n, k + 4);
+            return false;
+        }
+        slotPart = k + 4;
+    } else {
+        snprintf(err, errCap,
+                 "宏键名 \"%s\" 不合法(块内直接写 M1~M%d,例:M7)", k, (int)MACRO_SLOTS);
+        return false;
     }
-    if (digits == 0) return false;                // p0_M 这种半截
-    return slot >= 1 && slot <= MACRO_SLOTS;
+    // 挡掉**前导零**（"M01"）：它按十进制解析等于槽 1，能过下面的范围检查，
+    // 但 NVS 里存下的键是 `p0_M01`，而 executeMacro 读的是 `p0_M1` —— 两者永远
+    // 对不上。表现出来就是"保存返回成功、这个宏按 M1 毫无反应"，而且那把键
+    // 还留在 NVS 里谁都删不掉。
+    if (slotPart[0] == '0') {
+        snprintf(err, errCap, "宏键名 \"%s\" 不能有前导零(写 M7,不是 M07)", k);
+        return false;
+    }
+    int slot = 0, digits = 0;
+    for (const char* q = slotPart; *q != '\0'; q++) {
+        if (*q < '0' || *q > '9') {
+            snprintf(err, errCap, "宏键名 \"%s\" 里有非数字字符", k);
+            return false;
+        }
+        slot = slot * 10 + (*q - '0');
+        if (++digits > 3) {
+            snprintf(err, errCap, "宏键名 \"%s\" 的槽位号太长", k);
+            return false;                       // 防 "M99999999" 溢出
+        }
+    }
+    if (digits == 0) {
+        snprintf(err, errCap, "宏键名 \"%s\" 缺槽位号(要写成 M1~M%d)", k, (int)MACRO_SLOTS);
+        return false;
+    }
+    if (slot < 1 || slot > MACRO_SLOTS) {
+        snprintf(err, errCap, "宏槽位 %d 超出 1~%d(键名 \"%s\")", slot, (int)MACRO_SLOTS, k);
+        return false;
+    }
+    snprintf(out, cap, "p%d_M%d", prof, slot);
+    return true;
 }
 
 // 键名 → GKEY_SLOT 下标；不是那 6 个槽之一就返回 -1。
@@ -5511,34 +5576,34 @@ static size_t cfgBuildJson(char* out, size_t cap) {
         }
     }
 
-    // ---- remap：4 个定长数组，下标 = 方案号 ----
+    // ---- 每个方案一个对象：CFG_PROF_NAMES[p] = { "remap": [...], "macros": {...} } ----
     //
     // 走 RAM 里的 profileRemaps / remapCounts，不现读 NVS：这两个数组是
-    // setup() 里已经把 NVS 全load进来过的运行时副本，读它和读 NVS 等价，
-    // 但省掉 128 次 NVS 查表（每次都要走一遍分区查找）。
-    JsonArray remap = doc["remap"].to<JsonArray>();
+    // setup() 里已经把 NVS 全 load 进来过的运行时副本，读它和读 NVS 等价，
+    // 但省掉一整轮 NVS 查表（每次都要走一遍分区查找）。
+    //
+    // 两种取值的取舍（和 v2 一样，但换成了按块组织）：
+    // · remap  —— **定长**数组，一个都没配就是 []。必须发空数组：数组一旦缺项，
+    //            "这个方案没规则"和"这个方案没提"就分不开了，而后者按本模块的
+    //            规矩是"不动"，会让"清空某个方案"根本清不掉。
+    // · macros —— **稀疏**对象，只带真正设过的键（"M7": "SEQ:ab"）。24 个键
+    //            全发的话光键名就 200 多字节，而绝大多数人只设了三五个。
+    //            没设过的键**压根不出现**（不是 null）："清空某个宏"在网页上
+    //            就是把那一行删掉，少一个键 = 删一个宏，语义正好。
+    //            键名里不再带 p 前缀 —— 块名已经说明了是哪个系统，见 cfgMacroNvsKey。
     for (int p = 0; p < TOTAL_PROFILES; p++) {
-        JsonArray one = remap.add<JsonArray>();
+        JsonObject prof = doc[CFG_PROF_NAMES[p]].to<JsonObject>();
+        JsonArray remap = prof["remap"].to<JsonArray>();
         int cnt = remapCounts[p];
         if (cnt > MAX_REMAP_RULES) cnt = MAX_REMAP_RULES;   // 被人手改过 NVS 时的兜底
         for (int i = 0; i < cnt; i++) {
-            JsonObject r = one.add<JsonObject>();
+            JsonObject r = remap.add<JsonObject>();
             r["from"] = (uint16_t)profileRemaps[p][i].fromKey;
             r["to"]   = (uint16_t)profileRemaps[p][i].toKey;
         }
-    }
-
-    // ---- macros：稀疏对象，只带真正设过的 ----
-    //
-    // ⚠ 这里会连着做 48 次 preferences.getString。每次都是一次 NVS 查表 +
-    //   一次 String 堆分配，函数体又跑在 handleCommand 里（主任务，压着
-    //   10 秒看门狗）。所以每 8 个键喂一次狗 —— 不是怕慢，是怕"配置项
-    //   越来越多之后，某天这个循环悄悄越过了看门狗阈值"。
-    JsonObject macros = doc["macros"].to<JsonObject>();
-    int scanned = 0;
-    for (int p = 0; p < TOTAL_PROFILES; p++) {
+        JsonObject macros = prof["macros"].to<JsonObject>();
         for (int m = 1; m <= MACRO_SLOTS; m++) {
-            char mk[16];
+            char nk[16], mk[16];
             snprintf(mk, sizeof(mk), "p%d_M%d", p, m);
             String v = preferences.getString(mk, "");
             if (v.length() > 0) {
@@ -5546,15 +5611,19 @@ static size_t cfgBuildJson(char* out, size_t cap) {
                 // 宁可让用户看到"有个宏只回了一半"，也不能让整份 JSON 生成失败。
                 if (v.length() > CFG_MACRO_MAX) {
                     v = v.substring(0, CFG_MACRO_MAX);
-                    ELWARN("CFG", "宏 %s 超过 %d 字节，回拉时截断", mk, (int)CFG_MACRO_MAX);
+                    ELWARN("CFG", "宏 %s 超过 %d 字节,回拉时截断", mk, (int)CFG_MACRO_MAX);
                 }
-                macros[mk] = v;
+                snprintf(nk, sizeof(nk), "M%d", m);
+                macros[nk] = v;
             }
-            if ((++scanned & 7) == 0) btLinkKeepAlive();
+            if ((m & 3) == 0) btLinkKeepAlive();
         }
     }
 
-    // ---- gkeys：MA/MB 的双状态 + 相位 ----
+    // ---- gkeys：MA/MB 的双状态 + 相位（全局，不分系统）----
+    //
+    // 留在顶层而不是塞进 windows/mac：MA/MB 是"按一下换一套动作"的全局键，
+    // 和当前跑在哪个操作系统没关系，拆成两套只会让 NVS 多占一倍、页面多出一倍卡片。
     JsonObject gk = doc["gkeys"].to<JsonObject>();
     for (int i = 0; i < GKEY_SLOT_COUNT; i++) {
         String v = preferences.getString(GKEY_NVS[i], "");
@@ -5570,6 +5639,24 @@ static size_t cfgBuildJson(char* out, size_t cap) {
     // 相位永远发：0 是合法值，"没这个键"和"相位是 0"必须分得开
     gk["MA_ph"] = preferences.getUChar("g_MA_ph", 0);
     gk["MB_ph"] = preferences.getUChar("g_MB_ph", 0);
+
+    // ---- timer：倒计时（只读，不落盘）----
+    //
+    // ⚠ 这块是**只读**的：cfgApplyJson 收到它会原样忽略，不写 NVS、不改运行状态。
+    //   倒计时按设计就是运行内存里的东西（TIMERSET: 设、跑完归零、断电归零），
+    //   落盘会带来两个坏处：
+    //     · 断电重启后倒计时"复活"了，而用户以为它已经随断电结束
+    //     · 每次打开网页点任意一个"保存"都会把这个快照写一遍，把一个
+    //       纯运行时的量伪装成配置 —— 比没有这个字段更容易误导
+    //   所以它进 JSON 只有一个目的：**让页面能看到键盘此刻正在跑什么**。
+    //   三个字段都发：run 用来显示"跑着/停了"，remain 是此刻真剩多少秒
+    //   （不是快照，是每次拉的时候现算的），total 是当初设的整段时长。
+    {
+        JsonObject t = doc["timer"].to<JsonObject>();
+        t["run"] = (bool)timerRunning;
+        t["remain"] = (long)timerRemainSec;
+        t["total"] = (long)timerTotalSec;
+    }
 
     // ⚠ overflowed() 必须在序列化**之前**判，而且它是这一整段里最重要的一行检查。
     //
@@ -5629,16 +5716,16 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
         //   而不是 JSON 本身写错了。
         switch (de.code()) {
             case DeserializationError::IncompleteInput:
-                snprintf(err, errCap, "JSON 不完整（多半是传输丢片）");
+                snprintf(err, errCap, "JSON 不完整(多半是传输丢片)");
                 break;
             case DeserializationError::EmptyInput:
                 snprintf(err, errCap, "JSON 是空的");
                 break;
             case DeserializationError::InvalidInput:
-                snprintf(err, errCap, "JSON 语法错（多余的逗号/括号不配对）");
+                snprintf(err, errCap, "JSON 语法错(多余的逗号/括号不配对)");
                 break;
             case DeserializationError::NoMemory:
-                snprintf(err, errCap, "内存不够，解析不了");
+                snprintf(err, errCap, "内存不够,解析不了");
                 break;
             case DeserializationError::TooDeep:
                 snprintf(err, errCap, "JSON 嵌套太深");
@@ -5675,8 +5762,8 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
     }
     int ver = doc["version"].as<int>();
     if (ver != CFG_SCHEMA_VERSION) {
-        snprintf(err, errCap, "版本对不上：这份 JSON 是 v%d，本固件只认 v%d"
-                             "（请刷新网页重新拉取一份）",
+        snprintf(err, errCap, "版本对不上:这份 JSON 是 v%d,本固件只认 v%d"
+                             "(请刷新网页重新拉取一份)",
                  ver, CFG_SCHEMA_VERSION);
         return -1;
     }
@@ -5711,7 +5798,7 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
         }
         double num = v.as<double>();
         if (num < f.lo || num > f.hi) {
-            snprintf(err, errCap, "%s 超出范围 (%g~%g)，收到 %g",
+            snprintf(err, errCap, "%s 超出范围 (%g~%g),收到 %g",
                      f.key, (double)f.lo, (double)f.hi, num);
             return -1;
         }
@@ -5721,102 +5808,122 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
         nPend++;
     }
 
-    // ---- 方案三块：结构校验（和标量一样，"先校验，一个都不落地"）----
+    // ---- 方案块：结构校验（和标量一样，"先校验，一个都不落地"）----
+    //
+    // v3 起方案块是按操作系统分的两个对象：`"windows"` 和 `"mac"`（名字见
+    // CFG_PROF_NAMES）。每块下面挂它自己的 remap + macros，gkeys 留在顶层。
     //
     // 语义各不相同，先钉死：
-    //   remap[p] 出现 = **整份替换**方案 p（空数组 = 清空）。
-    //             方案 p 缺位 = 不动。
-    //   macros    出现 = 写这一个键；值为 null / "" = 删这一个键。
-    //             没出现的键 = 不动。
-    //   gkeys     同 macros；另外两个相位是数字。
+    //   <块>.remap  出现 = **整份替换**该方案（空数组 = 清空）。
+    //                块缺位 = 不动。
+    //   <块>.macros 出现 = 写这一个键；值为 null / "" = 删这一个键。
+    //                没出现的键 = 不动。键名不带方案前缀（块名已经说明了）。
+    //   gkeys       同 macros；另外两个相位是数字。
+    //   timer        **只读**：校验形状但绝不落盘，也不改运行状态。
     //
     // 为什么 remap 是"整份替换"而 macros 是"逐键"：remap 在网页上是一个
     // **列表编辑器**（用户勾了一堆规则点保存，页面只知道保存后的完整列表），
     // 逐键语义下用户删掉一条规则就永远删不掉。macros / gkeys 是一个键一个
     // 表单项，各自独立存，网页改 M3 不该动 M1~M2。
-    // ⚠ 这三个必须声明成 **JsonVariant（可变）**而不是 JsonVariantConst：
+    // ⚠ 这些必须声明成 **JsonVariant（可变）**而不是 JsonVariantConst：
     //   doc 本身是可变的 JsonDocument，而 ArduinoJson 7 不允许
     //   JsonVariantConst → JsonArray 这种"加可变性"的转换（只有反向成立），
     //   写成 const 会报 InvalidConversion。
-    JsonVariant jRemap = doc["remap"];
-    if (!jRemap.isNull()) {
-        if (!jRemap.is<JsonArray>()) {
-            snprintf(err, errCap, "remap 应该是数组（下标=方案号）");
+    for (int p = 0; p < TOTAL_PROFILES; p++) {
+        JsonVariant jProf = doc[CFG_PROF_NAMES[p]];
+        if (jProf.isNull()) continue;             // 整个块没提 = 这方案不动
+        // ⚠⚠ 必须是 is<JsonObjectConst>()，**不能**写 is<JsonObject>()。
+        //
+        //   这个坑很阴：写错了**编译得过、运行时恒为 false**、而且不报任何错。
+        //   原因是 ArduinoJson 7 把 is<T>() 拆成了两个重载：
+        //     · Converter<T>::fromJson 的首参**恰好**是 JsonVariantConst 才走真判定
+        //     · 否则命中另一个重载，函数体就一句 `return false;`
+        //   而 Converter<JsonObject>::fromJson 收的是**非 const** 的 JsonVariant
+        //   （Converter<JsonObjectConst>::fromJson 才收 JsonVariantConst），
+        //   所以在 JsonVariantConst 上写 is<JsonObject>() —— 对**任何**输入都返回
+        //   false，包括完全合法的对象。
+        //
+        //   现场表现：只要 JSON 里带这个块，保存必被拒，且报的还是
+        //   "xxx 应该是对象" —— 一句**完全误导**的话，用户会以为 JSON 写错了，
+        //   去检查括号、检查引号，检查一百遍也查不出来。
+        if (!jProf.is<JsonObjectConst>()) {
+            snprintf(err, errCap, "\"%s\" 应该是对象 (含 remap / macros 两个子项)",
+                     CFG_PROF_NAMES[p]);
             return -1;
         }
-        JsonArray ra = jRemap.as<JsonArray>();
-        if (ra.size() > (size_t)TOTAL_PROFILES) {
-            snprintf(err, errCap, "remap 最多 %d 个方案，收到 %u 个",
-                     TOTAL_PROFILES, (unsigned)ra.size());
-            return -1;
-        }
-        for (size_t p = 0; p < ra.size(); p++) {
-            JsonVariant one = ra[p];
-            if (!one.is<JsonArray>()) {
-                snprintf(err, errCap, "remap[%u] 应该是规则数组", (unsigned)p);
+        JsonObjectConst profObj = jProf.as<JsonObjectConst>();
+
+        // ---- remap ----
+        JsonVariantConst jRemap = profObj["remap"];
+        if (!jRemap.isNull()) {
+            if (!jRemap.is<JsonArrayConst>()) {
+                snprintf(err, errCap, "\"%s\".remap 应该是规则数组"
+                         "(形如 [{\"from\":128,\"to\":131}])", CFG_PROF_NAMES[p]);
                 return -1;
             }
-            JsonArray arr = one.as<JsonArray>();
-            if (arr.size() > (size_t)MAX_REMAP_RULES) {
-                snprintf(err, errCap, "方案%d 的映射有 %u 条，上限 %d",
-                         (int)p + 1, (unsigned)arr.size(), MAX_REMAP_RULES);
+            JsonArrayConst ra = jRemap.as<JsonArrayConst>();
+            if (ra.size() > (size_t)MAX_REMAP_RULES) {
+                snprintf(err, errCap, "\"%s\".remap 有 %u 条,上限 %d",
+                         CFG_PROF_NAMES[p], (unsigned)ra.size(), MAX_REMAP_RULES);
                 return -1;
             }
-            for (size_t i = 0; i < arr.size(); i++) {
-                JsonVariant r = arr[i];
-                if (!r.is<JsonObject>()) {
-                    snprintf(err, errCap, "remap[%u][%u] 应该是 {\"from\":…,\"to\":…}",
-                             (unsigned)p, (unsigned)i);
+            for (size_t i = 0; i < ra.size(); i++) {
+                JsonVariantConst r = ra[i];
+                if (!r.is<JsonObjectConst>()) {
+                    snprintf(err, errCap, "\"%s\".remap[%u] 应该是 {\"from\":...,\"to\":...}",
+                             CFG_PROF_NAMES[p], (unsigned)i);
                     return -1;
                 }
                 JsonVariantConst fv = r["from"];
                 JsonVariantConst tv = r["to"];
                 if (!fv.is<int>() || !tv.is<int>()) {
-                    snprintf(err, errCap, "remap[%u][%u] 的 from/to 应该是数字",
-                             (unsigned)p, (unsigned)i);
+                    snprintf(err, errCap, "\"%s\".remap[%u] 的 from/to 应该是数字",
+                             CFG_PROF_NAMES[p], (unsigned)i);
                     return -1;
                 }
                 long fk = fv.as<long>(), tk = tv.as<long>();
                 // 键码是 uint16。越界的绝大多数是手抄错了（比如把 224 写成 2224），
                 // 夹到 65535 只会让那颗键彻底没反应，必须点名拒掉。
                 if (fk < 0 || fk > 65535 || tk < 0 || tk > 65535) {
-                    snprintf(err, errCap, "remap[%u][%u] 键码超出 0~65535（收到 %ld→%ld）",
-                             (unsigned)p, (unsigned)i, fk, tk);
+                    snprintf(err, errCap, "\"%s\".remap[%u] 键码超出 0~65535(收到 %ld->%ld)",
+                             CFG_PROF_NAMES[p], (unsigned)i, fk, tk);
+                    return -1;
+                }
+            }
+        }
+
+        // ---- macros ----
+        JsonVariantConst jMacros = profObj["macros"];
+        if (!jMacros.isNull()) {
+            if (!jMacros.is<JsonObjectConst>()) {
+                snprintf(err, errCap, "\"%s\".macros 应该是对象 (形如 {\"M7\": \"SEQ:...\"})",
+                         CFG_PROF_NAMES[p]);
+                return -1;
+            }
+            for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
+                const char* k = kv.key().c_str();
+                char nk[16];
+                // 键名在这里就地翻译成 NVS 键名，顺带把"方案号与所在块不符"、
+                // 前导零、槽位越界这些一次性挑出来，并且都带上具体原因。
+                if (!cfgMacroNvsKey(p, k, nk, sizeof(nk), err, errCap)) return -1;
+                JsonVariantConst v = kv.value();
+                if (v.isNull()) continue;              // null = 删掉这个宏，合法
+                if (!v.is<const char*>()) {
+                    snprintf(err, errCap, "宏 %s 的值应该是字符串", k);
+                    return -1;
+                }
+                if (strlen(v.as<const char*>()) > CFG_MACRO_MAX) {
+                    snprintf(err, errCap, "宏 %s 超过 %d 字节", k, (int)CFG_MACRO_MAX);
                     return -1;
                 }
             }
         }
     }
 
-    JsonVariantConst jMacros = doc["macros"];
-    if (!jMacros.isNull()) {
-        if (!jMacros.is<JsonObject>()) {
-            snprintf(err, errCap, "macros 应该是对象（\"p0_M1\": \"SEQ:…\"）");
-            return -1;
-        }
-        for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
-            const char* k = kv.key().c_str();
-            if (!cfgMacroKeyValid(k)) {
-                snprintf(err, errCap, "宏键名 \"%s\" 不合法（要写成 p<方案0~%d>_M<%d~%d>）",
-                         k, TOTAL_PROFILES - 1, 1, MACRO_SLOTS);
-                return -1;
-            }
-            JsonVariantConst v = kv.value();
-            if (v.isNull()) continue;              // null = 删掉这个宏，合法
-            if (!v.is<const char*>()) {
-                snprintf(err, errCap, "宏 %s 的值应该是字符串", k);
-                return -1;
-            }
-            if (strlen(v.as<const char*>()) > CFG_MACRO_MAX) {
-                snprintf(err, errCap, "宏 %s 超过 %d 字节", k, (int)CFG_MACRO_MAX);
-                return -1;
-            }
-        }
-    }
-
     JsonVariantConst jGkeys = doc["gkeys"];
     if (!jGkeys.isNull()) {
-        if (!jGkeys.is<JsonObject>()) {
+        // 同上：JsonVariantConst 上必须用 Const 版，见 macros 那段的详细说明
+        if (!jGkeys.is<JsonObjectConst>()) {
             snprintf(err, errCap, "gkeys 应该是对象");
             return -1;
         }
@@ -5845,7 +5952,7 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
                 }
                 int ph = v.as<int>();
                 if (ph < 0 || ph > 1) {
-                    snprintf(err, errCap, "%s 只能是 0 或 1，收到 %d", k, ph);
+                    snprintf(err, errCap, "%s 只能是 0 或 1,收到 %d", k, ph);
                     return -1;
                 }
                 continue;
@@ -5854,8 +5961,16 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
         }
     }
 
-    if (nPend == 0 && jRemap.isNull() && jMacros.isNull() && jGkeys.isNull()) {
-        snprintf(err, errCap, "一个认识的字段都没有");
+    // "什么都没给"要拒：否则网页把整份配置发空了，固件回 OK:0，页面显示
+    // "已保存 0 项"，用户以为存上了，其实什么都没发生。
+    // timer 单独算：它是只读的，一份只带 timer 的 JSON 等于什么都没要求。
+    bool anyScheme = false;
+    for (int p = 0; p < TOTAL_PROFILES; p++) {
+        JsonVariantConst jProf = doc[CFG_PROF_NAMES[p]];
+        if (!jProf.isNull() && jProf.is<JsonObjectConst>()) { anyScheme = true; break; }
+    }
+    if (nPend == 0 && !anyScheme && doc["gkeys"].isNull()) {
+        snprintf(err, errCap, "一个认识的字段都没有(timer 是只读的,不算)");
         return -1;
     }
 
@@ -5881,45 +5996,62 @@ for (int i = 0; i < nPend; i++) {
     btLinkKeepAlive();
 }
 
-// ---- 方案三块：落盘 ----
+// ---- 方案块：落盘 ----
 //
-// 标量写完了才动这三块。顺序无所谓（三块互不相干），但**都在显式提交之前**，
+// 标量写完了才动这些块。顺序无所谓（互不相干），但**都在显式提交之前**，
 // 这样回 OK 的时候它们已经一起进了 flash。
 int nScheme = 0;   // 方案类改动条数，只用来给 HUD/日志报个数
 
-// remap：出现的方案整份替换（空数组 = 清空）
-if (!jRemap.isNull()) {
-    JsonArray ra = jRemap.as<JsonArray>();
-    for (size_t p = 0; p < ra.size(); p++) {
-        JsonArray arr = ra[p].as<JsonArray>();
+// timer：**只读，刻意不落盘**。原因见 cfgBuildJson 里 timer 那段。
+// 这里显式记一笔，免得以后有人看到"JSON 里有 timer 却没人写它"以为是漏了。
+{
+    JsonVariantConst jTimer = doc["timer"];
+    if (!jTimer.isNull())
+        ELINFO("CFG", "timer 是只读的,已忽略(倒计时是运行时状态,断电归零)");
+}
+
+// 每个方案块：remap 整份替换 + macros 逐键写/删
+for (int p = 0; p < TOTAL_PROFILES; p++) {
+    JsonVariantConst jProf = doc[CFG_PROF_NAMES[p]];
+    if (jProf.isNull() || !jProf.is<JsonObjectConst>()) continue;
+    JsonObjectConst profObj = jProf.as<JsonObjectConst>();
+
+    // remap：出现的方案整份替换（空数组 = 清空）
+    JsonVariantConst jRemap = profObj["remap"];
+    if (!jRemap.isNull()) {
+        JsonArrayConst ra = jRemap.as<JsonArrayConst>();
         RemapRule tmp[MAX_REMAP_RULES];
         int n = 0;
-        for (size_t i = 0; i < arr.size() && n < MAX_REMAP_RULES; i++) {
-            tmp[n].fromKey = normalizeRemapKey((uint16_t)arr[i]["from"].as<long>());
-            tmp[n].toKey   = normalizeRemapKey((uint16_t)arr[i]["to"].as<long>());
+        for (size_t i = 0; i < ra.size() && n < MAX_REMAP_RULES; i++) {
+            tmp[n].fromKey = normalizeRemapKey((uint16_t)ra[i]["from"].as<long>());
+            tmp[n].toKey   = normalizeRemapKey((uint16_t)ra[i]["to"].as<long>());
             n++;
         }
         // 整份替换，所以 n==0 就是"清空这个方案"
-        cfgStoreRemap((int)p, tmp, n);
+        cfgStoreRemap(p, tmp, n);
         nScheme += n;
     }
-}
 
-// macros：逐键写 / 删（值为 null 或 "" = 删）
-if (!jMacros.isNull()) {
-    for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
-        const char* k = kv.key().c_str();
-        JsonVariantConst v = kv.value();
-        const char* val = v.isNull() ? "" : v.as<const char*>();
-        if (val[0] == '\0') {
-            preferences.remove(k);
-            ELINFO("CFG", "宏 %s 已删", k);
-        } else {
-            preferences.putString(k, val);
-            ELINFO("CFG", "宏 %s 已写 %u 字节", k, (unsigned)strlen(val));
+    // macros：逐键写 / 删（值为 null 或 "" = 删）
+    // 键名在这里第二次翻译成 NVS 键名 —— 校验段已经保证翻译一定成功。
+    JsonVariantConst jMacros = profObj["macros"];
+    if (!jMacros.isNull()) {
+        for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
+            const char* k = kv.key().c_str();
+            char nk[16];
+            if (!cfgMacroNvsKey(p, k, nk, sizeof(nk), err, errCap)) return -1;
+            JsonVariantConst v = kv.value();
+            const char* val = v.isNull() ? "" : v.as<const char*>();
+            if (val[0] == '\0') {
+                preferences.remove(nk);
+                ELINFO("CFG", "宏 %s(%s) 已删", nk, k);
+            } else {
+                preferences.putString(nk, val);
+                ELINFO("CFG", "宏 %s(%s) 已写 %u 字节", nk, k, (unsigned)strlen(val));
+            }
+            nScheme++;
+            btLinkKeepAlive();
         }
-        nScheme++;
-        btLinkKeepAlive();
     }
 }
 
@@ -7922,6 +8054,17 @@ void setup() {
     saverMode = preferences.getUChar("saver_mode", SAVER_OFF);
     if (saverMode >= TOTAL_SAVER_MODES) saverMode = SAVER_OFF;
     currentProfile = preferences.getUChar("curr_prof", 0);
+    // ⚠ 方案从 4 个砍到 2 个（Windows / macOS）之后，NVS 里很可能还躺着
+    //   curr_prof = 2 或 3 —— 那是旧固件存进去的"方案 3 / 方案 4"。
+    //   **必须钳位**，不然 currentProfile 会越界去索引 profileRemaps[2]，
+    //   那是在 .bss 里读一个根本不存在的方案的映射表（拿到的是相邻内存，
+    //   表现是"开机后按某颗键发出一条莫名其妙的键码"，极难查）。
+    //   越界值一律归到 0（Windows），并喊一嗓子，别静悄悄地换掉用户的设置。
+    if (currentProfile >= TOTAL_PROFILES) {
+        ELWARN("CFG", "NVS 里的 curr_prof=%u 已超出方案数 %d,归到方案0",
+               (unsigned)currentProfile, (int)TOTAL_PROFILES);
+        currentProfile = 0;
+    }
     totalKeyCount = preferences.getUInt("keyCount", 0);
 
     // 今日击键：先按 NVS 的 today_y 比对本地今天，若不同则视作跨日清零。
