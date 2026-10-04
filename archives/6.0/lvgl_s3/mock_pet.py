@@ -166,5 +166,73 @@ for i, (pose, *_rest) in enumerate(SCREENS):
         .save(f"mock_pet_{s[0]}.png")
 
 img.resize((img.width * 2, img.height * 2), Image.NEAREST).save("mock_pet.png")
+
+
+# ================= 场景 2：随机探头（SCENE_PEEK）=====================
+# 临时浮层，5~8s 后自动消失，长按 LOGO 收回去。
+# 贴在**底部横条**而不是屏幕中央：主屏 7 种风格的内容重心都在中上部，
+# 底部横条是唯一不打架的位置。
+def build_peek(pose, name, lines, close_hint="长按 LOGO 收起我"):
+    """底下是极客仪表盘的简化版，证明横条确实不挡主内容。"""
+    im, d = new_screen(pose)
+
+    # ---- 底下：主屏内容（简化示意，真实布局见各 build_style_*）----
+    d.text((120, 64), "23:47", font=f(LATIN_B, 40), fill=rgb(CLR_TEXT), anchor="mm")
+    d.text((120, 112), "10月4日 星期日", font=f(CJK, 16),
+           fill=rgb(CLR_TEXT_DIM), anchor="mm")
+    d.rounded_rectangle((16, 130, 110, 140), radius=5, fill=rgb(CLR_SURFACE_2))
+    d.rounded_rectangle((16, 130, 86, 140), radius=5, fill=rgb(CLR_AMBER))
+    d.rounded_rectangle((130, 130, 224, 140), radius=5, fill=rgb(CLR_SURFACE_2))
+    d.rounded_rectangle((130, 130, 178, 140), radius=5, fill=rgb(CLR_GREEN))
+
+    # ---- 探头横条：y=168..240，h=72 ----
+    d.rectangle((0, 168, 239, 239), fill=rgb(0x141A26))
+    d.line((0, 168, 239, 168), fill=rgb(CLR_STROKE), width=1)
+
+    # 猫头：r=26，中心 (36, 204) —— 只画头，肩膀在横条外，看起来像"探出来"
+    cx, cy = 36, 204
+    d.ellipse((cx - 20, cy - 26, cx + 20, cy + 14), fill=rgb(CLR_PET))
+    d.ellipse((cx - 21, cy - 30, cx - 7, cy - 16), fill=rgb(CLR_PET))
+    d.ellipse((cx + 7, cy - 30, cx + 21, cy - 16), fill=rgb(CLR_PET))
+    d.ellipse((cx - 18, cy - 26, cx - 12, cy - 20), fill=rgb(CLR_PET_DARK))
+    d.ellipse((cx + 12, cy - 26, cx + 18, cy - 20), fill=rgb(CLR_PET_DARK))
+    for sx in (-1, 1):                      # 眼睛
+        ex = cx + sx * 8
+        d.ellipse((ex - 4, cy - 12, ex + 4, cy - 4), fill=rgb(0x1A1A1A))
+    d.polygon([(cx - 3, cy - 1), (cx + 3, cy - 1), (cx, cy + 2)], fill=rgb(0xD2694A))
+    d.arc((cx - 8, cy - 2, cx, cy + 7), 0, 110, fill=rgb(0x1A1A1A), width=2)
+    d.arc((cx, cy - 2, cx + 8, cy + 7), 70, 180, fill=rgb(0x1A1A1A), width=2)
+
+    # 台词：x=64..232 = 168px -> 每行 10 字
+    #   横条 72px 只装得下 3 行（72 / 19 = 3.8），所以是「2 行台词 + 1 行关闭提示」。
+    #   ✕ 放在**提示行右端**而不是第一行右上角 —— 放右上角会吃掉台词第一行的宽度，
+    #   放提示行右端则整个 168px 都能给台词。
+    for i, ln in enumerate(lines):
+        d.text((64, 171 + 19 * i), ln, font=f(CJK, 16),
+               fill=rgb(CLR_TEXT if i == 0 else CLR_TEXT_DIM), anchor="la")
+    d.text((64, 171 + 19 * 2), close_hint, font=f(CJK, 16),
+           fill=rgb(CLR_TEXT_DIM), anchor="la")
+
+    # 关闭按钮：提示行右端 16px 圆 + 叉（x=212..228, y=211..227）
+    d.ellipse((212, 211, 228, 227), outline=rgb(CLR_TEXT_DIM), width=1)
+    d.line((216, 215, 224, 223), fill=rgb(CLR_TEXT_DIM), width=1)
+    d.line((224, 215, 216, 223), fill=rgb(CLR_TEXT_DIM), width=1)
+    return im
+
+
+PEEKS = [
+    ("greet",  "小橘", ["你回来啦！", "我等了你 12 分钟"]),
+    ("hungry", "小橘", ["肚子叫了…", "喂我一口好不好"]),
+]
+
+peek_sheet = Image.new("RGB", (W * len(PEEKS) + GAP, H), rgb(0x05070C))
+for i, (pose, name, lines) in enumerate(PEEKS):
+    peek_sheet.paste(build_peek(pose, name, lines), (i * (W + GAP), 0))
+
+peek_sheet.resize((peek_sheet.width * 2, peek_sheet.height * 2), Image.NEAREST)\
+    .save("mock_pet_peek.png")
+build_peek(*PEEKS[0]).resize((W * S, H * S), Image.NEAREST).save("mock_pet_peek_greet.png")
+
 print("写出 mock_pet.png / mock_pet_idle.png / mock_pet_greet.png / mock_pet_hungry.png")
-print(f"对话气泡宽 216px，16px 中文每行最多 {216 // 16} 字")
+print("写出 mock_pet_peek.png / mock_pet_peek_greet.png")
+print(f"全屏对话气泡宽 216px，每行最多 {216 // 16} 字；探头台词宽 168px，每行 {168 // 16} 字")
