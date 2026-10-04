@@ -292,14 +292,46 @@ void btLinkStreamResetThrottle() { s_streamLastMs = 0; }
 
 // ============================================================ 发送：流式大块
 
+// 往单槽里塞数据的唯一入口（定义在下面 btLinkStreamBegin 之后，这里先前置声明，
+// 好让 StreamBegin 能用它发长度握手行）。
+static bool streamFeed(const void* data, size_t len);
+
 bool btLinkStreamBegin(const char* verb, const char* key, size_t totalLen) {
-    (void)totalLen;   // 只是诊断信息，协议不依赖它
     if (!btLinkReady() || s_st.active) return false;
     if (!headOk(verb, key)) return false;
     memset(&s_st, 0, sizeof(s_st));
     s_st.active = true;
     copyField(s_st.verb, sizeof(s_st.verb), verb);
     copyField(s_st.key,  sizeof(s_st.key),  key);
+    // ---- 先发一条长度握手行：`<VERB>:<KEY>:LEN:<总字节数>` ----
+    //
+    // ⚠ 为什么必须有它：正文是分片发的，**丢片是可以发生且静默的**。
+    //   一条 ATT 通知带不下就被协议栈整条丢掉（README 里那个 20 字节的例子），
+    //   而收尾标记 END 照样会到。于是主机拿着一个**缺了一截**的正文去
+    //   JSON.parse —— 运气好会报 "unexpected end of input"，运气不好
+    //   （正好切在某个 `}` 上）就成了一份**语法合法但缺内容**的配置，
+    //   页面会照着它显示、甚至照着它回写，把缺掉的那部分配置**清零**。
+    //   主机手里没有总长就只有"看着像完整的"这一个依据。
+    //
+    //   有了 LEN 行，主机在收到 END 时拿实际字节数和它对一遍，对不上就
+    //   明确报"传输丢片"而不是往下走。这条握手本身也占一个包，
+    //   代价是每条流多 1 包，换掉一整类静默数据损坏，很划算。
+    //
+    // ⚠⚠ 它是**和正文第一片连在同一个 body 里**发出的，不是独立的一行，
+    //   而这不是偷懒，是 20 字节预算下唯一的发法，别去"修"：
+    //     · 每片正文只有 chunkRoom = BT_PAYLOAD_MAX - 头长 - 1 = 20-10-1
+    //       = **9 字节**（key 是 1~4 位请求号，CFGDUMP 的头 10 字节）
+    //     · 想让 "LEN:20480" 独立成行，得占 9 字节正文 + 1 字节换行 = 10 > 9
+    //     · 硬凑的话分片会从这一行中间切开，网页每片各自带 `VERB:KEY:` 头，
+    //       切出来的行是 "LEN:2048" 和 "0" 两段，**永远拼不回 "LEN:20480"**
+    //   所以这里塞进流式单槽的开头，和 JSON 首片连续存放；主机侧必须把
+    //   `LEN:<n>{...` 这种粘连形态一起认掉（见 s3-setting.html 的 _onLine）。
+    //   代价是单槽前 8~10 字节被占掉，JSON 的第一片从那儿接上。
+    {
+        char lenLine[32];
+        int n = snprintf(lenLine, sizeof(lenLine), "LEN:%u", (unsigned)totalLen);
+        if (n > 0) streamFeed(lenLine, (size_t)n);
+    }
     s_criticalUntil = millis() + BT_CRITICAL_HOLD_MS;
     return true;
 }
@@ -387,11 +419,36 @@ static bool pumpOne() {
         s_st.pos = (uint16_t)(s_st.pos + n);
         return true;
     }
-    // 缓冲喂空了但还没 End()：不能收尾，等调用方继续喂。
-    if (s_st.active && s_st.closed && s_st.pos >= s_st.fill) {
-        emitEnd(s_st.verb, s_st.key);
-        s_st.active = false;
-        return true;   // END 本身也算一包，让调用方看到进度
+    // ---- 单槽回收：这一批发完了，把 buf 腾空让调用方接着喂 ----
+    //
+    // ⚠⚠ 这一段是整个流式发送的**命门**，缺了它会死锁，而且症状极像"蓝牙慢"：
+    //   没有回收时 s_st.fill 只会单调涨到 BT_TX_BODY_MAX 再也不动，于是
+    //     · btLinkStreamRoom() 从此恒为 0
+    //     · 调用方(cfgJsonPump / logDumpPump)每次都撞在 `room == 0` 上，
+    //       游标永远推不动
+    //     · 于是永远调不到 btLinkStreamEnd()，网页**永远收不到收尾标记**
+    //   现场表现是两段式的，很容易被误判成"网络问题"：
+    //     · 第一次拉取：静默卡住 → 网页等满 15 秒报"一个字节都没收到"
+    //       （其实前面的片都到了，只是没有 END 让它兑现）
+    //     · 之后每次拉取：固件那边 cfgTxActive 已经是 true，
+    //       一律回 CFGERR「上一次还没发完，稍后重试」——**再也回不来了**，
+    //       除非重启键盘。
+    //   凡是走 btLinkStream* 的都受这条管：配置 JSON、以及 logDumpPump 的
+    //   8KB 日志回拉（所以"回拉大日志"以前其实也只能发出头 240 字节）。
+    //
+    // 回收的时机是"这一批 pos 追上 fill 了" —— 此刻 buf 里的内容已经全部
+    // 交给 emitChunk，清掉不会重发。closed 为真说明调用方喂完了，趁机补
+    // 收尾标记并把槽释放掉。
+    if (s_st.active && s_st.pos >= s_st.fill) {
+        s_st.fill = 0;
+        s_st.pos  = 0;
+        if (s_st.closed) {
+            emitEnd(s_st.verb, s_st.key);
+            s_st.active = false;
+            return true;   // END 本身也算一包，让调用方看到进度
+        }
+        // 还没 End()：不能收尾，等调用方继续喂。
+        return false;
     }
     return false;
 }

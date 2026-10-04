@@ -221,6 +221,14 @@ void btLinkStreamResetThrottle();
 //       btLinkStreamEnd();
 //   }
 //
+// ⚠ **total 不是"诊断信息"，协议真的依赖它。** StreamBegin 之后、正文第一片
+//   之前会先发一条 `<VERB>:<KEY>:LEN:<总字节数>`，主机收到 END 时拿它和实际
+//   收到的字节数对一遍，对不上就报"传输丢片"而不是把残缺正文交出去。
+//   （早期版本这里写的是 `(void)totalLen`，于是主机没有任何办法察觉自己
+//   收到的是一份缺了片的配置 —— 而缺片是**静默**的：一条 ATT 通知带不下
+//   就被协议栈整条丢掉，收尾标记 END 照样会到。最坏情况下那份残缺正文
+//   恰好还是合法 JSON，于是页面照着它回写，缺掉的字段被静默清零。）
+//
 // 背压：单槽缓冲（BT_TX_BODY_MAX），喂满了 btLinkStreamWrite 返回 false，
 // 调用方下一轮 loop 再喂。整段数据任何时刻只有一份副本，且落在 .bss 不吃栈。
 bool btLinkStreamBegin(const char* verb, const char* key, size_t totalLen);

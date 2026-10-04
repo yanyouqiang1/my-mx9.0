@@ -158,16 +158,45 @@ static void logDumpPump(void);
 //   报"解析失败"而看不出真因。所以网页发之前必须压成一行（JS 那边用
 //   JSON.stringify 不带缩进）。这一条比看上去要紧：一个缩进过的 400 字节
 //   JSON 直发必然失败。
-#define CFG_SCHEMA_VERSION    1
+// v1 = 十三个标量小配置。
+// v2 = 加上**方案那一整套**：remap（4 方案 × 最多 32 条）、macros（4×12）、
+//      gkeys（MA/MB 双状态 + 相位）。也就是"除了 ME 文本和壁纸，
+//      键盘里存的配置全部走这一份 JSON"。
+#define CFG_SCHEMA_VERSION    2
 
-#define CFG_TX_BUF_SIZE       1536    // 组 JSON 用的缓冲
-#define CFG_RX_BUF_SIZE       2048    // 收 JSON 用的缓冲
+// 缓冲大小。
+//
+// ⚠⚠ 这里原来是 .bss 上的 1536 / 2048 固定数组，**加进方案就不够了**：
+//   48 个宏 × (键名 7 + 引号 2 + 正文上限 CFG_MACRO_MAX) ≈ 12.7KB
+//   4 方案 × 32 条 remap × `{"from":255,"to":255}` ≈ 3.3KB
+//   gkeys 6 个 payload × CFG_GKEY_MAX ≈ 1.5KB
+//   标量 ≈ 0.4KB
+//   → 最坏 ~18KB。而 18KB × 2（收发各一份）硬塞进 .bss 会白吃 36KB 静态 RAM，
+//   这块板子内部 DRAM 本来就紧（构建时报 29.5%）。所以改成**按需 ps_malloc**。
+//
+// 20KB 是够的：上面算出来的最坏值约 18KB，留了两成余量。分配失败会明确回
+// CFGERR，绝不"截断成一份看着挺像样的半份 JSON"再发出去 —— 那种错在网页那边
+// 报成 "unexpected end of input"，极难查（见 cfgBuildJson 的注释）。
+#define CFG_BUF_SIZE          20480
 
-// 组 JSON 用的缓冲。1536 字节对现在这十几个字段（约 350 字节压缩后）余量很大，
-// 但**加进按键映射 / 宏之后会不够** —— 那时改成 ps_malloc，别硬撑在 .bss 上。
-static char  cfgTxBuf[CFG_TX_BUF_SIZE];
-// 收 JSON 用的缓冲。同样是 .bss 固定数组（不做动态分配，省掉一条失败路径）。
-static char  cfgRxBuf[CFG_RX_BUF_SIZE];
+// 单个宏 / 单个全局动作 payload 的正文上限。
+// 取 256 是因为**收侧一行的物理上限就是 256 字节**（BT_RX_BUF_SIZE）——
+// 老协议一条 SET: 指令最多也就带 256 字节，所以磁盘上不可能有更长的。
+// 这里照同一个数收，两边口径一致；超了直接报错，不静默截断。
+#define CFG_MACRO_MAX         256
+#define CFG_GKEY_MAX          256
+
+static char* cfgTxBuf = nullptr;    // 组 JSON 用的缓冲（ps_malloc）
+static char* cfgRxBuf = nullptr;    // 收 JSON 用的缓冲（ps_malloc）
+// cfgBuildJson 失败时的原因。**必须**带出来而不是只回一句"生成失败"：
+// 失败原因有好几种（文档装不下 / 缓冲不够 / 含换行），对应的处理完全不同，
+// 而网页过去把 CFGERR 整个丢掉了，最后统一显示成"一个字节都没收到"。
+static char  cfgBuildErr[64] = {0};
+
+// 收发两个缓冲各要一份，首次用到时分配、之后一直留着（进程生命周期内不释放：
+// 释放了又得处理"释放后有人还在用"的窗口，收益为零）。
+// 函数体在下面"配置 JSON：一张表驱动"那一段（elog.h 是后段才 include 的，
+// 这里用不了 ELERR）。
 
 // 一条 CFGDATA 能带多少正文。收侧单行上限是 BT_RX_BUF_SIZE(256)，
 // 去掉 "CFGDATA:"(8) 和结尾的 '\0'，实际能装 247 —— 取 200 留足余量，
@@ -216,6 +245,7 @@ static uint8_t cfgPend = 0;
 
 // 实现都在 handleCommand 前面那一段（"配置 JSON"），loop() 里只调 cfgJsonPump
 // 和 cfgPostPump。
+static bool   cfgBufEnsure(void);
 static size_t cfgBuildJson(char* out, size_t cap);
 static int    cfgApplyJson(const char* json, size_t len, char* err, size_t errCap);
 static void   cfgJsonPump(void);
@@ -5266,6 +5296,138 @@ static const CfgField CFG_FIELDS[] = {
 };
 static const size_t CFG_FIELD_COUNT = sizeof(CFG_FIELDS) / sizeof(CFG_FIELDS[0]);
 
+// ---- 方案三件套的键名表（gkeys 用） ----
+//
+// GKEY_SLOT[i] 是 JSON 里的键名，GKEY_NVS[i] 是对应的 NVS 键。
+// 两张表**必须同序同长** —— 一旦错位，写下去的就是"把 A 的值存进了 B 的键"，
+// 而现场毫无异常（只有下次读回来才发现串了）。
+//
+// 这 6 个槽就是固件 GSET: 能写的全部：
+//   MA / MB    老单套全局动作（保留兼容，网页新 UI 不显示但老配置还在）
+//   MAa / MAb  MA 的状态 A / 状态 B
+//   MBa / MBb  MB 的状态 A / 状态 B
+// 相位 g_MA_ph / g_MB_ph 不在这张表里 —— 它是数字不是字符串，单开一处处理。
+static const char* const GKEY_SLOT[] = { "MA", "MB", "MAa", "MAb", "MBa", "MBb" };
+static const char* const GKEY_NVS[]  = { "g_MA", "g_MB", "g_MAa", "g_MAb", "g_MBa", "g_MBb" };
+static const int          GKEY_SLOT_COUNT = (int)(sizeof(GKEY_SLOT) / sizeof(GKEY_SLOT[0]));
+
+// 每个方案的 M 键个数。宏的 NVS 键是 p<方案>_M<序号>，MACROS_RESET 里
+// 硬写的 12、网页的 4×12 批量预加载都是这个数 —— 改一处要改三处。
+#define MACRO_SLOTS 12
+
+// 宏的 NVS 键名校验：必须严格是 p<方案>_M<序号>，方案 0~(TOTAL_PROFILES-1)、
+// 序号 1~MACRO_SLOTS。
+//
+// ⚠ 序号要**按十进制解析**，不能只看第一个字符。第一版图省事写成
+//   `k[4] ∈ ['1', '0' + MACRO_SLOTS/10]` 且 `k[5]=='\0'`，于是 M10~M12
+//   全部被当成非法键名拒掉 —— 而 M1~M9 能过。表现出来就是"保存返回
+//   宏键名 p0_M10 不合法"，用户完全不知道是自己名字打错了还是固件有毛病。
+//
+// ⚠ 为什么要卡得这么死：键名是直接拼进 preferences.putString 的。如果放行
+//   任意字符串，一个手滑的 "p99_M1" 或 "hello" 就会在 NVS 里留下一个**永远
+//   没人读、也永远删不掉**的键 —— 而 NVS 分区只有 20KB 且只增不减，这种键
+//   攒几个就把分区写满了，表现是"别的配置突然存不进去了"。宁可当场报错。
+static bool cfgMacroKeyValid(const char* k) {
+    if (k == nullptr) return false;
+    if (k[0] != 'p' || k[1] < '0' || k[1] > '9' || k[2] != '_' || k[3] != 'M') return false;
+    if (k[1] - '0' >= TOTAL_PROFILES) return false;
+    // ⚠ 还要挡掉**前导零**（"p0_M01"）：它按十进制解析等于槽 1，能过下面那条
+    //   范围检查，但 NVS 里存下的键是 `p0_M01`，而 executeMacro 读的是 `p0_M1`
+    //   —— 两者永远对不上。表现出来就是"保存返回成功、这个宏按 M1 毫无反应"，
+    //   而且那把键还留在 NVS 里谁都删不掉。
+    if (k[4] == '0') return false;                 // 前导零 / 零号
+
+    int slot = 0, digits = 0;
+    for (const char* q = k + 4; *q != '\0'; q++) {
+        if (*q < '0' || *q > '9') return false;   // 出现非数字 = 键名脏了
+        slot = slot * 10 + (*q - '0');
+        if (++digits > 3) return false;            // 防 "p0_M99999999" 溢出
+    }
+    if (digits == 0) return false;                // p0_M 这种半截
+    return slot >= 1 && slot <= MACRO_SLOTS;
+}
+
+// 键名 → GKEY_SLOT 下标；不是那 6 个槽之一就返回 -1。
+static int cfgGkeySlotOf(const char* k) {
+    if (k == nullptr) return -1;
+    for (int i = 0; i < GKEY_SLOT_COUNT; i++) {
+        if (strcmp(k, GKEY_SLOT[i]) == 0) return i;
+    }
+    return -1;
+}
+
+// 某个方案的 remap 整份替换：先删干净旧的，再逐条写新的，最后**回读校验**。
+// 返回实际存住（回读逐条比对通过）的条数。nRules<=0 表示"只清空"。
+//
+// ⚠ 为什么必须回读校验：RAM 里有这份表 ≠ flash 里有这份表。Preferences::put*
+//   写不下新键时返回 0（NVS 分区只有 20KB，是只增不减的日志结构存储），
+//   而当次运行按键照样按 RAM 这份新表工作 —— 表现是"配好了当场能用，
+//   断一次电全没了，再配一次还是不行"。而单条规则通常写得进去（新键少、
+//   旧条目还能就地覆盖），"只配一条正常、配两条就丢"这个不对称正指向这里。
+//   所以以**回读结果**为准，并把存不住这件事摆到屏幕上（别让用户以为成功了）。
+//
+// 这条路径被两处共用：配置 JSON 的 remap 块、老协议 REMAP:<p>:clear:<rules>。
+// 共用是故意的 —— 两条路必须落出**完全一样**的 NVS 布局，否则用户在 JSON 里
+// 改一遍、老协议再存一遍，两边会互相覆盖出不同的结果。
+static int cfgStoreRemap(int prof, const RemapRule* rules, int nRules) {
+    if (prof < 0 || prof >= TOTAL_PROFILES) return 0;
+    if (nRules > MAX_REMAP_RULES) nRules = MAX_REMAP_RULES;
+
+    // 1. 老的全删。⚠ 不能只把条数置 0：那些 rmp_<p>_<i> 键还留在 NVS 里，
+    //    换固件/读档时会诈尸，而且再也清不掉。
+    for (int i = 0; i < MAX_REMAP_RULES; i++) {
+        char itemKey[20];
+        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+        preferences.remove(itemKey);
+        if ((i & 15) == 0) btLinkKeepAlive();
+    }
+    memset(profileRemaps[prof], 0, sizeof(profileRemaps[prof]));
+    remapCounts[prof] = 0;
+    char cntKey[16];
+    snprintf(cntKey, sizeof(cntKey), "rmp_cnt_%d", prof);
+    preferences.putInt(cntKey, 0);
+
+    // 2. 新的逐条写
+    int nvsFail = 0;
+    for (int i = 0; i < nRules; i++) {
+        profileRemaps[prof][i] = rules[i];
+        // ⚠ 必须看返回值，理由见上面的注释
+        char itemKey[20];
+        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+        uint32_t val = ((uint32_t)rules[i].fromKey << 16) | (uint32_t)rules[i].toKey;
+        if (preferences.putUInt(itemKey, val) == 0) nvsFail++;
+        remapCounts[prof] = i + 1;
+        btLinkKeepAlive();      // 每写一条喂一次狗，见 cfgApplyJson 第二遍那段
+    }
+    preferences.putInt(cntKey, remapCounts[prof]);
+
+    // 3. 回读校验：条数 + 每一条的两个键，都重新比一遍
+    int stored = preferences.getInt(cntKey, -1);
+    if (stored != remapCounts[prof]) nvsFail++;
+    int verified = 0;
+    for (int i = 0; i < remapCounts[prof]; i++) {
+        char itemKey[20];
+        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
+        uint32_t back = preferences.getUInt(itemKey, 0xFFFFFFFFUL);
+        uint16_t rf = normalizeRemapKey((uint16_t)(back >> 16));
+        uint16_t rt = normalizeRemapKey((uint16_t)(back & 0xFFFF));
+        if (rf == profileRemaps[prof][i].fromKey && rt == profileRemaps[prof][i].toKey) verified++;
+    }
+    // flash 里的东西不可信 → 把 RAM 也对齐成"实际存住的那部分"，
+    // 否则当次运行看起来正常、下次开机又变样，更没法查。
+    if (nvsFail > 0) remapCounts[prof] = verified;
+
+    ELINFO("REMAP", "方案%d 保存 %d 条 回读通过 %d 条 失败 %d",
+           prof + 1, remapCounts[prof], verified, nvsFail);
+    if (nvsFail > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "只存住 %d/%d 条", verified, remapCounts[prof]);
+        ELERR("REMAP", "%s NVS分区可能已满", buf);
+        triggerHud("按键重映射", buf, lv_color_hex(CLR_RED));
+    }
+    return verified;
+}
+
 // 落盘：按类型挑 put* 函数。新加一个类型记得在这加一个 case ——
 // 漏了的话字段会被"应用成功但重启后丢失"，而且现场毫无异常。
 //
@@ -5287,12 +5449,55 @@ static void cfgPutNvs(size_t idx) {
     }
 }
 
+// ============================ 缓冲分配 ============================
+//
+// 函数体放在这里而不是文件顶部那一段，是因为 ELERR 来自 elog.h，而 elog.h 是
+// 本文件后段才 include 的（顶部只有 ArduinoJson / bt_link.h）。
+//
+// 放在 PSRAM：编译带了 -DBOARD_HAS_PSRAM / -DBOARD_HAS_PSRAM_NOW，ps_malloc 会
+// 优先从 8MB PSRAM 里切，内部 DRAM 一字节不占。分配失败必须明确报错，
+// **不能退回固定小缓冲** —— 那等于把 v2 的配置静默截断成半份。
+//
+// ⚠ 两份都多要 1 字节：收侧最后要在 cfgRxBuf[cfgRxLen] 写一个 '\0'，而
+//   cfgRxLen 最大能等于 CFG_BUF_SIZE（声明总长恰好等于上限时）。按 CFG_BUF_SIZE
+//   正好分配的话，这一写就越界一个字节。
+static bool cfgBufEnsure(void) {
+    if (cfgTxBuf == nullptr) {
+        cfgTxBuf = (char*)ps_malloc(CFG_BUF_SIZE + 1);
+        if (cfgTxBuf == nullptr) {
+            ELERR("CFG", "ps_malloc %d 字节（发送）失败", (int)(CFG_BUF_SIZE + 1));
+            return false;
+        }
+    }
+    if (cfgRxBuf == nullptr) {
+        cfgRxBuf = (char*)ps_malloc(CFG_BUF_SIZE + 1);
+        if (cfgRxBuf == nullptr) {
+            ELERR("CFG", "ps_malloc %d 字节（接收）失败", (int)(CFG_BUF_SIZE + 1));
+            return false;
+        }
+    }
+    return true;
+}
+
 // ============================ 下载：固件 → 网页 ============================
 //
 // 生成压缩成一行的 JSON（不能有 \n / \r，理由见 CFG_RX_CHUNK_MAX 那段）。
 // 返回写出的字节数（不含结尾的 '\0'）。放不下就返回 0，调用方负责报错 ——
 // 宁可让网页看到"缓冲不足"，也不要静默截断出一份语法不完整、看着还挺像样的
 // JSON：那种错误会在网页那边报成"某一行 unexpected end of input"，极难查。
+//
+// v2 在十三个标量之外多三块**方案**数据。三块的取舍不一样，先说清楚：
+//
+// · remap  —— 发**定长**的 4 个数组（一个方案一个，没规则就是空数组 []）。
+//            必须发空数组：数组一旦缺项，"这个方案没规则"和"这个方案没提"
+//            就分不开了，而后者按本模块的规矩是"不动"，会让"清空某方案"
+//            根本清不掉。
+// · macros —— 发**稀疏**对象，只带真正设过的键（"p0_M1": "SEQ:ab"）。
+//            48 个键全发的话光键名就 400 多字节，而绝大多数人只设了三五个。
+//            没设过的键**压根不出现**（不是 null）："清空某个宏"在网页上
+//            就是把那一行删掉，少一个键 = 删一个宏，语义正好。
+// · gkeys  —— 同上稀疏，但两个相位（MA_ph / MB_ph）**永远发**，因为 0
+//            是合法值，"没发"和"是 0"必须能区分开。
 static size_t cfgBuildJson(char* out, size_t cap) {
     JsonDocument doc;
     doc["version"] = CFG_SCHEMA_VERSION;
@@ -5305,10 +5510,94 @@ static size_t cfgBuildJson(char* out, size_t cap) {
             case CFG_U32:  doc[f.key] = *(uint32_t*)f.var;   break;
         }
     }
+
+    // ---- remap：4 个定长数组，下标 = 方案号 ----
+    //
+    // 走 RAM 里的 profileRemaps / remapCounts，不现读 NVS：这两个数组是
+    // setup() 里已经把 NVS 全load进来过的运行时副本，读它和读 NVS 等价，
+    // 但省掉 128 次 NVS 查表（每次都要走一遍分区查找）。
+    JsonArray remap = doc["remap"].to<JsonArray>();
+    for (int p = 0; p < TOTAL_PROFILES; p++) {
+        JsonArray one = remap.add<JsonArray>();
+        int cnt = remapCounts[p];
+        if (cnt > MAX_REMAP_RULES) cnt = MAX_REMAP_RULES;   // 被人手改过 NVS 时的兜底
+        for (int i = 0; i < cnt; i++) {
+            JsonObject r = one.add<JsonObject>();
+            r["from"] = (uint16_t)profileRemaps[p][i].fromKey;
+            r["to"]   = (uint16_t)profileRemaps[p][i].toKey;
+        }
+    }
+
+    // ---- macros：稀疏对象，只带真正设过的 ----
+    //
+    // ⚠ 这里会连着做 48 次 preferences.getString。每次都是一次 NVS 查表 +
+    //   一次 String 堆分配，函数体又跑在 handleCommand 里（主任务，压着
+    //   10 秒看门狗）。所以每 8 个键喂一次狗 —— 不是怕慢，是怕"配置项
+    //   越来越多之后，某天这个循环悄悄越过了看门狗阈值"。
+    JsonObject macros = doc["macros"].to<JsonObject>();
+    int scanned = 0;
+    for (int p = 0; p < TOTAL_PROFILES; p++) {
+        for (int m = 1; m <= MACRO_SLOTS; m++) {
+            char mk[16];
+            snprintf(mk, sizeof(mk), "p%d_M%d", p, m);
+            String v = preferences.getString(mk, "");
+            if (v.length() > 0) {
+                // 超过上限的（理论上不可能，见 CFG_MACRO_MAX）截断并留痕 ——
+                // 宁可让用户看到"有个宏只回了一半"，也不能让整份 JSON 生成失败。
+                if (v.length() > CFG_MACRO_MAX) {
+                    v = v.substring(0, CFG_MACRO_MAX);
+                    ELWARN("CFG", "宏 %s 超过 %d 字节，回拉时截断", mk, (int)CFG_MACRO_MAX);
+                }
+                macros[mk] = v;
+            }
+            if ((++scanned & 7) == 0) btLinkKeepAlive();
+        }
+    }
+
+    // ---- gkeys：MA/MB 的双状态 + 相位 ----
+    JsonObject gk = doc["gkeys"].to<JsonObject>();
+    for (int i = 0; i < GKEY_SLOT_COUNT; i++) {
+        String v = preferences.getString(GKEY_NVS[i], "");
+        if (v.length() > 0) {
+            if (v.length() > CFG_GKEY_MAX) {
+                v = v.substring(0, CFG_GKEY_MAX);
+                ELWARN("CFG", "全局键 %s 超过 %d 字节，回拉时截断", GKEY_NVS[i], (int)CFG_GKEY_MAX);
+            }
+            gk[GKEY_SLOT[i]] = v;
+        }
+        btLinkKeepAlive();
+    }
+    // 相位永远发：0 是合法值，"没这个键"和"相位是 0"必须分得开
+    gk["MA_ph"] = preferences.getUChar("g_MA_ph", 0);
+    gk["MB_ph"] = preferences.getUChar("g_MB_ph", 0);
+
+    // ⚠ overflowed() 必须在序列化**之前**判，而且它是这一整段里最重要的一行检查。
+    //
+    //   doc 装不下时，ArduinoJson **不报错**：装不下的那些键被整个静默丢弃，
+    //   而 serializeJson 照样返回一个"看起来很正常"的长度（它只算自己实际
+    //   能写出的字节数）。于是网页收到一份**语法合法、版本号也对、就是缺了
+    //   一半键**的配置，页面照着它把表单填好、用户再点一次保存就把缺掉的
+    //   部分**清零**了 —— 整条链路上没有任何一处会报错。这就是和"丢片"同一
+    //   类的静默数据损坏，只不过发生在固件这一侧。
+    //
+    //   实测不会经常触发：JsonDocument 在 ESP32 上走 malloc，池子按需涨。
+    //   但"配置项越加越多，某天悄悄越过"正是它唯一的失效方式，所以必须挡。
+    if (doc.overflowed()) {
+        snprintf(cfgBuildErr, sizeof(cfgBuildErr), "JSON 装不下（宏/全局键太多）");
+        ELWARN("CFG", "%s", cfgBuildErr);
+        return 0;
+    }
     size_t n = serializeJson(doc, out, cap);
-    if (n == 0 || n >= cap) return 0;
+    if (n == 0 || n >= cap) {
+        snprintf(cfgBuildErr, sizeof(cfgBuildErr), "缓冲不够（要 %d 字节，上限 %d）",
+                 (int)n + 1, (int)cap);
+        return 0;
+    }
     // 兜底：正文里混进 \n 或 \r 就没法按行攒了，宁可当场失败。
-    if (memchr(out, '\n', n) != nullptr || memchr(out, '\r', n) != nullptr) return 0;
+    if (memchr(out, '\n', n) != nullptr || memchr(out, '\r', n) != nullptr) {
+        snprintf(cfgBuildErr, sizeof(cfgBuildErr), "配置内容含换行");
+        return 0;
+    }
     return n;
 }
 
@@ -5432,7 +5721,140 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
         nPend++;
     }
 
-    if (nPend == 0) {
+    // ---- 方案三块：结构校验（和标量一样，"先校验，一个都不落地"）----
+    //
+    // 语义各不相同，先钉死：
+    //   remap[p] 出现 = **整份替换**方案 p（空数组 = 清空）。
+    //             方案 p 缺位 = 不动。
+    //   macros    出现 = 写这一个键；值为 null / "" = 删这一个键。
+    //             没出现的键 = 不动。
+    //   gkeys     同 macros；另外两个相位是数字。
+    //
+    // 为什么 remap 是"整份替换"而 macros 是"逐键"：remap 在网页上是一个
+    // **列表编辑器**（用户勾了一堆规则点保存，页面只知道保存后的完整列表），
+    // 逐键语义下用户删掉一条规则就永远删不掉。macros / gkeys 是一个键一个
+    // 表单项，各自独立存，网页改 M3 不该动 M1~M2。
+    // ⚠ 这三个必须声明成 **JsonVariant（可变）**而不是 JsonVariantConst：
+    //   doc 本身是可变的 JsonDocument，而 ArduinoJson 7 不允许
+    //   JsonVariantConst → JsonArray 这种"加可变性"的转换（只有反向成立），
+    //   写成 const 会报 InvalidConversion。
+    JsonVariant jRemap = doc["remap"];
+    if (!jRemap.isNull()) {
+        if (!jRemap.is<JsonArray>()) {
+            snprintf(err, errCap, "remap 应该是数组（下标=方案号）");
+            return -1;
+        }
+        JsonArray ra = jRemap.as<JsonArray>();
+        if (ra.size() > (size_t)TOTAL_PROFILES) {
+            snprintf(err, errCap, "remap 最多 %d 个方案，收到 %u 个",
+                     TOTAL_PROFILES, (unsigned)ra.size());
+            return -1;
+        }
+        for (size_t p = 0; p < ra.size(); p++) {
+            JsonVariant one = ra[p];
+            if (!one.is<JsonArray>()) {
+                snprintf(err, errCap, "remap[%u] 应该是规则数组", (unsigned)p);
+                return -1;
+            }
+            JsonArray arr = one.as<JsonArray>();
+            if (arr.size() > (size_t)MAX_REMAP_RULES) {
+                snprintf(err, errCap, "方案%d 的映射有 %u 条，上限 %d",
+                         (int)p + 1, (unsigned)arr.size(), MAX_REMAP_RULES);
+                return -1;
+            }
+            for (size_t i = 0; i < arr.size(); i++) {
+                JsonVariant r = arr[i];
+                if (!r.is<JsonObject>()) {
+                    snprintf(err, errCap, "remap[%u][%u] 应该是 {\"from\":…,\"to\":…}",
+                             (unsigned)p, (unsigned)i);
+                    return -1;
+                }
+                JsonVariantConst fv = r["from"];
+                JsonVariantConst tv = r["to"];
+                if (!fv.is<int>() || !tv.is<int>()) {
+                    snprintf(err, errCap, "remap[%u][%u] 的 from/to 应该是数字",
+                             (unsigned)p, (unsigned)i);
+                    return -1;
+                }
+                long fk = fv.as<long>(), tk = tv.as<long>();
+                // 键码是 uint16。越界的绝大多数是手抄错了（比如把 224 写成 2224），
+                // 夹到 65535 只会让那颗键彻底没反应，必须点名拒掉。
+                if (fk < 0 || fk > 65535 || tk < 0 || tk > 65535) {
+                    snprintf(err, errCap, "remap[%u][%u] 键码超出 0~65535（收到 %ld→%ld）",
+                             (unsigned)p, (unsigned)i, fk, tk);
+                    return -1;
+                }
+            }
+        }
+    }
+
+    JsonVariantConst jMacros = doc["macros"];
+    if (!jMacros.isNull()) {
+        if (!jMacros.is<JsonObject>()) {
+            snprintf(err, errCap, "macros 应该是对象（\"p0_M1\": \"SEQ:…\"）");
+            return -1;
+        }
+        for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
+            const char* k = kv.key().c_str();
+            if (!cfgMacroKeyValid(k)) {
+                snprintf(err, errCap, "宏键名 \"%s\" 不合法（要写成 p<方案0~%d>_M<%d~%d>）",
+                         k, TOTAL_PROFILES - 1, 1, MACRO_SLOTS);
+                return -1;
+            }
+            JsonVariantConst v = kv.value();
+            if (v.isNull()) continue;              // null = 删掉这个宏，合法
+            if (!v.is<const char*>()) {
+                snprintf(err, errCap, "宏 %s 的值应该是字符串", k);
+                return -1;
+            }
+            if (strlen(v.as<const char*>()) > CFG_MACRO_MAX) {
+                snprintf(err, errCap, "宏 %s 超过 %d 字节", k, (int)CFG_MACRO_MAX);
+                return -1;
+            }
+        }
+    }
+
+    JsonVariantConst jGkeys = doc["gkeys"];
+    if (!jGkeys.isNull()) {
+        if (!jGkeys.is<JsonObject>()) {
+            snprintf(err, errCap, "gkeys 应该是对象");
+            return -1;
+        }
+        for (JsonPairConst kv : jGkeys.as<JsonObjectConst>()) {
+            const char* k = kv.key().c_str();
+            int slot = cfgGkeySlotOf(k);
+            if (slot >= 0) {
+                JsonVariantConst v = kv.value();
+                if (v.isNull()) continue;          // null = 删掉这一项，合法
+                if (!v.is<const char*>()) {
+                    snprintf(err, errCap, "全局键 %s 的值应该是字符串", k);
+                    return -1;
+                }
+                if (strlen(v.as<const char*>()) > CFG_GKEY_MAX) {
+                    snprintf(err, errCap, "全局键 %s 超过 %d 字节", k, (int)CFG_GKEY_MAX);
+                    return -1;
+                }
+                continue;
+            }
+            // 两个相位是数字，范围 0~1
+            if (strcmp(k, "MA_ph") == 0 || strcmp(k, "MB_ph") == 0) {
+                JsonVariantConst v = kv.value();
+                if (!v.is<int>()) {
+                    snprintf(err, errCap, "%s 应该是 0 或 1", k);
+                    return -1;
+                }
+                int ph = v.as<int>();
+                if (ph < 0 || ph > 1) {
+                    snprintf(err, errCap, "%s 只能是 0 或 1，收到 %d", k, ph);
+                    return -1;
+                }
+                continue;
+            }
+            // 未知键按本模块的老规矩忽略（网页比固件新时才会出现）
+        }
+    }
+
+    if (nPend == 0 && jRemap.isNull() && jMacros.isNull() && jGkeys.isNull()) {
         snprintf(err, errCap, "一个认识的字段都没有");
         return -1;
     }
@@ -5459,6 +5881,76 @@ for (int i = 0; i < nPend; i++) {
     btLinkKeepAlive();
 }
 
+// ---- 方案三块：落盘 ----
+//
+// 标量写完了才动这三块。顺序无所谓（三块互不相干），但**都在显式提交之前**，
+// 这样回 OK 的时候它们已经一起进了 flash。
+int nScheme = 0;   // 方案类改动条数，只用来给 HUD/日志报个数
+
+// remap：出现的方案整份替换（空数组 = 清空）
+if (!jRemap.isNull()) {
+    JsonArray ra = jRemap.as<JsonArray>();
+    for (size_t p = 0; p < ra.size(); p++) {
+        JsonArray arr = ra[p].as<JsonArray>();
+        RemapRule tmp[MAX_REMAP_RULES];
+        int n = 0;
+        for (size_t i = 0; i < arr.size() && n < MAX_REMAP_RULES; i++) {
+            tmp[n].fromKey = normalizeRemapKey((uint16_t)arr[i]["from"].as<long>());
+            tmp[n].toKey   = normalizeRemapKey((uint16_t)arr[i]["to"].as<long>());
+            n++;
+        }
+        // 整份替换，所以 n==0 就是"清空这个方案"
+        cfgStoreRemap((int)p, tmp, n);
+        nScheme += n;
+    }
+}
+
+// macros：逐键写 / 删（值为 null 或 "" = 删）
+if (!jMacros.isNull()) {
+    for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
+        const char* k = kv.key().c_str();
+        JsonVariantConst v = kv.value();
+        const char* val = v.isNull() ? "" : v.as<const char*>();
+        if (val[0] == '\0') {
+            preferences.remove(k);
+            ELINFO("CFG", "宏 %s 已删", k);
+        } else {
+            preferences.putString(k, val);
+            ELINFO("CFG", "宏 %s 已写 %u 字节", k, (unsigned)strlen(val));
+        }
+        nScheme++;
+        btLinkKeepAlive();
+    }
+}
+
+// gkeys：逐槽写 / 删 + 两个相位
+if (!jGkeys.isNull()) {
+    for (JsonPairConst kv : jGkeys.as<JsonObjectConst>()) {
+        const char* k = kv.key().c_str();
+        int slot = cfgGkeySlotOf(k);
+        if (slot >= 0) {
+            JsonVariantConst v = kv.value();
+            const char* val = v.isNull() ? "" : v.as<const char*>();
+            if (val[0] == '\0') {
+                preferences.remove(GKEY_NVS[slot]);
+                ELINFO("CFG", "全局键 %s 已删", k);
+            } else {
+                preferences.putString(GKEY_NVS[slot], val);
+                ELINFO("CFG", "全局键 %s 已写", k);
+            }
+            nScheme++;
+        } else if (strcmp(k, "MA_ph") == 0 || strcmp(k, "MB_ph") == 0) {
+            // 相位顺带重置了对应的旧单套键吗？—— 不重置。相位是相位，
+            // 老单套 g_MA / g_MB 是独立的一条配置，清它是另一件事。
+            char nk[16];
+            snprintf(nk, sizeof(nk), "g_%s", k);      // "g_MA_ph"
+            preferences.putUChar(nk, (uint8_t)kv.value().as<int>());
+            nScheme++;
+        }
+        btLinkKeepAlive();
+    }
+}
+
 // 显式提交：告诉网页"保存成功"之前，得保证这些值真的进了 flash。
 //
 // 为什么必须在这儿提交 —— Preferences 是 setup() 里 begin("keyboard", false)
@@ -5474,8 +5966,8 @@ unsigned long tCommit = millis();
 preferences.end();
 btLinkKeepAlive();
 preferences.begin("keyboard", false);
-ELINFO("CFG", "已应用 %d 个字段，NVS 提交用了 %lums", nPend,
-       (unsigned long)(millis() - tCommit));
+ELINFO("CFG", "已应用 %d 个设置项（其中方案类 %d 条），NVS 提交用了 %lums",
+       nPend, nScheme, (unsigned long)(millis() - tCommit));
 
 // ---- 界面副作用：**只置位**，留给 cfgPostPump 在后面的 loop 里一件一件做 ----
 //
@@ -5498,7 +5990,7 @@ for (int i = 0; i < nPend; i++) {
 }
 cfgPend |= pendMask;   // 或运算：上一次还没做完的不要被覆盖掉
 
-return nPend;
+return nPend + nScheme;
 }
 
 // loop() 里跑：cfgApplyJson 置起来的界面副作用，**一轮只做一件**。
@@ -5659,108 +6151,50 @@ static void handleCommand(const String& cmd) {
                               clearCmd == "1"  || clearCmd == "0");
 
             if (prof >= 0 && prof < TOTAL_PROFILES) {
-                // 清掉这个方案的全部规则：条数归零 + 逐条擦掉 NVS 里的键，
-                // 只置 0 的话那些 rmp_p_i 键还留在 NVS 里，换固件/读档时会诈尸。
-                if (wantClear) {
-                    for (int i = 0; i < remapCounts[prof]; i++) {
-                        char itemKey[20];
-                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
-                        preferences.remove(itemKey);
-                    }
-                    remapCounts[prof] = 0;
-                    memset(profileRemaps[prof], 0, sizeof(profileRemaps[prof]));
-                    char key[16];
-                    snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
-                    preferences.putInt(key, 0);
-                }
-
                 if (rules.length() > 0) {
-                    // 整份替换：先把旧的清掉，再写新的
-                    for (int i = 0; i < remapCounts[prof]; i++) {
-                        char itemKey[20];
-                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
-                        preferences.remove(itemKey);
-                    }
-                    remapCounts[prof] = 0;
-
+                    // 整份替换。先把规则解析进一个临时表，再交给 cfgStoreRemap
+                    // 一次做完"删旧 → 写新 → 回读校验"。
+                    //
+                    // ⚠ 为什么不再就地写：配置 JSON 的 remap 块也调同一个函数。
+                    //   两条路必须落出**完全一样**的 NVS 布局，否则用户在 JSON
+                    //   里改一遍、再用老协议存一遍，两边会互相覆盖出不同结果，
+                    //   而现场没有任何异常。
+                    RemapRule tmp[MAX_REMAP_RULES];
+                    int n = 0;
                     int start = 0;
-                    int nvsFail = 0;
-                    while (start < rules.length() && remapCounts[prof] < MAX_REMAP_RULES) {
+                    while (start < rules.length() && n < MAX_REMAP_RULES) {
                         int semicolon = rules.indexOf(';', start);
-                        String rule = (semicolon > 0) ? rules.substring(start, semicolon) : rules.substring(start);
+                        String rule = (semicolon >= 0) ? rules.substring(start, semicolon)
+                                                       : rules.substring(start);
                         int comma = rule.indexOf(',');
                         if (comma > 0) {
-                            profileRemaps[prof][remapCounts[prof]].fromKey = normalizeRemapKey((uint16_t)rule.substring(0, comma).toInt());
-                            profileRemaps[prof][remapCounts[prof]].toKey = normalizeRemapKey((uint16_t)rule.substring(comma + 1).toInt());
-
-                            char itemKey[20];
-                            snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, remapCounts[prof]);
-                            uint32_t val = ((uint32_t)profileRemaps[prof][remapCounts[prof]].fromKey << 16) | profileRemaps[prof][remapCounts[prof]].toKey;
-                            // ⚠ 必须看返回值。Preferences::put* 失败时返回 0，最常见的
-                            //   失败原因是 NVS 分区写不进**新键**（分区只有 20KB，
-                            //   NVS 是只增不减的日志结构存储）。
-                            //   以前这里完全不看返回值，屏幕照旧显示"已保存"、
-                            //   按键当场也生效（RAM 里有这份表），断电后 NVS 里
-                            //   什么都没有 —— 表现就是"配好了当场能用，断一次电全没了，
-                            //   再配一次还是不行"。而单条规则通常能写进去（新键少、
-                            //   旧条目还能就地覆盖），所以"只配一条正常、配两条就丢"
-                            //   这种不对称正好指向这里。
-                            if (preferences.putUInt(itemKey, val) == 0) nvsFail++;
-                            remapCounts[prof]++;
+                            tmp[n].fromKey = normalizeRemapKey((uint16_t)rule.substring(0, comma).toInt());
+                            tmp[n].toKey   = normalizeRemapKey((uint16_t)rule.substring(comma + 1).toInt());
+                            n++;
                         }
                         // semicolon == 0 也当作分隔符：规则串以 ';' 开头时
                         // indexOf 返回 0，而旧代码的 `semicolon > 0` 会把它当"没有分号"，
                         // 于是把 ";224,227;227,224" 整段当成一条去 parse。
                         start = (semicolon >= 0) ? semicolon + 1 : rules.length();
                     }
-                    char key[16];
-                    snprintf(key, sizeof(key), "rmp_cnt_%d", prof);
-                    if (preferences.putInt(key, remapCounts[prof]) == 0) nvsFail++;
-
-                    // 读回校验：RAM 里有不等于 flash 里有。这里把 NVS 里真正读回来的
-                    // 数字段数和每一条的值都重新比一遍，以**校验结果**为准，
-                    // 而不是拿 RAM 里的 remapCounts 去报喜。
-                    int intended = remapCounts[prof];
-                    int stored = preferences.getInt(key, -1);
-                    if (stored != intended) nvsFail++;
-                    int verified = 0;
-                    for (int i = 0; i < intended; i++) {
-                        char itemKey[20];
-                        snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
-                        uint32_t back = preferences.getUInt(itemKey, 0xFFFFFFFFUL);
-                        uint16_t rf = normalizeRemapKey((uint16_t)(back >> 16));
-                        uint16_t rt = normalizeRemapKey((uint16_t)(back & 0xFFFF));
-                        if (rf == profileRemaps[prof][i].fromKey &&
-                            rt == profileRemaps[prof][i].toKey) {
-                            verified++;
-                        }
-                    }
-                    if (nvsFail > 0) {
-                        // flash 里的东西不可信 → 把 RAM 也对齐成"实际存住的那部分"，
-                        // 否则当次运行看起来正常、下次开机又变样，更没法查。
-                        remapCounts[prof] = verified;
-                    }
-
+                    int verified = cfgStoreRemap(prof, tmp, n);
                     char buf[32];
-                    LOG_PORT.printf("[REMAP] prof=%d want=%d verified=%d nvsFail=%d\n",
-                                    prof, intended, verified, nvsFail);
-                    if (nvsFail > 0) {
-                        // 存不进去就把原因摆到屏幕上，别再让用户以为"保存成功了"。
-                        snprintf(buf, sizeof(buf), "只存住 %d/%d 条", verified, intended);
-                        ELERR("REMAP", "方案%d 存盘失败 %s NVS分区可能已满", prof + 1, buf);
-                        triggerHud("按键重映射", buf, lv_color_hex(CLR_RED));
-                    } else {
+                    if (verified == n) {
                         snprintf(buf, sizeof(buf), "%d 条已保存", verified);
-                        ELINFO("REMAP", "方案%d 保存 %d 条", prof + 1, verified);
                         triggerHud("按键重映射", buf, lv_color_hex(CLR_GREEN));
                     }
+                    // 存不全时 cfgStoreRemap 内部已经弹了红字"只存住 x/y 条"，
+                    // 这里不再弹第二次绿的 —— 两种 HUD 连着弹只会让人以为存好了。
                 } else if (wantClear) {
+                    // 只清不写：清掉这个方案的全部规则。cfgStoreRemap(prof,0,0)
+                    // 就是"删 MAX_REMAP_RULES 个键 + 条数归零"，和写入路径
+                    // 用的是同一段代码，NVS 布局自然一致。
+                    cfgStoreRemap(prof, nullptr, 0);
                     LOG_PORT.printf("[REMAP] prof=%d cleared\n", prof);
                     // ⚠ 清空分支以前只打 UART，不进错误日志 —— 于是"映射莫名其妙
                     //   变 0 条"这种事在日志里查无实据。固件侧任何会让某个方案
                     //   变空的路径都必须留痕，否则永远分不清是"没存进去"还是
-                    //   "被清掉了"。这条和上面的 保存/回读 行一起构成完整审计链：
-                    //   保存 N 条 → 回读 N 条 → （若出现）方案N 已清空。
+                    //   "被清掉了"。
                     ELWARN("REMAP", "方案%d 已清空", prof + 1);
                     triggerHud("按键重映射", "已清空", lv_color_hex(CLR_AMBER));
                 }
@@ -6129,12 +6563,19 @@ static void handleCommand(const String& cmd) {
             btLinkReplyC("CFGERR", "蓝牙没连上");
         } else if (cfgTxActive) {
             btLinkReplyC("CFGERR", "上一次还没发完，稍后重试");
+        } else if (!cfgBufEnsure()) {
+            btLinkReplyC("CFGERR", "固件内存不够，发不出配置");
         } else {
-            cfgTxLen = cfgBuildJson(cfgTxBuf, sizeof(cfgTxBuf));
+            cfgBuildErr[0] = '\0';
+            cfgTxLen = cfgBuildJson(cfgTxBuf, CFG_BUF_SIZE);
             if (cfgTxLen == 0) {
-                // 缓冲不够 / 生成出来混进了换行。必须明确报错，不能发半份 JSON 出去
-                ELWARN("CFG", "生成 JSON 失败（缓冲 %d 字节不够？）", (int)sizeof(cfgTxBuf));
-                btLinkReplyC("CFGERR", "固件生成 JSON 失败");
+                // 缓冲不够 / 文档装不下 / 生成出来混进了换行。必须明确报错，
+                // 不能发半份 JSON 出去 —— 见 cfgBuildJson 末尾 overflowed 那段。
+                // 原因原样回给网页，别让用户对着"生成失败"猜是哪一种。
+                if (cfgBuildErr[0] == '\0')
+                    snprintf(cfgBuildErr, sizeof(cfgBuildErr), "生成 JSON 失败");
+                ELWARN("CFG", "%s（缓冲上限 %d 字节）", cfgBuildErr, (int)CFG_BUF_SIZE);
+                btLinkReplyC("CFGERR", cfgBuildErr);
             } else {
                 cfgTxPos = 0;
                 // btLinkReplyStreamBegin 的 key 自动取本条请求的请求号（#123），
@@ -6155,9 +6596,12 @@ static void handleCommand(const String& cmd) {
     // ---------------- 配置 JSON：保存 ----------------
     else if (cmd.startsWith("CFGBEGIN:")) {
         uint32_t total = (uint32_t)cmd.substring(9).toInt();
-        if (total == 0 || total > CFG_RX_BUF_SIZE) {
+        if (!cfgBufEnsure()) {
+            btLinkReplyC("CFGSAVE", "ERR:固件内存不够");
+            cfgRxActive = false;
+        } else if (total == 0 || total > CFG_BUF_SIZE) {
             ELWARN("CFG", "拒绝一段 %u 字节的配置（上限 %d）",
-                   (unsigned)total, (int)CFG_RX_BUF_SIZE);
+                   (unsigned)total, (int)CFG_BUF_SIZE);
             btLinkReplyC("CFGSAVE", "ERR:长度不合法");
             cfgRxActive = false;
         } else {
@@ -7424,6 +7868,15 @@ void setup() {
 
     // NVS
     preferences.begin("keyboard", false);
+
+    // 配置 JSON 的收发缓冲（各 CFG_BUF_SIZE+1 字节，落在 PSRAM）。
+    // 在这里就分配掉，而不是等第一条 CFGGET —— 那条命令是跑在 loop() 里的，
+    // 头一次 ps_malloc 会和 LVGL/BLE 抢一下堆，虽然不至于失败，但把不确定的
+    // 因素从按键路径上拿走更划算。失败只记日志：真的用到时 cfgBufEnsure
+    // 会再试一次并给网页回一条明确的 CFGERR。
+    if (cfgBufEnsure()) {
+        ELINFO("CFG", "配置缓冲已就绪 %d 字节 x2", (int)CFG_BUF_SIZE);
+    }
 
     // 可写性自检：写一个探针键，再读回来比一遍。
     //

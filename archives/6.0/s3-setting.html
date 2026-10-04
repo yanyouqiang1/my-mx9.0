@@ -522,6 +522,9 @@
                         <button class="btn btn-green" id="alarmOnBtn" style="flex: 1;">开启闹钟</button>
                         <button class="btn btn-tag" id="alarmOffBtn" style="flex: 1;">关闭闹钟</button>
                     </div>
+                    <div id="alarmStatus" style="font-size: 0.8rem; color: #94a3b8; margin-top: 8px;">
+                        状态：还没从键盘拉取过
+                    </div>
                 </div>
                 <div style="background: #334155; padding: 15px; border-radius: 8px;">
                     <h3 style="margin-top:0; color:#38bdf8;">倒计时</h3>
@@ -613,19 +616,39 @@
         <div class="card">
             <h2>5. 配置 JSON（整份拉取 / 保存）</h2>
             <div class="hint">
-                键盘里所有<b>小配置项</b>（显示风格、屏保、当前方案、背光、灯效、按键特效、
-                闹钟、温度偏移、时间）会拼成<b>一整份 JSON</b>。下面这个框就是它的原文：
-                <br><br>
-                <b>从键盘拉取</b>：把键盘当前真实配置整份读回来（连接后建议先拉一次，
-                这样框里就不是页面默认值了）。<br>
-                <b>保存到键盘</b>：把框里的 JSON 校验一遍、写进 NVS 并立即生效。<br><br>
+                键盘里存的配置会拼成<b>一整份 JSON</b>。下面这个框就是它的原文，
+                <b>连上蓝牙时会自动拉一次</b>，上面所有配置表单（显示风格 / 闹钟 /
+                方案 / 映射 / 宏 / 全局键）都会随之填成键盘里的真实值。<br><br>
+                整个页面<b>只有这一份配置</b>：在上面的表单里改、在下面的框里手改，
+                保存走的都是同一条路 —— 改模型，再整份发回键盘。所以「从键盘拉取」
+                一次就等于以前的「一次性预加载全部」（那个按钮原来是 54 条指令、
+                要跑 30 秒，现在是一次往返）。<br><br>
+                <b>包含什么</b>：<br>
+                · 十三个标量设置：显示风格、屏保、当前方案、背光、亮度、灯效、
+                  状态灯亮度、按键特效、闹钟开关/时/分、温度偏移、时间<br>
+                · <code>remap</code>：4 个方案的按键映射，每个方案一个数组，
+                  元素是 <code>{"from": 键码, "to": 键码}</code><br>
+                · <code>macros</code>：4 方案 × M1~M12 共 48 个宏，形如
+                  <code>"p0_M1": "SEQ:abc"</code> 或 <code>"p0_M2": "CMB:128,4"</code>；
+                  没设过的宏<b>不会出现在 JSON 里</b>，所以<b>删掉一行就是删掉一个宏</b><br>
+                · <code>gkeys</code>：<code>MA</code>/<code>MB</code> 老单套、
+                  <code>MAa</code>/<code>MAb</code>/<code>MBa</code>/<code>MBb</code> 双状态，
+                  以及 <code>MA_ph</code>/<code>MB_ph</code> 两个相位（永远存在，0 或 1）<br><br>
+                <b>不包含</b>（各有原因，故意保留自己的通道）：<br>
+                · <b>ME 键文本</b> 和 <b>壁纸</b> —— 前者可能十几 KB 要转 hex、
+                  后者是 JPEG 裸字节，本来就走的二进制通道，塞进 JSON 没意义<br>
+                · <b>倒计时</b> —— 它是运行时的一次性倒数，固件里不落盘、重启归零。
+                  放进"配置"会造出假象：存一次配置顺手把正在跑的倒计时重置了<br>
+                · <b>日志 / 告警</b> —— 那些是运行时事件，不是设置<br><br>
                 几个约定：<br>
-                · <b>version 是版本闸门，不能改</b>。固件只认它自己那一个版本号，
-                  改成别的会被整份拒绝并提示"版本对不上，请重新拉取"。它不是设置项。<br>
+                · <b>version 是版本闸门，不能改</b>。固件只认它自己那一个版本号
+                  （当前 v2），改成别的会被整份拒绝并提示"版本对不上，请重新拉取"。<br>
                 · <b>没写的字段保持原样</b>（不会被清零），所以可以只改一个数再存。<br>
                 · <b>超出范围的字段会整份拒绝</b>并告诉你错在哪一项，不会偷偷夹取值 ——
                   比如 brightness 只接受 0~255。<br>
                 · 不认识的字段会被<b>忽略</b>（所以网页比固件新时也能用）。<br>
+                · <code>remap</code> 是唯一的例外：<b>它一旦出现就是整份替换</b>
+                  （写成 <code>[]</code> 就是清空那个方案）。<br>
                 · 点保存时固件会<b>显式提交 flash</b>，所以"已保存"之后断电也不会丢。<br>
                 · 这些值仍然存在原来那套 NVS 键里，<b>不会清掉你已有的按键映射和宏</b>。
             </div>
@@ -759,28 +782,42 @@
             }
             document.getElementById('status').innerText = "已连接 ✅";
             document.getElementById('status').style.color = "#4ade80";
-            // 连接成功后启用"预加载全部"按钮(可选)。默认按需取,选键时单条拉。
+            // 连接成功后**自动拉一次整份配置**，把页面上所有配置表单填成键盘里的
+            // 真实值。以前连上之后页面显示的永远是 HTML 里写死的默认值
+            // （07:30、方案 1、映射 0 条…），用户必须挨个点"从键盘读取"才能
+            // 看到自己配过什么 —— 现在一次往返就全对了。
+            //
+            // 失败不弹窗：刚连上时 CCCD 订阅可能还没在主机侧真正生效，
+            // 第一次 notify 很容易正好落在订阅建立之前。这里静默重试一次，
+            // 都不成的话用户自己点「📥 从键盘拉取」就行。
+            cfgSetStatus("已连接，正在拉取配置…", "#38bdf8");
+            // 预加载按钮在 HTML 里是 disabled 的，只有连上了才放开
             const rBtn = document.getElementById('readAllBtn');
-            if (rBtn) { rBtn.disabled = false; rBtn.title = "可选:一次性预加载全部配置,后续切键免等"; }
-            // 顺手拉一次 MA/MB 双状态 + 相位回填 UI,免得用户切到这个 tab 看到空白
+            if (rBtn) { rBtn.disabled = false; rBtn.title = "再拉一次整份配置（连上时已自动拉过）"; }
+            if (!await cfgPull(true)) {
+                await new Promise(r => setTimeout(r, 600));
+                await cfgPull(true);
+            }
+            // 顺手把 MA/MB 双状态 + 相位徽章也刷一次（cfgPull 内部已经做过，
+            // 这里再调一次是为了覆盖"两次拉取都失败"的情况：老缓存里可能有值）
             await loadToggleFromCache();
         } catch(e) {
             alert("连接失败: " + e.message);
         }
     });
 
-    // 一次性预加载全部:54 条 BLE 指令,串行 800ms timeout 一条,跑完会刷 UI。
-    // 默认是按需取(选键/选方案时自动拉那一条),这个按钮只给想一次性浏览的人用。
+    // 一次性预加载全部:现在是**一次**整份拉取(旧实现是 54 条串行指令、约 30 秒)。
     document.getElementById('readAllBtn').addEventListener('click', async () => {
         const btn = document.getElementById('readAllBtn');
         const pBox = document.getElementById('readAllProgress');
         btn.disabled = true;
-        btn.innerText = "⏳ 预加载中...";
+        btn.innerText = "⏳ 拉取中...";
         try {
-            await readAllConfig((done, label) => {
-                pBox.innerText = `预加载进度: ${done}/54 (${label})`;
-            });
-            pBox.innerText = "✅ 预加载完成,后续切键不再需要等";
+            pBox.innerText = "预加载进度: 正在拉取整份配置…";
+            const ok = await readAllConfig();
+            pBox.innerText = ok
+                ? "✅ 预加载完成,后续切键不再需要等"
+                : "❌ 读取失败,请再点一次";
         } catch (e) {
             pBox.innerText = "❌ 读取失败: " + e.message;
         } finally {
@@ -833,6 +870,7 @@
         //   全是"�"。stream 模式会把这半个字节留着、和下一片拼起来。
         _dec: new TextDecoder("utf-8"),
         _seq: 0,                          // 请求号，1~9999
+        _expect: new Map(),                // "VERB|KEY" -> 固件声明的总字节数（-1=没声明）
 
         // 发一条请求并等它的回话 —— **读回配置统一走这个**。
         //
@@ -842,12 +880,29 @@
         //     （早期版本用 `MACRODUMP` + `p3_M12` 当 key，收尾那一包正好
         //      21 字节 > 20，**整条通知被协议栈丢掉**，M10~M12 的宏读不回来）
         //   · 响应不需要靠"正文长得像"去猜是回给哪个请求的
-        // 返回 Promise：正文（不含 VERB/KEY/END），超时返回 null。
+        // 返回 Promise：正文（不含 VERB/KEY/END），拿不到返回 null。
+        //
+        // ⚠ "没发出去"和"发出去了没人回"必须分开，因为它们的修法完全不同：
+        //   前者是蓝牙断了 / GATT 写失败（sendBLE 弹过 alert），后者才是固件
+        //   那边的问题。以前这里 `return ok ? body : null` 两者都返回 null，
+        //   而 cfgPull 只看"null 就是超时"，于是**一个 alert 都弹过的写失败**
+        //   在状态行上显示成"15 秒内一个字节都没收到" —— 把最常见的那个原因
+        //   指成了最不可能的那个，照着提示去查固件等于白查。
+        //   所以这里把 waiter 立刻结掉、并在 _lastSendErr 留痕，让调用方
+        //   能把两种 null 分开报。
         async call(verb, line, timeoutMs) {
             const id = String((this._seq = (this._seq % 9999) + 1));
             const body = this.request(verb, id, timeoutMs);
             const ok = await sendBLE(line + "#" + id);
-            return ok ? body : null;
+            if (ok) return body;
+            this._waits = this._waits.filter(w => {
+                if (w.verb !== verb || w.key !== id) return true;
+                clearTimeout(w.timer);      // 定时器也得撤，否则 15 秒后
+                w.resolve(null);            // 同一个 waiter 会被结第二次
+                return false;
+            });
+            this._lastSendErr = line;
+            return null;
         },
 
         // 只等一条消息（不负责发）。key 是回话的 key。
@@ -900,13 +955,64 @@
             if (body === "END") {
                 const full = this._buf.get(id);
                 this._buf.delete(id);
-                this._deliver(verb, key, full === undefined ? "" : full);
+                const expect = this._expect.get(id);
+                this._expect.delete(id);
+                const text = full === undefined ? "" : full;
+                // ---- 长度核对：固件在正文第一片之前会先发一条 `LEN:<总字节数>` ----
+                //
+                // ⚠ 为什么必须核对：正文是分片发的，而**丢片是静默的** —— 一条
+                //   ATT 通知带不下就被协议栈整条丢掉，收尾标记 END 照样会到。
+                //   没有总长做对照时，主机只有"看着像完整的"这一个依据，于是
+                //   会拿一个缺了一截的正文去 JSON.parse：
+                //     · 运气好 → 报 "unexpected end of input"（还算能看出是丢片）
+                //     · 运气不好（正好切在某个 `}` 上）→ **语法合法但缺内容**，
+                //       页面照着它显示、甚至照着它回写，把缺掉的那部分配置清零
+                //   对不上就明确报"丢片"，绝不往下走。
+                //
+                // 旧固件不发 LEN 行（expect === undefined）→ 不做核对，保持兼容。
+                if (expect !== undefined && expect >= 0) {
+                    // 固件按 **UTF-8 字节**算，这里也必须按字节，不能用 body.length
+                    //（一个汉字 length 1 但占 3 字节，用 length 会对不上）
+                    const got = new TextEncoder().encode(text).length;
+                    if (got !== expect) {
+                        LOG_PORT_UI(`✗ ${verb}:${key} 传输丢片：固件声明 ${expect} 字节，实收 ${got} 字节`);
+                        this._deliver(verb, key, text, { truncated: true, expect, got });
+                        return;
+                    }
+                }
+                this._deliver(verb, key, text);
+                return;
+            }
+            // 长度握手行：认下来但**不拼进正文**。
+            //
+            // ⚠ 它几乎总是和正文的第一片**粘在同一个 body 里**，这是固件在
+            //   20 字节预算下唯一能用的发法，不是可以随手"修好"的地方：
+            //   每片正文只有 `BT_PAYLOAD_MAX - 头长 - 1` = 20-10-1 = 9 字节
+            //   （BT_PAYLOAD_MAX / chunkRoom 见 bt_link.cpp），而"独立成行"至少要
+            //   `LEN:20480` = 9 字节正文 + 1 字节换行 = 10 > 9 —— 装不下。
+            //   固件因此把 LEN 塞进流式单槽的开头，和 JSON 首片连续存放，
+            //   切片后到这里就是 `LEN:356`（后面那片正好是纯握手）或
+            //   `LEN:356{"version":2,...`（本片顺带带了首片正文）两种形态。
+            // ⚠ 早先只认 `^LEN:(\d+)$`（纯握手行）那版，在粘连形态下
+            //   匹配不上 → 整段 `LEN:356{...` 被当成正文拼进去 → LEN 核对
+            //   从来没被建立 → JSON 必然解析失败。两种形态都得认。
+            //   真正的正文以 "{" 开头，所以用第二段是空或 "{" 来区分，
+            //   不会误伤 LOGDUMP 那种刚好以 "LEN:" 开头的日志正文。
+            const mLen = /^LEN:(\d+)([\s\S]*)$/.exec(body);
+            if (mLen && (mLen[2] === "" || mLen[2][0] === "{")) {
+                this._expect.set(id, parseInt(mLen[1], 10));
+                this._buf.set(id, mLen[2]);
                 return;
             }
             this._buf.set(id, (this._buf.get(id) || "") + body);
         },
 
-        _deliver(verb, key, body) {
+        _deliver(verb, key, body, xfer) {
+            // ⚠ 丢片时 resolve(null) 而不是把那份残缺正文交出去。
+            //   所有调用方（readRemap / readMacroConfig / cfgPull …）本来就都把
+            //   null 当"没拿到"处理，并且**不会**拿它去写缓存、更不会拿它去回写
+            //   键盘 —— 交出去的话，"读失败"会一路走成"用户以为保存成功了"。
+            //   拿不到就是拿不到，别给一份半的。
             const h = this._handlers.get(verb);
             if (h) { h(body, key); return; }        // 推送类优先
             for (let i = 0; i < this._waits.length; i++) {
@@ -914,6 +1020,12 @@
                 if (w.verb === verb && w.key === key) {
                     clearTimeout(w.timer);
                     this._waits.splice(i, 1);
+                    if (xfer && xfer.truncated) {
+                        // 记下原因，让调用方能把"丢片"和"超时"分开报给用户
+                        this._lastXferErr = { verb, key, ...xfer };
+                        w.resolve(null);
+                        return;
+                    }
                     w.resolve(body);
                     return;
                 }
@@ -921,9 +1033,17 @@
             LOG_PORT_UI(`← ${verb}:${key}:${body}（没人等这条）`);
         },
 
+        _lastXferErr: null,               // 最近一次"收到但缺片"的记录（供状态提示）
+        _lastCfgErr: null,                // 固件最近一次 CFGERR 的原话（CFGGET 的拒绝理由）
+        _lastSendErr: null,               // 最近一次"指令压根没发出去"的指令名
+
         reset() {
             this._line = "";
             this._buf.clear();
+            this._expect.clear();
+            this._lastXferErr = null;
+            this._lastCfgErr = null;
+            this._lastSendErr = null;
             this._waits.forEach(w => clearTimeout(w.timer));
             this._waits = [];
             this._dec = new TextDecoder("utf-8");
@@ -952,6 +1072,21 @@
         logDumpBytes += body.length;
         handleLogDumpLine(body);
         updateLogStatus(`状态:回拉中… 已收到 ${(logDumpBytes / 1024).toFixed(1)} KB`);
+    });
+
+    // 固件拒绝配置请求时用它回话。固件里 CFGGET/CFGBEGIN 一共有 5 条拒绝路径
+    // （蓝牙没连上 / 上一次还没发完 / 内存不够 / 生成 JSON 失败 / 链路忙），
+    // 全部走这个 verb。
+    //
+    // ⚠ 必须在这里注册 handler，否则这些理由一条都到不了用户眼前：
+    //   CFGERR 是"推送类"消息，_deliver 里推送优先于 waiter，而网页没有任何
+    //   人等 CFGERR → 走到底那行只会往日志面板打一句"（没人等这条）"，而
+    //   cfgPull 等的 CFGDUMP 仍然要空等满 15 秒。于是固件明明回了
+    //   "固件内存不够，发不出配置"，用户看到的却是"一个字节都没收到"——
+    //   照着这个提示去查蓝牙、去查固件，都是白查。**真因就在手上，只是没人捡。**
+    BtLink.on("CFGERR", (body) => {
+        BtLink._lastCfgErr = body;
+        LOG_PORT_UI("✗ 键盘拒绝：" + body);
     });
 
     function onBleNotify(e) { BtLink.feed(e.target.value); }
@@ -1080,14 +1215,14 @@
         logBuffer = []; renderLogBox();
     });
 
-    // ========== 配置 JSON：整份拉取 / 保存 ==========
+    // ========== 配置 JSON：单一模型 + 整份拉取 / 保存 ==========
     //
     // 走的就是 bt_link 那套通用链路，没有另开通道：
     //   拉取：发 `CFGGET#<请求号>`，固件用 `CFGDUMP:<请求号>:<片段>` 分片回传，
     //         最后一条是空的（= 收尾标记 END）。BtLink.call 等的就是它 ——
     //         因为固件的 key 自动取请求号，两边靠它配对，不用猜。
     //   保存：发 CFGBEGIN:<总字节数> + 若干 CFGDATA:<片段> + CFGEND#<请求号>，
-    //         固件回 CFGSAVE:<请求号>:OK:<字段数> 或 ERR:<原因>。
+    //         固件回 CFGSAVE:<请求号>:OK:<项数> 或 ERR:<原因>。
     //
     // ⚠ 三件必须守住的事（错了网页和键盘两边都只会看到"超时"）：
     //
@@ -1097,12 +1232,40 @@
     //
     // 2. **切片要按 UTF-8 字符边界切，不能按字节硬切**。一个汉字 3 字节，从中间
     //    切开再解码就是两个 U+FFFD 豆腐块，固件那边拼回来就不是合法 JSON 了。
-    //    本项目的字段值都是数字/布尔，理论上全是 ASCII，但**别依赖这一点** ——
-    //    cfgSplitForBle 用 Array.from 按码点切，是稳的写法。
+    //    本项目的字段值都是数字/布尔/ASCII，理论上全是 ASCII，但**别依赖这一点**
+    //    —— cfgSplitForBle 用 Array.from 按码点切，是稳的写法。
     //
     // 3. **CFGBEGIN 里的总长必须是 UTF-8 字节数**，不是字符串长度。固件按字节
     //    核对收没收齐，写成字符数会在有中文时误判成"没收齐"然后整份丢弃。
     const CFG_JSON_MAX_CHUNK = 180;   // 固件那边 CFG_RX_CHUNK_MAX=200，留足余量
+    const CFG_SCHEMA_VERSION = 2;     // 必须和固件 src/lvgl_s3.ino 的 CFG_SCHEMA_VERSION 一致
+    // 这三个必须和固件一致，改一边要改另一边（README「配置 JSON」那节有登记）
+    const CFG_BUF_MAX = 20480;        // CFG_BUF_SIZE
+    const CFG_MACRO_MAX = 256;        // CFG_MACRO_MAX
+    const CFG_GKEY_MAX = 256;         // CFG_GKEY_MAX
+
+    // ---- 单一模型 ----
+    //
+    // 整个页面**只有这一份**键盘配置的内存副本。CFGGET 拉回来的是它，
+    // 表单上的每一个输入都是改它，各个列表（映射/宏/全局键）都从它渲染，
+    // 保存就是把改完的它整份发回去。
+    //
+    // 以前不是这样：13 个标量要发 13 条独立指令，映射/宏/全局键要 54 条
+    // REMAPREAD/MACRODUMP/GKEYDUMP，"读取所有配置"是 54 次串行往返
+    // （实测要 30 秒），而且每条各自有超时/丢包的可能。现在是**一次**。
+    const cfgModel = {
+        version: CFG_SCHEMA_VERSION,
+        // 标量小配置（v1 就有）
+        disp_mode: 0, saver_mode: 0, curr_prof: 0,
+        light_on: true, brightness: 128, effect: 0, ind_level: 2, key_fx: 0,
+        alarm_on: false, alarm_h: 7, alarm_m: 30, sht_offset: 0, set_epoch: 0,
+        // 方案三件套（v2 加的）
+        remap: [],      // 4 个数组，下标=方案号；每个里面是 {from,to}
+        macros: {},     // {"p0_M1":"SEQ:ab"}，没设的键不出现
+        gkeys: {},      // {"MAa":"SW:1+…", "MA_ph":0}
+    };
+
+    let cfgLoaded = false;   // 有没有成功拉过一次（没拉过就别让用户往空模型上改）
 
     function cfgEncodeLen(str) { return new TextEncoder().encode(str).length; }
 
@@ -1127,89 +1290,300 @@
         el.style.color = color || "#94a3b8";
     }
 
-    document.getElementById('cfgPullBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert("请先连接蓝牙！");
-        cfgSetStatus("正在从键盘拉取...", "#38bdf8");
+    // 把 cfgModel 同步回文本框（始终存**格式化**过的，方便人读和手改；
+    // 发出去时再压回一行）
+    function cfgModelToTextbox() {
+        document.getElementById('cfgJson').value = JSON.stringify(cfgModel, null, 2);
+    }
+
+    // 文本框是**唯一**能直接编辑整份配置的地方。点保存时先从它重建模型，
+    // 这样"在框里手改"和"在表单里点保存"两条路最终发出去的是同一种东西。
+    function cfgTextboxToModel() {
+        const ta = document.getElementById('cfgJson');
+        if (!ta.value.trim()) return { ok: false, msg: "框里是空的，没什么可存" };
+        let obj;
+        try {
+            obj = JSON.parse(ta.value);
+        } catch (e) {
+            return { ok: false, msg: "JSON 语法不对：" + e.message };
+        }
+        if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+            return { ok: false, msg: "顶层必须是一个 { } 对象" };
+        }
+        // 只换已知的那几块，未知键原样留着（固件那边会忽略它们，
+        // 但留着能让人在框里写注释字段、跨版本过渡时不被本页吃掉）
+        for (const k of Object.keys(cfgModel)) {
+            if (Object.prototype.hasOwnProperty.call(obj, k)) cfgModel[k] = obj[k];
+        }
+        return { ok: true, obj };
+    }
+
+    // 把键盘回上来的整份配置灌进模型 + 所有配置表单 + configCache。
+    // 这是"拉取数据的时候把配置页面的那些填上"的那一步。
+    async function cfgPull(quiet) {
+        if (!myCharacteristic) { if (!quiet) alert("请先连接蓝牙！"); return false; }
+        if (!quiet) cfgSetStatus("正在从键盘拉取…", "#38bdf8");
+        BtLink._lastXferErr = null;
+        BtLink._lastCfgErr = null;
+        BtLink._lastSendErr = null;
         // 固件不是一口气发完，它把整份 JSON 摊到很多轮主循环上慢慢发
         // （不然一条大 JSON 会把主循环按住、触发任务看门狗重启）。所以这里
         // 是 await 到收尾标记才返回，超时给宽一点。
-        const body = await BtLink.call("CFGDUMP", "CFGGET", 8000);
+        const body = await BtLink.call("CFGDUMP", "CFGGET", 15000);
         if (body === null) {
-            cfgSetStatus("拉取超时或链路忙，键盘没回话", "#f87171");
-            return;
+            // 四种 null 挨个分清，因为它们的修法完全不同，混成一句"超时"
+            // 会把用户指到错误的方向上去（这个坑已经踩过一次：sendBLE
+            // 明明弹过"写入失败"的 alert，状态行却写着"一个字节都没收到"）。
+            //   ① 指令压根没写进键盘 —— 蓝牙/GATT 的问题，sendBLE 弹过 alert
+            //   ② 固件明确拒了 —— CFGERR 带着原话过来了
+            //   ③ 收到了但缺片 —— 固件声明的总长和实收对不上
+            //   ④ 真·超时 —— 发出去了，固件一个字都没回
+            const se = BtLink._lastSendErr;
+            const ce = BtLink._lastCfgErr;
+            const xe = BtLink._lastXferErr;
+            if (se) {
+                cfgSetStatus(`指令「${se}」没写进键盘（蓝牙断了？），不是键盘没回话`, "#f87171");
+            } else if (ce) {
+                cfgSetStatus(`键盘拒绝：${ce}`, "#f87171");
+            } else if (xe) {
+                cfgSetStatus(`传输丢片：键盘声明 ${xe.expect} 字节，只收到 ${xe.got} 字节`, "#f87171");
+                LOG_PORT_UI(`[CFG] 丢片：期望 ${xe.expect} / 实收 ${xe.got} 字节`);
+            } else {
+                cfgSetStatus("拉取超时（15 秒内一个字节都没收到）", "#f87171");
+            }
+            return false;
         }
         let obj;
         try {
             obj = JSON.parse(body);
         } catch (e) {
-            // 到这里说明固件发出来的正文拼起来仍不是合法 JSON —— 属于协议层
-            // 出问题了，把原文留着方便查，别悄悄清空框子。
+            // 走到这里说明**收齐了**（LEN 核对过）却仍不是合法 JSON —— 属于
+            // 固件或协议层出了问题。把原文留着方便查，但**别把它当配置用**。
             cfgSetStatus("拉回来的内容不是合法 JSON：" + e.message, "#f87171");
             document.getElementById('cfgJson').value = body;
+            return false;
+        }
+        if (obj.version !== CFG_SCHEMA_VERSION) {
+            // 这是最常见的一种：网页和固件版本对不上（多半是固件还没重烧）。
+            // 明确说清是哪边旧，别只丢一句"版本对不上"。
+            const who = obj.version < CFG_SCHEMA_VERSION ? "键盘固件太旧" : "网页太旧";
+            cfgSetStatus(`版本对不上：键盘是 v${obj.version}，本页是 v${CFG_SCHEMA_VERSION}（${who}）`, "#f87171");
+            document.getElementById('cfgJson').value = JSON.stringify(obj, null, 2);
+            LOG_PORT_UI(`[CFG] 版本不匹配：键盘 v${obj.version} / 本页 v${CFG_SCHEMA_VERSION} → ${who}`);
+            return false;
+        }
+        for (const k of Object.keys(cfgModel)) {
+            if (Object.prototype.hasOwnProperty.call(obj, k)) cfgModel[k] = obj[k];
+        }
+        // 兜底：固件保证 remap 是 4 个数组，但万一拿到一份手改过的，
+        // 别让后面的 [0][1][2][3] 直接 undefined 崩掉整个渲染。
+        if (!Array.isArray(cfgModel.remap)) cfgModel.remap = [];
+        while (cfgModel.remap.length < 4) cfgModel.remap.push([]);
+        cfgModel.remap = cfgModel.remap.slice(0, 4).map(a => Array.isArray(a) ? a : []);
+        if (typeof cfgModel.macros !== 'object' || !cfgModel.macros) cfgModel.macros = {};
+        if (typeof cfgModel.gkeys !== 'object' || !cfgModel.gkeys) cfgModel.gkeys = {};
+
+        // 拉回来的东西**不保证就一定存得回去**。两类情况会在保存时被固件拒：
+        //   · 手改框里的 JSON 时把某个宏/全局键写长了（固件按 CFG_MACRO_MAX 截）
+        //   · 拉回来的配置本身就已经接近 20KB 上限，再加一项就超
+        // 在这里点名，比等到点保存、传了 90 多片之后才回一句"固件拒绝"要好。
+        const tooLong = [];
+        for (const [k, v] of Object.entries(cfgModel.macros)) {
+            if (typeof v === 'string' && v.length > CFG_MACRO_MAX) tooLong.push(`宏 ${k}（${v.length} 字节）`);
+        }
+        for (const [k, v] of Object.entries(cfgModel.gkeys)) {
+            if (typeof v === 'string' && v.length > CFG_GKEY_MAX) tooLong.push(`全局键 ${k}（${v.length} 字节）`);
+        }
+        if (tooLong.length) {
+            LOG_PORT_UI(`⚠ 这些项超过固件上限，再保存会被拒：${tooLong.join('、')}`);
+        }
+
+        cfgLoaded = true;
+        cfgModelToTextbox();
+        cfgFillForms();
+        await cfgRefreshAllLists();
+        if (!quiet) {
+            const nRule = cfgModel.remap.reduce((s, a) => s + a.length, 0);
+            cfgSetStatus(`已拉回 ${Object.keys(obj).length} 项：`
+                       + `${Object.keys(cfgModel.macros).length} 个宏 / ${nRule} 条映射 / `
+                       + `${Object.keys(cfgModel.gkeys).length} 个全局键`, "#4ade80");
+        }
+        LOG_PORT_UI(`[CFG] 整份拉取完成 ${body.length} 字节`);
+        return true;
+    }
+
+    // 把模型里的标量项填进"系统设置"那一排表单
+    function cfgFillForms() {
+        const $ = id => document.getElementById(id);
+        if (typeof cfgModel.disp_mode === 'number') $('dispModeSelect').value = String(cfgModel.disp_mode);
+        if (typeof cfgModel.curr_prof === 'number') $('activeProfile').value = String(cfgModel.curr_prof);
+        if (cfgModel.alarm_on && typeof cfgModel.alarm_h === 'number' && typeof cfgModel.alarm_m === 'number') {
+            const p = n => String(n).padStart(2, '0');
+            $('alarmTime').value = `${p(cfgModel.alarm_h)}:${p(cfgModel.alarm_m)}`;
+        }
+        updateAlarmButtons();
+    }
+
+    // 闹钟开关的显示。
+    //
+    // ⚠ 以前这里只有两个按钮、没有状态回显：连上键盘之后页面显示的永远是
+    //   HTML 里写死的 value="07:30"，而键盘上真实是什么时间、有没有开，
+    //   页面上一个字都看不出来 —— 用户只能"点开启闹钟"来盲试。
+    //   整份 JSON 拉取之后这个信息就在手边了，不显示出来是浪费。
+    function updateAlarmButtons() {
+        const el = document.getElementById('alarmStatus');
+        if (!el) return;
+        if (!cfgLoaded) {
+            el.textContent = "状态：还没从键盘拉取过";
+            el.style.color = "#94a3b8";
             return;
         }
-        // 存**格式化**后的，方便人读和手改；发出去时再压回一行。
-        document.getElementById('cfgJson').value = JSON.stringify(obj, null, 2);
-        cfgSetStatus("已拉回 " + Object.keys(obj).length + " 项配置", "#4ade80");
-    });
-
-    document.getElementById('cfgSaveBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert("请先连接蓝牙！");
-        const ta = document.getElementById('cfgJson');
-        if (!ta.value.trim()) return cfgSetStatus("框里是空的，没什么可存", "#f87171");
-
-        // 先在本地过一遍 JSON.parse + stringify：
-        //   · 语法错当场就报，不用把半份垃圾发给键盘
-        //   · stringify 不带缩进 = 自动压成一行（约定 1），顺手解决缩进 JSON 必失败
-        let compact;
-        try {
-            compact = JSON.stringify(JSON.parse(ta.value));
-        } catch (e) {
-            return cfgSetStatus("JSON 语法不对：" + e.message, "#f87171");
+        if (cfgModel.alarm_on) {
+            const p = n => String(n).padStart(2, '0');
+            el.textContent = `状态：已开启，每天 ${p(cfgModel.alarm_h)}:${p(cfgModel.alarm_m)}`;
+            el.style.color = "#4ade80";
+        } else {
+            el.textContent = "状态：已关闭";
+            el.style.color = "#94a3b8";
         }
+    }
+
+    // 模型 → 各个列表/编辑器（映射列表、宏卡片、四个全局键卡片）
+    //
+    // 这些卡片原来都是各自去问键盘要（MACRODUMP/GKEYDUMP/REMAPREAD），
+    // 现在统一从 configCache 读，而 configCache 由整份 JSON 一次填满。
+    async function cfgRefreshAllLists() {
+        configCache.remaps = {};
+        configCache.macros = {};
+        configCache.gkeys = {};
+
+        for (let p = 0; p < 4; p++) {
+            configCache.remaps[p] = cfgModel.remap[p].map(r => ({ from: r.from, to: r.to }));
+        }
+        // 固件不发没设过的宏，这里把"没出现"和"空串"统一成 'NONE' ——
+        // loadMacroFromCache 只认 null / 'NONE' / 'SEQ:…' / 'CMB:…' 四种
+        for (const [k, v] of Object.entries(cfgModel.macros)) {
+            configCache.macros[k] = (v === '' ? 'NONE' : v);
+        }
+        for (const k of ['MA', 'MB']) {
+            const v = cfgModel.gkeys[k];
+            configCache.gkeys[k] = (typeof v === 'string' && v !== '') ? v : 'NONE';
+        }
+        for (const k of ['MA', 'MB']) {
+            for (const s of ['a', 'b']) {
+                const v = cfgModel.gkeys[k + s];
+                configCache.gkeys[`${k}_${s}`] = (typeof v === 'string' && v !== '') ? v : 'NONE';
+            }
+            const ph = cfgModel.gkeys[k + '_ph'];
+            configCache.gkeys[`${k}_ph`] = (ph === 1 ? '1' : '0');
+            updatePhaseBadge(k, configCache.gkeys[`${k}_ph`]);
+        }
+        // 宏那 48 个格子里没设过的也要显式标成 NONE，否则 loadMacroFromCache
+        // 的 ensureMacroLoaded 会因为"cache 里是 undefined"再去问键盘一次
+        for (let p = 0; p < 4; p++) {
+            for (let m = 1; m <= 12; m++) {
+                const ck = `p${p}_M${m}`;
+                if (configCache.macros[ck] === undefined) configCache.macros[ck] = 'NONE';
+            }
+        }
+        await loadMacroFromCache();
+        await loadGlobalkFromCache();
+        await loadRemapFromCache();
+        await loadToggleFromCache();
+    }
+
+    // 改模型 → 整份发回键盘 → 成功后再拉一次（用回读结果刷新界面）
+    //
+    // 为什么保存后要**再拉一次**而不是就地更新界面：固件对 remap 会做回读
+    // 校验，NVS 分区满的时候它会把 RAM 表裁成"实际存住的那部分"。这时候
+    // 页面如果还按用户输入显示，就是"界面说 8 条、键盘上只有 5 条"。
+    // 再拉一次，界面显示的就是 flash 里真正有的东西。
+    async function cfgPush(mutator, okMsg) {
+        if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
+        if (!cfgLoaded) {
+            if (!confirm("还没从键盘拉取过配置。\n\n继续的话会以**当前页面上显示的默认值**为准整份下发，"
+                      + "键盘上已有的配置会被覆盖。\n\n建议先点「📥 从键盘拉取」。确定继续？")) {
+                return false;
+            }
+        }
+        if (typeof mutator === 'function') mutator(cfgModel);
+        cfgModel.version = CFG_SCHEMA_VERSION;
+        cfgModelToTextbox();
+
+        const compact = JSON.stringify(cfgModel);
         if (compact.indexOf("\n") >= 0 || compact.indexOf("\r") >= 0) {
-            // stringify 出来还带换行，只可能是某个字符串值里真的有换行。
-            // 固件那边按行攒，这种值传不过去 —— 明确告诉用户，别发出去等超时。
-            return cfgSetStatus("JSON 里有字符串值含换行，传不过去（固件按行收）", "#f87171");
+            return cfgSetStatus("JSON 里有字符串值含换行，传不过去（固件按行收）", "#f87171"), false;
         }
-
         const total = cfgEncodeLen(compact);        // ⚠ 字节数，不是长度（约定 3）
+        // ⚠ 先在本地挡一道长度。固件的接收缓冲是 CFG_BUF_SIZE(20480)，
+        //   超了它在 CFGBEGIN 就回 "ERR:长度不合法" 并把 cfgRxActive 清掉；
+        //   紧接着每一片 CFGDATA 都会收到 "ERR:缺少 CFGBEGIN"，最后 CFGEND
+        //   收到 "ERR:没有在收"。等在本地挡下来说清楚是哪超了，
+        //   否则用户看到的是一句风马牛不相及的"缺少 CFGBEGIN"。
+        if (total > CFG_BUF_MAX) {
+            const msg = `这份配置 ${total} 字节，超过固件上限 ${CFG_BUF_MAX} 字节。\n\n` +
+                        `最常见的原因是宏太多或单个宏太长（单个宏上限 ${CFG_MACRO_MAX} 字节）。\n` +
+                        `可以先删掉几个不用的宏再存。`;
+            cfgSetStatus(msg.split('\n')[0], "#f87171");
+            alert(msg);
+            return false;
+        }
         cfgSetStatus(`正在下发 ${total} 字节…`, "#38bdf8");
         if (!await sendBLE("CFGBEGIN:" + total)) {
-            return cfgSetStatus("CFGBEGIN 没发出去，蓝牙可能断了", "#f87171");
+            cfgSetStatus("CFGBEGIN 没发出去，蓝牙可能断了", "#f87171");
+            return false;
         }
         for (const piece of cfgSplitForBle(compact, CFG_JSON_MAX_CHUNK)) {   // ⚠ 约定 2
             if (!await sendBLE("CFGDATA:" + piece)) {
-                return cfgSetStatus("传到一半断了，固件会在 5 秒后丢弃这段", "#f87171");
+                cfgSetStatus("传到一半断了，固件会在 5 秒后丢弃这段", "#f87171");
+                return false;
             }
         }
         // 只有 CFGEND 带请求号，固件回 CFGSAVE:<请求号>:... 时才配得对
-        const reply = await BtLink.call("CFGSAVE", "CFGEND", 8000);
+        BtLink._lastSendErr = null;
+        const reply = await BtLink.call("CFGSAVE", "CFGEND", 15000);
         if (reply === null) {
-            cfgSetStatus("没等到固件回应。配置**可能已经存上了**（可拉取确认）", "#fbbf24");
-            return;
+            // 三种 null 分开说。其中"没发出去"最要紧：固件那边压根没收到
+            // CFGEND，而它还开着 5 秒接收窗口，超时后会往日志里报
+            // "没有在收" —— 看着像固件的问题，其实是连接断了。
+            if (BtLink._lastSendErr) {
+                cfgSetStatus("CFGEND 没写进键盘（蓝牙断了？）", "#f87171");
+            } else {
+                cfgSetStatus("没等到固件回应。配置**可能已经存上了**（可拉取确认）", "#fbbf24");
+            }
+            return false;
         }
-        if (reply.startsWith("OK:")) {
-            // 固件回的是 `OK:<应用字段数>:<固件侧耗时毫秒>`。第三个数是固件自己
-            // 量的（十几项 NVS 页写入 + 显式提交），带出来是为了以后真出问题时
-            // 能一眼看出"慢在哪一侧"，不用再去翻日志。
-            const p = reply.split(":");
-            const cnt = p[1];
-            const ms = p[2] ? `${p[2]} ms` : "耗时未知";
-            cfgSetStatus(`已保存 ${cnt} 项配置（固件侧 ${ms}；屏幕可能晚半秒才对上）`, "#4ade80");
-        } else {
+        if (!reply.startsWith("OK:")) {
             cfgSetStatus("固件拒绝：" + reply.slice(4), "#f87171");
+            alert("固件拒绝保存：\n" + reply.slice(4));
+            return false;
         }
+        // 回的是 `OK:<应用项数>:<固件侧耗时毫秒>`。第三个数是固件自己量的
+        // （十几项 NVS 页写入 + 显式提交），带出来是为了以后真出问题时
+        // 能一眼看出"慢在哪一侧"，不用再去翻日志。
+        const p = reply.split(":");
+        const ms = p[2] ? `${p[2]} ms` : "耗时未知";
+        await cfgPull(true);
+        cfgSetStatus(`已保存 ${p[1]} 项配置（固件侧 ${ms}）`, "#4ade80");
+        if (okMsg) alert(okMsg);
+        return true;
+    }
+
+    document.getElementById('cfgPullBtn').addEventListener('click', async () => {
+        await cfgPull(false);
+    });
+
+    document.getElementById('cfgSaveBtn').addEventListener('click', async () => {
+        const r = cfgTextboxToModel();
+        if (!r.ok) return cfgSetStatus(r.msg, "#f87171");
+        await cfgPush(null);
     });
 
     document.getElementById('cfgFormatBtn').addEventListener('click', () => {
-        const ta = document.getElementById('cfgJson');
-        try {
-            ta.value = JSON.stringify(JSON.parse(ta.value), null, 2);
-            cfgSetStatus("已格式化", "#94a3b8");
-        } catch (e) {
-            cfgSetStatus("JSON 语法不对，格式化失败：" + e.message, "#f87171");
-        }
+        const r = cfgTextboxToModel();
+        if (!r.ok) return cfgSetStatus(r.msg, "#f87171");
+        cfgModelToTextbox();
+        cfgSetStatus("已格式化", "#94a3b8");
     });
 
     // 连接成功时同步把状态栏刷新一下,免得一直停在"未连接"
@@ -1255,84 +1629,43 @@
     }
 
     // 读 MA / MB 当前相位(下次按下将执行 A 还是 B)。失败返 null(允许用户重试)。
+    //
+    // ⚠ 这条现在只是**兜底**：整份配置 JSON 里已经带 `gkeys.MA_ph` / `gkeys.MB_ph`
+    //   （固件无条件发这两个键，因为 0 是合法值、"没这个键"和"相位是 0"必须
+    //   分得开）。只有用户还没点过拉取时，pollTogglePhase 才会走这条路。
     async function readGlobalkPhase(key) {
         const body = await BtLink.call("GKEYPHASE", `GKEYPHASE:${key}`, 800);
         if (body !== "0" && body !== "1") return null;
         return body;
     }
 
-    // 重置 MA / MB 相位回 0。
-    async function sendTogglePhaseReset(key) {
-        return BtLink.call("GKEYPHASE", `GKEYPHASE_RESET:${key}`, 800);
-    }
+    // 相位重置 / 单键全清原来各有两条老协议（`GKEYPHASE_RESET:<key>` 和
+    // `GKEY_RESET:<key>`）。现在这两件事都是"改整份 JSON 里的 gkeys 再发回去"，
+    // 对应的两个按钮已经直接调 cfgPush 了，所以下面这两个函数删掉了。
+    // 固件那两个分支仍然留着，老页面/老脚本还能用。
 
-    // 单键全局清空(只清 MA 或 MB 的全部 + 相位,不动 M1-M12)。
-    async function sendToggleKeyReset(key) {
-        await sendBLE(`GKEY_RESET:${key}`);
-    }
-
-    // 批量预加载:4 方案 × REMAP(4 条) + M1-M12(48 条) + MA/MB(2 条) = 54 条。
-    // 默认走按需取(ensureXxx),这个只在用户主动点"一次性预加载"按钮时跑。
-    // 串行 + 短 timeout,实测 30 秒内能跑完。读回后自动刷新当前显示的 UI。
+    // 批量预加载 —— 现在就是**一次**整份拉取。
+    //
+    // 旧实现是 4 + 48 + 8 = 60 次串行往返（REMAPREAD / MACRODUMP /
+    // GKEYDUMP / GKEYPHASE 各来一遍），实测要 30 秒，而且每一次都是独立的
+    // 超时机会 —— 54 条里只要有一条丢了，那一项就永远停在"没读到"。
+    // 现在 CFGGET 一次把整份配置拉回来，cfgPull 内部已经填好了
+    // configCache 并刷新了所有列表，这里基本就是转发一下。
     async function readAllConfig(onProgress) {
         if (!myCharacteristic) return alert("请先连接蓝牙！");
-        const startMs = Date.now();
-        let total = 0, ok = 0;
-
-        // 1. REMAP 4 个方案
-        for (let p = 0; p < 4; p++) {
-            total++;
-            const rules = await readRemap(p);
-            // ⚠ 同样只在真读到时才写缓存。批量预加载 4 个方案，只要有一个方案
-            //   超时（蓝牙刚连上、第一次 notify 还没建立好很常见），`|| []` 就会
-            //   把那一个方案永久标成"0 条"，之后点多少次「从键盘读取」都救不回来。
-            if (rules !== null) configCache.remaps[p] = rules;
-            if (rules !== null) ok++;
-            if (onProgress) onProgress(total, `REMAP 方案${p + 1}`);
+        if (onProgress) onProgress(1, "整份配置");
+        const t0 = Date.now();
+        const ok = await cfgPull(true);
+        if (onProgress) onProgress(2, "完成");
+        if (ok) {
+            const nRule = cfgModel.remap.reduce((s, a) => s + a.length, 0);
+            LOG_PORT_UI(`[读回] 一次整份拉取完成：${Object.keys(cfgModel.macros).length} 宏 / `
+                + `${nRule} 条映射 / ${Object.keys(cfgModel.gkeys).length} 全局键，`
+                + `${((Date.now() - t0) / 1000).toFixed(1)}秒`);
+        } else {
+            LOG_PORT_UI('[读回] 整份拉取失败');
         }
-
-        // 2. 方案专属宏 4 × 12
-        for (let p = 0; p < 4; p++) {
-            for (let m = 1; m <= 12; m++) {
-                total++;
-                const data = await readMacroConfig(p, m);
-                configCache.macros[`p${p}_M${m}`] = data;
-                if (data !== null) ok++;
-                if (onProgress) onProgress(total, `方案${p + 1} M${m}`);
-            }
-        }
-
-        // 3. 全局键 MA / MB(双状态切换:每个键 2 个状态 + 1 个相位 = 3 条)
-        for (const k of ['MA', 'MB']) {
-            // 老单套(留作兜底;新 UI 已不显示,但读全配置时仍能拉到)
-            total++;
-            const data = await readGlobalkConfig(k);
-            configCache.gkeys[k] = data;
-            if (data !== null) ok++;
-            if (onProgress) onProgress(total, `全局 ${k}`);
-            // 状态 A / B
-            for (const s of ['a', 'b']) {
-                total++;
-                const sd = await readGlobalkStateConfig(k, s);
-                configCache.gkeys[`${k}_${s}`] = sd;
-                if (sd !== null) ok++;
-                if (onProgress) onProgress(total, `全局 ${k} 状态${s.toUpperCase()}`);
-            }
-            // 相位
-            total++;
-            const ph = await readGlobalkPhase(k);
-            configCache.gkeys[`${k}_ph`] = ph;
-            if (ph !== null) ok++;
-            if (onProgress) onProgress(total, `${k} 相位`);
-        }
-
-        const sec = ((Date.now() - startMs) / 1000).toFixed(1);
-        LOG_PORT_UI(`[读回] 完成,${total} 条 / ${ok} 收到回话,${sec}秒`);
-        // 立即刷新当前选中的键（async:会先清 UI 再回填,跟 onchange 走同一条路径）
-        await loadMacroFromCache();
-        await loadGlobalkFromCache();
-        await loadRemapFromCache();
-        await loadToggleFromCache();
+        return ok;
     }
 
     // 按需取单条:cache 命中直接返,未命中才向键盘拉一次,拉完缓存。
@@ -1584,41 +1917,29 @@
     document.getElementById('remapClearBtn').addEventListener('click', async () => {
         if (!confirm("确定要清空当前方案的所有按键映射？")) return;
         const prof = document.getElementById('remapProfile').value;
-        const ok = await sendBLE(`REMAP:${prof}:clear:`);
-        remapRules = [];
-        remapRefreshList();
+        // JSON 里"清空这个方案"就是把 remap[prof] 写成空数组。
+        // 固件那边 remap[p] 一旦出现就是**整份替换**，空数组 = 0 条。
+        const ok = await cfgPush(m => { m.remap[Number(prof)] = []; });
         if (ok) {
-            // 读回来确认一次：清空必须是"真的清掉了"，不是"我以为清掉了"
-            const back = await readRemap(prof);
-            if (back !== null && back.length === 0) {
-                alert(`已清空方案 ${Number(prof) + 1} 的按键映射（已从键盘读回确认：0 条）。`);
-            } else {
-                alert(`已下发清空指令，但从键盘读回仍有 ${back ? back.length : "?"} 条。\n请看键盘屏幕上的提示。`);
-            }
+            // 用回读结果刷新：cfgPush 成功后会自己 cfgPull 一次，
+            // 所以这里 remapRules 已经是键盘上的真实值了。
+            alert(`已清空方案 ${Number(prof) + 1} 的按键映射（已从键盘读回确认：`
+                + `${configCache.remaps[Number(prof)].length} 条）。`);
         }
     });
 
-    // 一键清掉所有 4 个方案的按键映射:走固件 REMAP_RESET 命令,逐 key remove rmp_cnt_<p> + rmp_<p>_<i>。
-    // 主要给老 HTML 时期 ASCII 编码(97=A、98=B、99=C)留下的脏规则用 —— 那套映射落进
-    // kbPress 的 0x53~0x63 区间会发成 Num9/Num0/Num.,按 A 出来是 9。
+    // 一键清掉所有 4 个方案的按键映射。主要给老 HTML 时期 ASCII 编码
+    // (97=A、98=B、99=C)留下的脏规则用 —— 那套映射落进 kbPress 的
+    // 0x53~0x63 区间会发成 Num9/Num0/Num.，按 A 出来是 9。
     document.getElementById('remapResetAllBtn').addEventListener('click', async () => {
         if (!confirm("⚠️ 真的要清空全部 4 个方案的按键映射?\n\n会清掉:\n  • 所有方案的按键映射 (REMAP)\n\n保留:\n  • 宏 (M1~M12 × 4 方案)\n  • 全局动作 (MA / MB)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光 / 壁纸\n\n此操作不可撤销,确定继续?")) return;
         if (!confirm("再确认一次:真的要清空吗?")) return;
-        await sendBLE("REMAP_RESET");
-        // 本地视图也清掉 4 个方案的 cache
-        configCache.remaps = {};
-        remapRules = [];
-        remapRefreshList();
-        alert("已下发清空指令。键盘会逐条清 NVS,几秒后屏幕弹「映射已全部清空」卡片即代表完成。");
+        await cfgPush(m => { m.remap = [[], [], [], []]; }, "全部 4 个方案的按键映射已清空。");
     });
 
-    // 读回：让键盘把该方案现有的规则 notify 上来。
-    // 以前"从键盘读取"读不出来，是因为特征根本没有 NOTIFY，键盘没法回话。
-    //
-    // ⚠ retries：刚连上蓝牙时 CCCD 订阅可能还没在主机侧真正生效，固件 notify 的
-    //   第一条很容易正好落在订阅建立之前，于是必然超时。失败后原样重发一次，
-    //   两次之间隔了 timeoutMs，不存在两条相同 notify 被 BLE 合并的风险
-    //   （合并问题来自"两个并发的 readRemap"，那个重复监听器已经删掉了）。
+    // 读回：整份 JSON 一次拉全（remap + 48 个宏 + 全局键），顺带把
+    // 上面几个表单也填上。原来的"只读这一个方案的映射"那条路
+    // （REMAPREAD）保留在 readRemap() 里，作为 cache 没命中时的兜底。
     async function readRemap(prof, timeoutMs, retries) {
         // 一张表可能 32 条规则 ≈ 400 字节，固件会拆成二十来片，BtLink 负责
         // 拼回来并在收尾标记到达时才交给我们 —— 这里拿到的永远是**完整的**。
@@ -1641,52 +1962,38 @@
         const prof = document.getElementById('remapProfile').value;
         // ⚠⚠ 列表为空时**直接拒绝保存**，不再弹 confirm 放行。
         //
-        //   旧代码这里是"弹窗问一句，用户点确定就照发"。但 pairs 为空串时发出去的
-        //   是 `REMAP:<p>:clear:`，固件按"整份替换"语义会把键盘上**已经存好的**
-        //   映射全部抹掉 —— 也就是说，只要列表因为任何原因变空（读回超时、
-        //   切了方案下拉框还没回填、用户手动删光了），点一下"保存"就是在删配置。
+        //   旧代码这里是"弹窗问一句，用户点确定就照发"。但规则为空时，
+        //   在 JSON 里就等于 `remap[prof] = []`，而固件对 remap[p] 是
+        //   **整份替换**语义 —— 也就是说，只要列表因为任何原因变空
+        //   （读回超时、切了方案下拉框还没回填、用户手动删光了），
+        //   点一下"保存"就是在删配置。
         //
         //   confirm 在这里是有害的：弹窗文案再吓人，用户也是反射性地点"确定"。
         //   清空本来就有专门的按钮（🗑️ 清空此方案），两条路必须分开，
         //   "保存"永远不该有能力清空别人的数据。
         if (remapRules.length === 0) {
             alert(`规则列表是空的，已阻止保存。\n\n` +
-                  `原因：列表为空时"保存"发出去的是 \`REMAP:${prof}:clear:\`，\n` +
-                  `固件会按整份替换把方案 ${Number(prof) + 1} 上**已有的全部映射清空**。\n\n` +
+                  `原因：列表为空时"保存"会把方案 ${Number(prof) + 1} 的 remap 写成空数组，\n` +
+                  `固件按整份替换把上面**已有的全部映射清空**。\n\n` +
                   `要清空请点「🗑️ 清空此方案」。\n` +
-                  `若你刚配了规则却看到空列表，说明没读回键盘 —— 先点「📥 从键盘读取」。`);
+                  `若你刚配了规则却看到空列表，说明没读回键盘 —— 先点「📥 从键盘拉取」。`);
             return;
         }
-        let pairs = "";
-        if (remapRules.length > 0) {
-            pairs = remapRules.map(r => `${r.from},${r.to}`).join(';');
-        }
-        // 第三个字段必须写 clear：固件那边认 clear / 1 / 0 都行，但协议上是 clear。
-        // 这条命令是"整份替换"，不是追加 —— 之前两边一个发 1 一个认 clear，
-        // 存进去的规则清不掉，点"清空此方案"也发 1，等于两条全是哑的。
-        const ok = await sendBLE(`REMAP:${prof}:clear:${pairs}`);
+        const rules = remapRules.map(r => ({ from: r.from, to: r.to }));
+        const ok = await cfgPush(m => { m.remap[Number(prof)] = rules; });
         if (!ok) return;
-        const back = await readRemap(prof);
-        if (back === null) {
-            alert(`已下发保存指令，但没能从键盘读回确认。\n请看键盘屏幕上的提示。`);
-        } else if (back.length === remapRules.length) {
+        // cfgPush 成功后会 cfgPull 一次，configCache 里已经是键盘的真实值。
+        // 条数对不上只有两种可能，两种都会让用户以为"保存成功了"：
+        //   1) NVS 分区写不下新键（固件会弹红字"只存住 x/y 条"）
+        //   2) 蓝牙丢片导致部分没写进去
+        // 都要在这里点名，否则用户只会反复点保存，越点越乱。
+        const back = configCache.remaps[Number(prof)] || [];
+        if (back.length === rules.length) {
             alert(`已保存 ${back.length} 条映射到方案 ${Number(prof) + 1}（已从键盘读回确认）。`);
         } else {
-            // 条数对不上只有两种可能，两种都会让用户以为"保存成功了"：
-            //   1) 蓝牙拆包把命令截断（看上面的收发流水里有没有"会拆包"提示）
-            //   2) NVS 分区只有 20KB，写不下新键（键盘屏幕会红字提示"只存住 x/y 条"）
-            // 都要在这里点名，否则用户只会反复点保存，越点越乱。
-            alert(`下发的是 ${remapRules.length} 条，键盘只收下了 ${back.length} 条。\n\n` +
-                  `常见原因：\n` +
-                  `  1) 蓝牙把这条长命令拆包了（收发流水里有"会拆包"提示就是它）\n` +
-                  `  2) 键盘 NVS 分区已满，写不下新键（屏幕上会红字提示）\n\n` +
+            alert(`下发的是 ${rules.length} 条，键盘只存住了 ${back.length} 条。\n\n` +
+                  `常见原因：键盘 NVS 分区已满，写不下新键（屏幕上会红字提示）。\n` +
                   `当前列表以键盘读回的 ${back.length} 条为准。`);
-            // 本地视图也按键盘的真实结果对齐，别让界面继续显示一个没存上的方案
-            if (back !== null) {
-                remapRules = back;
-                remapRefreshList();
-                configCache.remaps[prof] = back;
-            }
         }
     });
 
@@ -1697,31 +2004,27 @@
 
     // "📥 从键盘读取" —— 点一次、读一次。
     //
-    // ⚠ 这里原来前后挂了**两个** remapLoadBtn 的 click 监听（1373 和 1391 两段，
-    //   id 在 147 行只声明了一次）。后果是点一次按钮发出**两条** REMAPREAD，
-    //   固件于是 notify **两次内容完全一样**的 REMAPDUMP。BLE 通知不排队，
-    //   上一条客户端还没 ACK 时第二条会被合并丢弃 -> 两个 waiter 必有一个超时。
+    // ⚠ 这里原来前后挂了**两个** remapLoadBtn 的 click 监听（id 在 147 行
+    //   只声明了一次）。后果是点一次按钮发出**两条** REMAPREAD，固件于是
+    //   notify **两次内容完全一样**的 REMAPDUMP。BLE 通知不排队，上一条
+    //   客户端还没 ACK 时第二条会被合并丢弃 -> 两个 waiter 必有一个超时。
     //   这就是"从键盘读取永远读到 0 条"的直接原因。
+    //
+    // 现在这里也走整份 JSON：一次拉回来既填了这个列表，也把上面那些表单
+    // 和 48 个宏格一起同步了。失败时**什么都不改**（旧代码里
+    // `back || []` 会把"键盘没回话"固化成"0 条"，然后 ensureRemapLoaded
+    // 只认 !== undefined，于是本次会话里这个方案永远显示 0 条）。
     document.getElementById('remapLoadBtn').addEventListener('click', async () => {
         const prof = document.getElementById('remapProfile').value;
-        const back = await readRemap(prof, 3000);
-        // ⚠ 只有真的读回来了才写缓存。null 是"键盘没回话"，[] 是"键盘上确实一条都没有"，
-        //   两者含义相反。旧代码的 `back || []` 把"没回话"直接固化成"0 条"，
-        //   而 ensureRemapLoaded 只认 `!== undefined` 就返回缓存，
-        //   于是这一次超时会让本次页面会话里这个方案永远显示 0 条。
-        if (back !== null) configCache.remaps[prof] = back;
-        // 只有真读回来了才刷新列表。back === null 时缓存里本来就没有这个方案的条目，
-        // 再调 loadRemapFromCache() 会让 ensureRemapLoaded 缓存未命中、
-        // **再发一条 REMAPREAD** —— 一次点击变两条指令，BLE 通知不排队，
-        // 两个并发 waiter 必有一个超时，反而把"读不到"变成"读两次都不到"。
-        if (back !== null) loadRemapFromCache();
-        if (back === null) {
-            alert("键盘没回话（3 秒内没收到 REMAPDUMP）。\n请确认蓝牙已连接、固件是最新那版。\n当前规则列表未改动。");
-        } else {
-            alert(back.length
-                ? `已从键盘读回方案 ${Number(prof) + 1} 的 ${back.length} 条映射。`
-                : `方案 ${Number(prof) + 1} 在键盘上确实没有任何映射规则。`);
+        const ok = await cfgPull(true);
+        if (!ok) {
+            alert("键盘没回话（整份配置拉取失败）。\n请确认蓝牙已连接、固件是最新那版。\n当前配置未改动。");
+            return;
         }
+        const n = (configCache.remaps[Number(prof)] || []).length;
+        alert(n
+            ? `已从键盘读回方案 ${Number(prof) + 1} 的 ${n} 条映射（整份配置已同步到页面）。`
+            : `方案 ${Number(prof) + 1} 在键盘上确实没有任何映射规则。`);
     });
 
     // 切宏键 / 切方案:从 cache 加载该键的宏
@@ -1962,12 +2265,22 @@
         badge.style.background = (phase === '1') ? '#a855f7' : '#0ea5e9';
     }
 
-    // 拉一次 MA / MB 的相位并更新徽章。失败静默,徽章保持原状。
+    // 相位徽章。
+    //
+    // 原来这里每次刷新都要单独发一条 `GKEYPHASE:MA` / `GKEYPHASE:MB` 去问
+    // 键盘（两次往返）。现在相位就在整份配置 JSON 的 `gkeys.<KEY>_ph` 里，
+    // 整份拉取时已经填进 configCache 了 —— 直接读缓存，不再发指令。
+    // 缓存里没有（还没拉过整份配置）才退回老路单问一次。
     async function pollTogglePhase(key) {
+        const ck = `${key}_ph`;
+        if (configCache.gkeys[ck] !== undefined) {
+            updatePhaseBadge(key, configCache.gkeys[ck]);
+            return;
+        }
         if (!myCharacteristic) return;
         const ph = await readGlobalkPhase(key);
         if (ph !== null) {
-            configCache.gkeys[`${key}_ph`] = ph;
+            configCache.gkeys[ck] = ph;
             updatePhaseBadge(key, ph);
         }
     }
@@ -2003,23 +2316,35 @@
         loadGlobalkFromCache();
     }
 
+    // 全局键保存。
+    //
+    // ⚠ 原来这里是 `GSET:<key>:<payload>` —— 一条指令写一个键。现在走整份
+    //   JSON：改模型里 gkeys 的对应槽，再整份发回去。
+    //   代价是每次保存要把整份配置（最多 20KB）推一遍，收益是：
+    //   · 一次往返，且和"配置 JSON"那一页保存的是同一份数据、同一套校验
+    //   · 不用再维护 GSET 的 key 命名规则（"MAa"/"MA"/"MA:a" 三套写法混着）
+    //   · 固件回读校验的失败（"只存住 5/8 条"）会直接冒出来，而不是只在
+    //     用户下次开机才发现
+    // 整份 JSON 里绝大多数是 remap/macros，最坏 20KB，按 180 字节一片是
+    // 110 片。实测一次保存 1~2 秒，可以接受。
     document.getElementById('saveGlobalkBtn').addEventListener('click', async () => {
         const key = document.getElementById('globalkKeySel').value;
         const payload = buildGlobalkPayload();
-        await sendBLE(`GSET:${key}:${payload}`);
-        alert(`${key} 全局动作已生效！\n协议: GSET:${key}:${payload}`);
+        await cfgPush(m => { m.gkeys[key] = payload; },
+            `${key} 全局动作已保存并生效！\n内容: ${payload}`);
     });
 
     document.getElementById('clearGlobalkBtn').addEventListener('click', async () => {
         const key = document.getElementById('globalkKeySel').value;
         if (!confirm(`确定要清除 ${key} 的全局配置？`)) return;
-        await sendBLE(`GSET:${key}:NONE`);
-        alert(`${key} 已清空全局配置。`);
+        // 删一个键在 JSON 里就是"把这个键整个去掉"（固件那边"键不存在"
+        // 就是清掉，和写空串等价）
+        await cfgPush(m => { delete m.gkeys[key]; }, `${key} 已清空全局配置。`);
     });
 
     // ========== MA / MB 双状态切换:保存 / 清除 / 相位重置 / 全清 ==========
     // (scope, key, state) 三者一一对应:scope 是 UI 区域 id 前缀,
-    // key 是 MA/MB,state 是 a/b。state 直接拼到协议名里:`GSET:<key><state>:...`。
+    // key 是 MA/MB,state 是 a/b。JSON 里的键名是 `<key><state>`（"MAa"）。
     const toggleBindings = [
         { scope: 'ma_a', key: 'MA', state: 'a' },
         { scope: 'ma_b', key: 'MA', state: 'b' },
@@ -2032,73 +2357,43 @@
             if (!myCharacteristic) return alert('请先连接蓝牙！');
             const payload = buildTogglePayload(b.scope);
             const tag = `${b.key}${b.state}`;
-            await sendBLE(`GSET:${tag}:${payload}`);
-            // 本地缓存立刻更新(避免下次切换又去拉)
-            configCache.gkeys[`${b.key}_${b.state}`] = payload;
-            alert(`${b.key} 状态 ${b.state.toUpperCase()} 已生效！\n协议: GSET:${tag}:${payload}`);
+            await cfgPush(m => { m.gkeys[tag] = payload; },
+                `${b.key} 状态 ${b.state.toUpperCase()} 已保存并生效！\n内容: ${payload}`);
         });
         // 清除单个状态
         document.getElementById(`${b.scope}ClearBtn`).addEventListener('click', async () => {
             if (!myCharacteristic) return alert('请先连接蓝牙！');
             if (!confirm(`确定要清除 ${b.key} 状态 ${b.state.toUpperCase()}？`)) return;
             const tag = `${b.key}${b.state}`;
-            await sendBLE(`GSET:${tag}:NONE`);
-            configCache.gkeys[`${b.key}_${b.state}`] = 'NONE';
-            fillToggleUiFromPayload(b.scope, 'NONE');
-            alert(`${tag} 已清空。`);
+            await cfgPush(m => { delete m.gkeys[tag]; }, `${tag} 已清空。`);
         });
     });
-    // 相位重置
-    document.getElementById('maPhaseResetBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert('请先连接蓝牙！');
-        const ph = await sendTogglePhaseReset('MA');
-        if (ph !== null) {
-            configCache.gkeys['MA_ph'] = '0';
-            updatePhaseBadge('MA', '0');
-            alert('MA 相位已重置,下次按下将执行状态 A。');
-        } else {
-            alert('MA 相位重置失败,请重试。');
-        }
-    });
-    document.getElementById('mbPhaseResetBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert('请先连接蓝牙！');
-        const ph = await sendTogglePhaseReset('MB');
-        if (ph !== null) {
-            configCache.gkeys['MB_ph'] = '0';
-            updatePhaseBadge('MB', '0');
-            alert('MB 相位已重置,下次按下将执行状态 A。');
-        } else {
-            alert('MB 相位重置失败,请重试。');
-        }
-    });
+    // 相位重置 → 把 gkeys 里那个 _ph 置 0（固件那边永远发这两个键，所以一定在）
+    for (const k of ['MA', 'MB']) {
+        const btn = document.getElementById(`${k.toLowerCase()}PhaseResetBtn`);
+        if (!btn) continue;
+        btn.addEventListener('click', async () => {
+            if (!myCharacteristic) return alert('请先连接蓝牙！');
+            const ok = await cfgPush(m => { m.gkeys[`${k}_ph`] = 0; },
+                `${k} 相位已重置,下次按下将执行状态 A。`);
+            if (!ok) alert(`${k} 相位重置失败,请重试。`);
+        });
+    }
     // 整键全清(双状态 + 相位 + 老单套),互不影响 M1-M12
-    document.getElementById('maFullResetBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert('请先连接蓝牙！');
-        if (!confirm('⚠️ 真的要清空 MA 的全部配置?\n\n会清掉:\n  • 状态 A\n  • 状态 B\n  • 相位(回到 A)\n  • 老单套(如有)\n\n不影响:\n  • M1~M12 宏\n  • 任何方案映射 / 时钟 / 灯光 / 壁纸\n\n确定继续?')) return;
-        await sendToggleKeyReset('MA');
-        // 本地缓存 + UI 全部刷新
-        configCache.gkeys['MA']    = 'NONE';
-        configCache.gkeys['MA_a']  = 'NONE';
-        configCache.gkeys['MA_b']  = 'NONE';
-        configCache.gkeys['MA_ph'] = '0';
-        fillToggleUiFromPayload('ma_a', 'NONE');
-        fillToggleUiFromPayload('ma_b', 'NONE');
-        updatePhaseBadge('MA', '0');
-        alert('MA 已全部清空。');
-    });
-    document.getElementById('mbFullResetBtn').addEventListener('click', async () => {
-        if (!myCharacteristic) return alert('请先连接蓝牙！');
-        if (!confirm('⚠️ 真的要清空 MB 的全部配置?\n\n会清掉:\n  • 状态 A\n  • 状态 B\n  • 相位(回到 A)\n  • 老单套(如有)\n\n不影响:\n  • M1~M12 宏\n  • 任何方案映射 / 时钟 / 灯光 / 壁纸\n\n确定继续?')) return;
-        await sendToggleKeyReset('MB');
-        configCache.gkeys['MB']    = 'NONE';
-        configCache.gkeys['MB_a']  = 'NONE';
-        configCache.gkeys['MB_b']  = 'NONE';
-        configCache.gkeys['MB_ph'] = '0';
-        fillToggleUiFromPayload('mb_a', 'NONE');
-        fillToggleUiFromPayload('mb_b', 'NONE');
-        updatePhaseBadge('MB', '0');
-        alert('MB 已全部清空。');
-    });
+    for (const k of ['MA', 'MB']) {
+        const btn = document.getElementById(`${k.toLowerCase()}FullResetBtn`);
+        if (!btn) continue;
+        btn.addEventListener('click', async () => {
+            if (!myCharacteristic) return alert('请先连接蓝牙！');
+            if (!confirm(`⚠️ 真的要清空 ${k} 的全部配置?\n\n会清掉:\n  • 状态 A\n  • 状态 B\n  • 相位(回到 A)\n  • 老单套(如有)\n\n不影响:\n  • M1~M12 宏\n  • 任何方案映射 / 时钟 / 灯光 / 壁纸\n\n确定继续?`)) return;
+            await cfgPush(m => {
+                delete m.gkeys[k];
+                delete m.gkeys[`${k}a`];
+                delete m.gkeys[`${k}b`];
+                m.gkeys[`${k}_ph`] = 0;
+            }, `${k} 已全部清空。`);
+        });
+    }
 
     // ========== 4. 方案专属宏 M1-M12 ==========
     // CMB/SEQ 同框互斥：当前选中的面板正常显示，另一个面板用 .panel-disabled
@@ -2182,50 +2477,60 @@
         const prof = document.getElementById('activeProfile').value;
         const mKey = document.getElementById('macroKey').value;
         const mode = document.querySelector('input[name="macroMode"]:checked').value;
+        const ck = `p${prof}_${mKey}`;
 
+        // 固件那边的键名只认 p<方案>_M<序号>，方案 0~3、序号 1~12。
+        // 这里**先挡一道**再发：以前是发出去之后固件才拒，用户看到的是
+        // 一句"NVS 键名不合法"，根本不知道是自己下拉框选错了。
+        if (!/^p[0-3]_M([1-9]|1[0-2])$/.test(ck)) {
+            return alert(`宏键名 "${ck}" 不合法（方案 1~4、按键 M1~M12）。`);
+        }
+
+        let payload;
         if (mode === "SEQ") {
             const txt = document.getElementById('seqInput').value;
             if (!txt) return alert("请输入宏击键流内容！");
-            await sendBLE(`SET:p${prof}_${mKey}:SEQ:${txt}`);
-            alert(`已保存打字/延时宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
+            payload = `SEQ:${txt}`;
         } else {
             const codes = buildMacroComboCodes();
             if (codes.length === 0) return alert("请至少勾选一个修饰键或添加一个普通键！");
-            await sendBLE(`SET:p${prof}_${mKey}:CMB:${codes.join(',')}`);
-            alert(`已保存组合键宏到方案 ${Number(prof) + 1} 的 ${mKey}！（${codes.length} 个键）`);
+            payload = `CMB:${codes.join(',')}`;
         }
+        await cfgPush(m => { m.macros[ck] = payload; },
+            `已保存${mode === "SEQ" ? "打字/延时" : "组合键"}宏到方案 ${Number(prof) + 1} 的 ${mKey}！`);
     });
 
-    // 清空当前键宏：发 SET:p{prof}_{mKey}: (value 空字符串)。
-    // 固件 preferences.putString 写空,executeMacro 读 macroData.length()==0 直接 return,
-    // 等于把这个键的宏彻底关掉。跟 GSET:KEY:NONE 那个清全局动作是同一个套路。
+    // 清空当前键宏：在 JSON 里就是**把这个宏键整个删掉**。
+    // （固件收到"键不存在"和"值为空串"是同一件事：preferences.remove）
     document.getElementById('clearMacroBtn').addEventListener('click', async () => {
         const prof = document.getElementById('activeProfile').value;
         const mKey = document.getElementById('macroKey').value;
-        if (!confirm(`确定要清空方案 ${Number(prof) + 1} 的 ${mKey} 宏?\n键盘里之前存的所有内容都会被覆盖为空。`)) return;
-        await sendBLE(`SET:p${prof}_${mKey}:`);
-        // 本地视图也清掉,免得下次切换看到一堆旧条目以为还在
-        document.getElementById('seqInput').value = '';
-        comboKeys = [];
-        renderComboKeys();
-        alert(`方案 ${Number(prof) + 1} 的 ${mKey} 宏已清空。`);
+        if (!confirm(`确定要清空方案 ${Number(prof) + 1} 的 ${mKey} 宏?\n键盘里之前存的所有内容都会被清掉。`)) return;
+        const ok = await cfgPush(m => { delete m.macros[`p${prof}_${mKey}`]; });
+        if (ok) {
+            // 本地视图也清掉，免得下次切换看到一堆旧条目以为还在
+            document.getElementById('seqInput').value = '';
+            comboKeys = [];
+            renderComboKeys();
+        }
     });
 
-    // 一键清空所有宏：所有方案 × M1-M12 + MA + MB(共 50 个键),保留 remap/灯光/时钟等。
-    // 固件侧走 MACROS_RESET 命令逐 key remove,完成会 notify "已清空所有宏"。
+    // 一键清空所有宏：4 方案 × M1-M12 + MA/MB 全部双状态。
+    // 走 JSON 的"把这些键从模型里删掉"，和逐个删是同一条路径。
     document.getElementById('resetAllMacrosBtn').addEventListener('click', async () => {
-        if (!confirm("⚠️ 真的要清空所有宏?\n\n会清掉:\n  • 4 个方案 × M1~M12 = 48 个方案专属宏\n  • MA / MB 全局动作\n\n保留:\n  • 按键映射 (REMAP)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光配置\n  • 屏幕壁纸\n\n此操作不可撤销,确定继续?")) return;
+        if (!confirm("⚠️ 真的要清空所有宏?\n\n会清掉:\n  • 4 个方案 × M1~M12 = 48 个方案专属宏\n  • MA / MB 全局动作（含双状态）\n\n保留:\n  • 按键映射 (REMAP)\n  • 时钟 / 闹钟 / 倒计时\n  • 灯光配置\n  • 屏幕壁纸\n\n此操作不可撤销,确定继续?")) return;
         // 二次确认,防误点
         if (!confirm("再确认一次:真的要清空吗?")) return;
-        await sendBLE("MACROS_RESET");
-        alert("已下发清空指令。键盘会逐条清 NVS,几秒后屏幕弹「已清空所有宏」卡片即代表完成。");
+        await cfgPush(m => {
+            m.macros = {};
+            for (const k of ['MA', 'MB', 'MAa', 'MAb', 'MBa', 'MBb']) delete m.gkeys[k];
+        }, "所有宏已清空。");
     });
 
     // ========== 系统设置：时间 / 闹钟 / 倒计时 / 显示 / 回显 / 灯光 ==========
     document.getElementById('syncTimeBtn').addEventListener('click', async () => {
         const sec = Math.floor(Date.now() / 1000);
-        await sendBLE("TIME:" + sec);
-        alert("已将当前时间同步给键盘！");
+        await cfgPush(m => { m.set_epoch = sec; }, "已将当前时间同步给键盘！");
     });
 
     async function sendAlert(color) {
@@ -2243,15 +2548,28 @@
     document.getElementById('alarmOnBtn').addEventListener('click', async () => {
         const t = document.getElementById('alarmTime').value;
         if (!t) return alert("请先选一个响铃时间！");
-        await sendBLE("ALARMSET:" + t);
-        alert(`闹钟已开启：每天 ${t} 提醒`);
+        const m = t.match(/^(\d{1,2}):(\d{2})$/);
+        if (!m) return alert(`时间格式不对："${t}"（应该是 HH:MM）`);
+        const h = Number(m[1]), mm = Number(m[2]);
+        // 固件对 h/m 各有范围校验并会整份拒绝，但页面先挡一道能给一句
+        // 人话，而不是把固件的拒绝原文甩出来
+        if (h > 23 || mm > 59) return alert("时间超出范围（时 0~23、分 0~59）");
+        await cfgPush(m2 => { m2.alarm_on = true; m2.alarm_h = h; m2.alarm_m = mm; },
+            `闹钟已开启：每天 ${t} 提醒`);
     });
 
     document.getElementById('alarmOffBtn').addEventListener('click', async () => {
-        await sendBLE("ALARMSET:OFF");
-        alert("闹钟已关闭");
+        await cfgPush(m => { m.alarm_on = false; }, "闹钟已关闭");
     });
 
+    // 倒计时**不走配置 JSON**。
+    //
+    // 它是**运行时**的一次性倒数，不是存在 NVS 里的设置：固件的
+    // timerTotalSec / timerRunning / timerRemainSec 都不落盘，重启就归零。
+    // 把它塞进"配置"里会造出两个假象：
+    //   · 拉回来的配置 JSON 里躺着一个 timer_sec，用户以为这是"我的设置"
+    //   · 把这份 JSON 存回去会**顺手重置正在跑的倒计时**
+    // 所以它和 ME 文本、壁纸一样，保留自己的 TIMERSET: 通道。
     document.getElementById('tmrStartBtn').addEventListener('click', async () => {
         const h = parseInt(document.getElementById('tmrH').value) || 0;
         const m = parseInt(document.getElementById('tmrM').value) || 0;
@@ -2267,9 +2585,11 @@
         alert("倒计时已停止");
     });
 
+    // 切显示风格：改模型里的 disp_mode 再整份发回。
+    // 固件那边照样会整屏重建（摊到后面几轮 loop），所以这一下会有半秒延迟。
     async function changeDispMode() {
-        const mode = document.getElementById('dispModeSelect').value;
-        await sendBLE("DISP_MODE:" + mode);
+        const mode = Number(document.getElementById('dispModeSelect').value);
+        await cfgPush(m => { m.disp_mode = mode; });
     }
 
     async function toggleKeystroke() {
