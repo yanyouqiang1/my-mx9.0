@@ -153,6 +153,27 @@ static void logDumpPump(void);
 // 键盘 → 主：
 //     CFGDUMP:<请求号>:<json片段> ×N ，末尾跟 CFGDUMP:<请求号>:END
 //
+// ---- 增量（只改其中几项）----
+//
+//     CFGPATCH:<总字节数>     和 CFGBEGIN 一样开一段，区别只在收尾
+//     CFGDATA:<正文片段>
+//     CFGPATCHEND#<请求号>    收尾，正文是**整份 JSON 的一个子集**，语义
+//                             逐条与整份完全一致（见 cfgApplyDoc）：
+//                               · 标量键出现 = 写这一项
+//                               · <块>.remap   出现 = 整份替换该方案的映射
+//                               · <块>.macros.<键> 出现 = 写/删这一个宏
+//                               · gkeys.<槽>       出现 = 写/删这一个全局键
+//                             没提到的键一律**不动**
+//
+// ⚠ 增量**不带 version**，也不做版本闸门：补丁的语义本来就是"只动我点名的
+//   那些"，网页拿旧版页面的补丁打过来顶多是少改几项，不该整份拒掉。真要对齐
+//   版本，走整份那条路（version 对不上会明确报错）。
+//
+// 为什么值得单独开一条路：改一项（比如只切显示风格）本来要传几 KB——键盘那边
+//   收几百毫秒，网页这边传完还要再整份拉回来确认一趟。改成补丁后就是几十字节，
+//   而且**不带 disp_mode 就不会挂整屏重建**，"改个亮度键盘自己跳到设置页"
+//   这件事在根上就没有了。
+//
 // ⚠ CFGDATA 的正文里**绝对不能有 \n 和 \r**：接收侧按行攒（见 bt_link 的
 //   btLinkOnWrite），混进换行会被切成两条指令，JSON 被劈成两半，两边都只会
 //   报"解析失败"而看不出真因。所以网页发之前必须压成一行（JS 那边用
@@ -208,6 +229,9 @@ static char  cfgBuildErr[64] = {0};
 static uint32_t     cfgRxLen    = 0;    // 已攒字节
 static uint32_t     cfgRxTotal = 0;    // CFGBEGIN 声明的总长
 static bool         cfgRxActive = false;
+// 这次收的是**增量**（CFGPATCH 开的）还是**整份**（CFGBEGIN 开的）。
+// 收包流程两者一模一样，只有收尾时调的应用函数不同，所以单独记一笔。
+static bool         cfgRxPatch  = false;
 static unsigned long cfgRxLastMs = 0;
 
 // 下载侧：cfgTxBuf 的哪一段还没喂给 bt_link。
@@ -247,10 +271,46 @@ static uint8_t cfgPend = 0;
 // 和 cfgPostPump。
 static bool   cfgBufEnsure(void);
 static size_t cfgBuildJson(char* out, size_t cap);
-static int    cfgApplyJson(const char* json, size_t len, char* err, size_t errCap);
+// isPatch=false：整份（必须带 version，做版本闸门）
+// isPatch=true ：增量（不带 version，只动正文里点名的那些项）
+static int    cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, size_t errCap);
 static void   cfgJsonPump(void);
 static void   cfgPostPump(void);
-// cfgApplyJson 要跑显示风格的副作用，而 applyDispMode 的定义在它后面。
+
+// ⚠ 存不进去的项累积在这里，cfgApplyDoc 填、handleCommand 读，最后**如实报
+//   给网页**。
+//   Preferences::put* 写不下新键时只返回 0、不抛异常（见 setup() 里的可写性
+//   自检：nvs 只有 20KB，且是只增不减的日志结构）。而"页面显示已保存、断电
+//   后配置全没了"是这个功能从一开始就在消灭的那类"界面说成功、其实没生效"，
+//   所以这里绝不能把失败吞掉 —— 收件方必须能区分"存住了"和"以为存住了"。
+//
+//   做成文件级而不是给 cfgApplyDoc 加返回参数：那个函数已经返回"应用了几项"
+//   这一个 int 了，装不下"存了 N 项、其中 M 项没存住"；为捎一句话改签名会让
+//   每一个调用点都得跟着改。
+static int  nNvsFail = 0;                       // 没存住的新键数量
+static char cfgFailNames[160] = {0};            // 没存住的键名，逗号分隔
+
+// 往失败名单里追加一个键名。
+//
+// 做成宏而不是函数：.ino 的 Arduino 预处理是拿正则切函数的，函数体放在
+// 前向声明区会被当成"这里该有个函数定义"，后面整段全被当成嵌套定义直接
+// 编译不过（a function-definition is not allowed here）。宏没这个问题。
+//
+// ⚠ 名单满了就**只截断名单，计数照加**。用户真正要知道的数字是"有 N 项没
+//   存住"，名单只是点名几个给他看；反过来把计数卡在 160 字节以内，那才是
+//   真的把问题藏起来了。
+//   顺带一个坑：u 超出数组长度时 `sizeof(...) - u` 是 **size_t 下溢**，
+//   会变成天文数字，于是 snprintf 拿着一个越界指针和"随便写多少"的尺寸
+//   去写 —— 直接把内存踩烂。所以这里必须先判 u 再算剩余空间。
+#define CFG_FAIL_ADD(name)  do {                                           \
+        nNvsFail++;                                                        \
+        size_t _u = strlen(cfgFailNames);                                  \
+        if (_u + 1 < sizeof(cfgFailNames))                                 \
+            snprintf(cfgFailNames + _u, sizeof(cfgFailNames) - _u,         \
+                     "%s%s", _u ? ", " : "", (name));                      \
+    } while (0)
+
+// cfgApplyDoc 要跑显示风格的副作用，而 applyDispMode 的定义在它后面。
 static void   applyDispMode(uint8_t mode);
 
 
@@ -5291,7 +5351,7 @@ struct CfgField {
     uint8_t     post;
 };
 
-// 刻意**不含**这些，理由见下面 cfgApplyJson 的注释：
+// 刻意**不含**这些，理由见下面 cfgApplyDoc 的注释：
 //   today_key / today_y —— 每日按键计数，跟着用键涨，属于运行状态不是设置
 //   boot_cnt / elog_fs / nvs_probe —— 内部记账
 //   set_epoch            —— 含了，但它是"时间"这个**设置**，算
@@ -5464,7 +5524,7 @@ static int cfgStoreRemap(int prof, const RemapRule* rules, int nRules) {
         uint32_t val = ((uint32_t)rules[i].fromKey << 16) | (uint32_t)rules[i].toKey;
         if (preferences.putUInt(itemKey, val) == 0) nvsFail++;
         remapCounts[prof] = i + 1;
-        btLinkKeepAlive();      // 每写一条喂一次狗，见 cfgApplyJson 第二遍那段
+        btLinkKeepAlive();      // 每写一条喂一次狗，见 cfgApplyDoc 第二遍那段
     }
     preferences.putInt(cntKey, remapCounts[prof]);
 
@@ -5644,7 +5704,7 @@ static size_t cfgBuildJson(char* out, size_t cap) {
 
     // ---- timer：倒计时（只读，不落盘）----
     //
-    // ⚠ 这块是**只读**的：cfgApplyJson 收到它会原样忽略，不写 NVS、不改运行状态。
+    // ⚠ 这块是**只读**的：cfgApplyDoc 收到它会原样忽略，不写 NVS、不改运行状态。
     //   倒计时按设计就是运行内存里的东西（TIMERSET: 设、跑完归零、断电归零），
     //   落盘会带来两个坏处：
     //     · 断电重启后倒计时"复活"了，而用户以为它已经随断电结束
@@ -5707,7 +5767,16 @@ static size_t cfgBuildJson(char* out, size_t cap) {
 //
 // 3. **未知字段 = 忽略，不报错。** 网页比固件新时会多发一些字段（比如网页已经
 //    支持宏、这版固件还没接），忽略掉才能让两端独立升级；但已知字段一个都不许错。
-static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) {
+// 整份（isPatch=false）和增量（isPatch=true）走的是**同一个函数**。
+//
+// 这不是图省事，是这份文档的语义本来就是增量的：所有字段的规则都是
+// "出现 = 动，没出现 = 不动"（标量如此，<块>.remap 整份替换、macros /
+// gkeys 逐键，详见下面方案块那段注释）。所以一份只带 disp_mode 的补丁，
+// 和一份带着 disp_mode 的整份配置，在这套语义下作用完全一样 —— 区别只在
+// 有没有 version 那道闸门。
+static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, size_t errCap) {
+    nNvsFail = 0;                 // 每次请求从零开始，失败名单不跨请求累积
+    cfgFailNames[0] = '\0';
     JsonDocument doc;
     DeserializationError de = deserializeJson(doc, json, len);
     if (de) {
@@ -5754,20 +5823,27 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
     // 往后字段会一个个加进来，CFG_SCHEMA_VERSION 往上加；网页那边带的
     // version 更老（浏览器缓存了旧页面）或更新（网页先发版、固件还没跟上）
     // 都会在这里被明确挡住，而不是悄悄丢字段。
-    if (doc["version"].isNull()) {
-        snprintf(err, errCap, "缺少 version 字段");
-        return -1;
-    }
-    if (!doc["version"].is<int>()) {
-        snprintf(err, errCap, "version 必须是数字");
-        return -1;
-    }
-    int ver = doc["version"].as<int>();
-    if (ver != CFG_SCHEMA_VERSION) {
-        snprintf(err, errCap, "版本对不上:这份 JSON 是 v%d,本固件只认 v%d"
-                             "(请刷新网页重新拉取一份)",
-                 ver, CFG_SCHEMA_VERSION);
-        return -1;
+    //
+    // ⚠ 增量（isPatch）**跳过**这道闸门：补丁不带 version，而且真要对齐版本
+    //   也没必要在这里做 —— 补丁的语义是"只动我点名的那些"，网页拿老版本的
+    //   补丁打过来，最坏结果是少改几项（它没提到的键本来就不动），而不是
+    //   写坏数据。整份那条路（isPatch=false）才继续硬拦。
+    if (!isPatch) {
+        if (doc["version"].isNull()) {
+            snprintf(err, errCap, "缺少 version 字段");
+            return -1;
+        }
+        if (!doc["version"].is<int>()) {
+            snprintf(err, errCap, "version 必须是数字");
+            return -1;
+        }
+        int ver = doc["version"].as<int>();
+        if (ver != CFG_SCHEMA_VERSION) {
+            snprintf(err, errCap, "版本对不上:这份 JSON 是 v%d,本固件只认 v%d"
+                                 "(请刷新网页重新拉取一份)",
+                     ver, CFG_SCHEMA_VERSION);
+            return -1;
+        }
     }
 
     // ---- 第一遍：先校验，一个都不落地 ----
@@ -5981,14 +6057,50 @@ static int cfgApplyJson(const char* json, size_t len, char* err, size_t errCap) 
 // ⚠ 每写一个字段喂一次狗。NVS 没有后台提交线程：每写一个新键就要把对应的
 //   4KB 页读进来改、再写回去（flash 擦除一扇区几百毫秒），13 个字段连着写
 //   轻松就是好几秒。中间不喂狗，整条指令就会顶到 10 秒看门狗上 panic。
+//
+// ⚠⚠ 第二个 ⚠ 是这一段最要紧的语义：**只在值真的变了的时候才落盘、才做副作用**。
+//
+//   原来这里是"JSON 里带了 disp_mode 就赋值 + 挂重建"，**完全不看值变没变**。
+//   而网页每次都是全量下发（cfgModel 整份序列化），于是只改个亮度，JSON 里
+//   也带着 disp_mode，键盘就跟着 applyDispMode() 把主屏整个重建一遍：
+//   屏幕闪一下、全部控件指针重来，用户看到的就是"改个亮度，键盘自己跳到
+//   设置页面去了"。反过来想也成立：改显示风格本身是真的需要重建的，
+//   但那一件事不该由"有没有顺便带上 brightness"来决定。
+//
+//   顺带还有个 NVS 层面的好处：值没变还写一遍，是**白白消耗分区空间**。
+//   nvs 只有 20KB 且是只增不减的日志结构（见 setup() 里的可写性自检），
+//   每次全量保存都把 13 个键重写一遍，是在主动缩短这个分区的寿命。
+int nChanged = 0;          // 真的变了的标量项数，用来决定挂哪些副作用
 for (int i = 0; i < nPend; i++) {
     const CfgField* f = pend[i].f;
+    bool changed = false;
     switch (f->type) {
-        case CFG_U8:   *(uint8_t*)f->var   = (uint8_t)pend[i].num;   break;
-        case CFG_BOOL: *(bool*)f->var      = pend[i].boolean;        break;
-        case CFG_F32:  *(float*)f->var     = (float)pend[i].num;     break;
-        case CFG_U32:  *(uint32_t*)f->var  = (uint32_t)pend[i].num;   break;
+        case CFG_U8:
+            if (*(uint8_t*)f->var != (uint8_t)pend[i].num) {
+                *(uint8_t*)f->var = (uint8_t)pend[i].num; changed = true;
+            }
+            break;
+        case CFG_BOOL:
+            if (*(bool*)f->var != pend[i].boolean) {
+                *(bool*)f->var = pend[i].boolean; changed = true;
+            }
+            break;
+        case CFG_F32:
+            // ⚠ 浮点必须比阈值不能比等值：JSON 里的 -5.3 解析成 float 是
+            //   -5.2999997，和 NVS 里读出来的那个不一定逐位相同。用等值比
+            //   的话，"什么都没改"会被判成"变了"，反而又去重建一次。
+            if (fabsf(*(float*)f->var - (float)pend[i].num) > 0.0005f) {
+                *(float*)f->var = (float)pend[i].num; changed = true;
+            }
+            break;
+        case CFG_U32:
+            if (*(uint32_t*)f->var != (uint32_t)pend[i].num) {
+                *(uint32_t*)f->var = (uint32_t)pend[i].num; changed = true;
+            }
+            break;
     }
+    if (!changed) continue;      // 没变：不写 NVS、不做副作用、不喂狗
+    nChanged++;
     unsigned long tField = millis();
     cfgPutNvs((size_t)(f - CFG_FIELDS));   // 传下标，见 cfgPutNvs 上面的坑
     unsigned long cost = millis() - tField;
@@ -6003,6 +6115,7 @@ for (int i = 0; i < nPend; i++) {
 // 标量写完了才动这些块。顺序无所谓（互不相干），但**都在显式提交之前**，
 // 这样回 OK 的时候它们已经一起进了 flash。
 int nScheme = 0;   // 方案类改动条数，只用来给 HUD/日志报个数
+
 
 // timer：**只读，刻意不落盘**。原因见 cfgBuildJson 里 timer 那段。
 // 这里显式记一笔，免得以后有人看到"JSON 里有 timer 却没人写它"以为是漏了。
@@ -6034,30 +6147,51 @@ for (int p = 0; p < TOTAL_PROFILES; p++) {
         nScheme += n;
     }
 
-    // macros：逐键写 / 删（值为 null 或 "" = 删）
-    // 键名在这里第二次翻译成 NVS 键名 —— 校验段已经保证翻译一定成功。
-    JsonVariantConst jMacros = profObj["macros"];
-    if (!jMacros.isNull()) {
-        for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
-            const char* k = kv.key().c_str();
-            char nk[16];
-            if (!cfgMacroNvsKey(p, k, nk, sizeof(nk), err, errCap)) return -1;
-            JsonVariantConst v = kv.value();
-            const char* val = v.isNull() ? "" : v.as<const char*>();
-            if (val[0] == '\0') {
-                preferences.remove(nk);
-                ELINFO("CFG", "宏 %s(%s) 已删", nk, k);
-            } else {
-                preferences.putString(nk, val);
-                ELINFO("CFG", "宏 %s(%s) 已写 %u 字节", nk, k, (unsigned)strlen(val));
+        // 逐键写 / 删（值为 null 或 "" = 删）
+        // 键名在这里第二次翻译成 NVS 键名 —— 校验段已经保证翻译一定成功。
+        //
+        // ⚠⚠ 写入后**必须回读校验**，理由和 cfgStoreRemap 那段一样、后果一样：
+        //   Preferences::put* 写不下新键时静默失败（返回 0），而旧代码**根本
+        //   不看返回值**，直接 ELINFO("已写")。于是网页显示"已保存 N 项"、
+        //   键盘当场也按新配置工作（RAM 里有），**断一次电全没了**，而两边
+        //   的日志都写着成功。宏一多就特别容易撞上：光 24 个满宏（256 字节
+        //   一个）就 6KB，加上映射和全局键，20KB 的 nvs 分区很快就写不下
+        //   新键了（它是只增不减的日志结构，旧条目要靠 GC 慢慢回收）。
+        //   现在以**回读结果**为准，写不进去就如实报给网页 —— 让"保存成功"
+        //   真的等于"存住了"。
+        JsonVariantConst jMacros = profObj["macros"];
+        if (!jMacros.isNull()) {
+            for (JsonPairConst kv : jMacros.as<JsonObjectConst>()) {
+                const char* k = kv.key().c_str();
+                char nk[16];
+                if (!cfgMacroNvsKey(p, k, nk, sizeof(nk), err, errCap)) return -1;
+                JsonVariantConst v = kv.value();
+                const char* val = v.isNull() ? "" : v.as<const char*>();
+                if (val[0] == '\0') {
+                    preferences.remove(nk);
+                    ELINFO("CFG", "宏 %s(%s) 已删", nk, k);
+                } else {
+                    preferences.putString(nk, val);
+                    String back = preferences.getString(nk, "");
+                    if (back != val) {
+                        // 记失败项（宏，.ino 里放不了新函数，见 CFG_FAIL_ADD）
+                        CFG_FAIL_ADD(nk);
+                        ELWARN("CFG", "宏 %s 没存住(NVS 写不下,分区可能满了)", nk);
+                    } else {
+                        ELINFO("CFG", "宏 %s(%s) 已写 %u 字节", nk, k, (unsigned)strlen(val));
+                    }
+                }
+                nScheme++;
+                btLinkKeepAlive();
             }
-            nScheme++;
-            btLinkKeepAlive();
         }
     }
-}
 
 // gkeys：逐槽写 / 删 + 两个相位
+//
+// ⚠ 同样要回读校验，理由见上面 macros 那段（写不下新键时 putString 静默失败）。
+//   全局键这条尤其容易踩：一条 SW:1+CMB:128,4 之类的组合有一两百字节，
+//   而 gkeys 有 6 个槽，加上宏和映射，nvs 那 20KB 很快就满了。
 if (!jGkeys.isNull()) {
     for (JsonPairConst kv : jGkeys.as<JsonObjectConst>()) {
         const char* k = kv.key().c_str();
@@ -6070,7 +6204,14 @@ if (!jGkeys.isNull()) {
                 ELINFO("CFG", "全局键 %s 已删", k);
             } else {
                 preferences.putString(GKEY_NVS[slot], val);
-                ELINFO("CFG", "全局键 %s 已写", k);
+                String back = preferences.getString(GKEY_NVS[slot], "");
+                if (back != val) {
+                    // 记失败项（同上，宏）
+                    CFG_FAIL_ADD(k);
+                    ELWARN("CFG", "全局键 %s 没存住(NVS 写不下,分区可能满了)", k);
+                } else {
+                    ELINFO("CFG", "全局键 %s 已写 %u 字节", k, (unsigned)strlen(val));
+                }
             }
             nScheme++;
         } else if (strcmp(k, "MA_ph") == 0 || strcmp(k, "MB_ph") == 0) {
@@ -6105,6 +6246,11 @@ ELINFO("CFG", "已应用 %d 个设置项（其中方案类 %d 条），NVS 提�
 
 // ---- 界面副作用：**只置位**，留给 cfgPostPump 在后面的 loop 里一件一件做 ----
 //
+// ⚠ 只按**真的变了**的字段来挂（上面第二遍里数出来的 nChanged / 逐项的
+//   changed 标记）。原来这里是"JSON 里带了哪个字段就挂哪个"，配合网页的全量
+//   下发，等于每改任何一项都会重建主屏 —— 那正是"改个亮度键盘自己跳到设置
+//   页面"的成因。
+//
 // 顺序有讲究：
 //   CLOCK  改系统时间，无 UI 依赖，最先
 //   DISP   重建主屏（resetStylePointers 会把顶部条指针清成 nullptr 再由
@@ -6113,7 +6259,17 @@ ELINFO("CFG", "已应用 %d 个设置项（其中方案类 %d 条），NVS 提�
 //   SAVER  最后：屏保模式可能要 destroyMainScreen()，放最后才不会白重建
 uint8_t pendMask = 0;
 for (int i = 0; i < nPend; i++) {
-    switch (pend[i].f->post) {
+    const CfgField* f = pend[i].f;
+    // 和第二遍同一个判据：这个字段是不是真变了
+    bool stillSame = false;
+    switch (f->type) {
+        case CFG_U8:   stillSame = (*(uint8_t*)f->var == (uint8_t)pend[i].num);   break;
+        case CFG_BOOL: stillSame = (*(bool*)f->var == pend[i].boolean);          break;
+        case CFG_F32:  stillSame = (fabsf(*(float*)f->var - (float)pend[i].num) <= 0.0005f); break;
+        case CFG_U32:  stillSame = (*(uint32_t*)f->var == (uint32_t)pend[i].num); break;
+    }
+    if (stillSame) continue;      // 没变 → 不挂副作用（值已经是它了）
+    switch (f->post) {
         case CFG_POST_CLOCK: pendMask |= CFG_PEND_CLOCK; break;
         case CFG_POST_DISP:  pendMask |= CFG_PEND_DISP;  break;
         case CFG_POST_PROF:  pendMask |= CFG_PEND_PROF;  break;
@@ -6123,11 +6279,13 @@ for (int i = 0; i < nPend; i++) {
     }
 }
 cfgPend |= pendMask;   // 或运算：上一次还没做完的不要被覆盖掉
+if (pendMask == 0 && nChanged == 0)
+    ELINFO("CFG", "本次没有任何值发生变化,未落盘也未重建界面");
 
-return nPend + nScheme;
+return nChanged + nScheme;
 }
 
-// loop() 里跑：cfgApplyJson 置起来的界面副作用，**一轮只做一件**。
+// loop() 里跑：cfgApplyDoc 置起来的界面副作用，**一轮只做一件**。
 //
 // 这才是"保存配置不再重启"的真正原因 —— 一次全屏重建独占一轮 loop，
 // 前后都有键盘扫描、LVGL 刷新和 esp_task_wdt_reset()，10 秒看门狗永远饿不着。
@@ -6195,6 +6353,33 @@ static void applyDispMode(uint8_t mode) {
     // 主机切风格时用户可能正停在菜单/设置界面，别把他踢出当前界面
     if (currentSysMode == SYS_MODE_NORMAL) showScreen(ensureMainScreen());
     triggerHud("显示风格", dispModeNames[currentDispMode], lv_color_hex(CLR_ACCENT));
+}
+
+// 开一段配置接收。isPatch 区分"整份"和"增量"两种后续。
+//
+// 这两个入口（CFGBEGIN / CFGPATCH）的收包流程**完全一样** —— 同一个缓冲、
+// 同一套长度校验、同一片 5 秒超时，唯一区别是收尾时走 cfgApplyDoc 的哪个
+// 模式。所以合并成一个函数，免得以后修校验漏掉其中一条路。
+static bool cfgRxBegin(const String& s, bool isPatch) {
+    uint32_t total = (uint32_t)s.toInt();
+    if (!cfgBufEnsure()) {
+        btLinkReplyC("CFGSAVE", "ERR:固件内存不够");
+        cfgRxActive = false;
+        return false;
+    }
+    if (total == 0 || total > CFG_BUF_SIZE) {
+        ELWARN("CFG", "拒绝一段 %u 字节的配置（上限 %d）",
+               (unsigned)total, (int)CFG_BUF_SIZE);
+        btLinkReplyC("CFGSAVE", "ERR:长度不合法");
+        cfgRxActive = false;
+        return false;
+    }
+    cfgRxPatch  = isPatch;
+    cfgRxTotal  = total;
+    cfgRxLen    = 0;
+    cfgRxActive = true;
+    cfgRxLastMs = millis();
+    return true;
 }
 
 static void handleCommand(const String& cmd) {
@@ -6737,27 +6922,18 @@ static void handleCommand(const String& cmd) {
         }
     }
     // ---------------- 配置 JSON：保存 ----------------
-    else if (cmd.startsWith("CFGBEGIN:")) {
-        uint32_t total = (uint32_t)cmd.substring(9).toInt();
-        if (!cfgBufEnsure()) {
-            btLinkReplyC("CFGSAVE", "ERR:固件内存不够");
-            cfgRxActive = false;
-        } else if (total == 0 || total > CFG_BUF_SIZE) {
-            ELWARN("CFG", "拒绝一段 %u 字节的配置（上限 %d）",
-                   (unsigned)total, (int)CFG_BUF_SIZE);
-            btLinkReplyC("CFGSAVE", "ERR:长度不合法");
-            cfgRxActive = false;
-        } else {
-            cfgRxTotal = total;
-            cfgRxLen   = 0;
-            cfgRxActive = true;
-            cfgRxLastMs = millis();
-        }
+    else if (cmd.startsWith("CFGBEGIN:") || cmd.startsWith("CFGPATCH:")) {
+        // 两条路只有收尾时调的模式不同，攒字节的部分共用 cfgRxBegin。
+        // ⚠ "CFGBEGIN:" 和 "CFGPATCH:" 都正好 9 个字符，substring(9) 才是
+        //   长度后面那一位 —— 写错一位会从 ':' 后面再切掉一个字符，
+        //   toInt() 永远得 0，然后固件回一句莫名其妙的"长度不合法"。
+        bool patch = cmd.startsWith("CFGPATCH:");
+        cfgRxBegin(cmd.substring(9), patch);
     }
     else if (cmd.startsWith("CFGDATA:")) {
         String chunk = cmd.substring(8);
         if (!cfgRxActive) {
-            // CFGBEGIN 丢了（老网页直接发 DATA，或那一包被协议栈吞了）。
+            // CFGBEGIN/CFGPATCH 丢了（老网页直接发 DATA，或那一包被协议栈吞了）。
             // 静默丢掉整段会变成"网页显示保存成功、键盘没变"，比报错难查得多。
             ELWARN("CFG", "CFGDATA 没有 CFGBEGIN，丢弃");
             btLinkReplyC("CFGSAVE", "ERR:缺少 CFGBEGIN");
@@ -6774,16 +6950,23 @@ static void handleCommand(const String& cmd) {
         memcpy(cfgRxBuf + cfgRxLen, chunk.c_str(), chunk.length());
         cfgRxLen += chunk.length();
     }
-    else if (cmd == "CFGEND") {
+    else if (cmd == "CFGEND" || cmd == "CFGPATCHEND") {
         if (!cfgRxActive) {
             btLinkReplyC("CFGSAVE", "ERR:没有在收");
             return;
         }
         cfgRxActive = false;
+        // 以**收尾这条指令**说的模式为准，而不是开段时记的那个：网页要是把
+        // CFGBEGIN 配 CFGPATCHEND 凑到一起，那一定是它自己串错了，按它要的
+        // 那个理解比反过来更不容易出乎意料。
+        bool isPatch = (cmd == "CFGPATCHEND");
+        if (isPatch != cfgRxPatch)
+            ELWARN("CFG", "开段说的是%s、收尾说的是%s（网页串错了），按收尾的算",
+                   cfgRxPatch ? "增量" : "整份", isPatch ? "增量" : "整份");
         if (cfgRxLen != cfgRxTotal) {
             // 少收了几片。**不能**拿手上这段去解析：JSON 被截断后，
             // deserializeJson 有可能把最后那个没闭合的对象整个丢掉还"成功"，
-            // 于是 cfgApplyJson 会拿一个字段都不剩的文档来"应用"。
+            // 于是 cfgApplyDoc 会拿一个字段都不剩的文档来"应用"。
             ELWARN("CFG", "没收齐：声明 %u 实收 %u，丢弃",
                    (unsigned)cfgRxTotal, (unsigned)cfgRxLen);
             btLinkReplyC("CFGSAVE", "ERR:没收齐，可能丢片");
@@ -6793,13 +6976,29 @@ static void handleCommand(const String& cmd) {
         char err[96];
         err[0] = '\0';
         unsigned long t0 = millis();
-        int n = cfgApplyJson(cfgRxBuf, cfgRxLen, err, sizeof(err));
+        int n = cfgApplyDoc(cfgRxBuf, cfgRxLen, isPatch, err, sizeof(err));
         unsigned long spent = millis() - t0;
+        // 存不进去的项名（cfgApplyDoc 里回读校验挑出来的）
+        char failed[160] = {0};
         if (n < 0) {
             ELWARN("CFG", "应用失败：%s", err);
             btLinkReplyf("CFGSAVE", "ERR:%s", err);
+        } else if (nNvsFail > 0 && cfgFailNames[0]) {
+            // ⚠ 这一条**不是** ERR：值已经写进 RAM 并提交了，键盘当场就是新的，
+            //   但有 n 项**没存进 flash**，断电会丢。如实告诉网页，别让它显示
+            //   一句"已保存 N 项"把人骗过去 —— 页面必须把这件事说清楚。
+            //   第四段带的是失败项名，网页会点名显示。
+            snprintf(failed, sizeof(failed), "%s", cfgFailNames);
+            ELWARN("CFG", "已应用 %d 项，但 %d 项没存进 flash：%s",
+                   n, nNvsFail, failed);
+            btLinkReplyf("CFGSAVE", "OK:%d:%lu:PARTIAL:%d:%s", n, (unsigned long)spent,
+                         nNvsFail, failed);
+            char info[64];
+            snprintf(info, sizeof(info), "已保存 %d 项，但 %d 项没存住",
+                     n, nNvsFail);
+            triggerHud("配置 JSON", info, lv_color_hex(CLR_AMBER));
         } else {
-            // 此刻值已经**提交进 flash**、可以断电了（见 cfgApplyJson 里的
+            // 此刻值已经**提交进 flash**、可以断电了（见 cfgApplyDoc 里的
             // preferences.end()）。界面重建还挂在 cfgPend 上，接下来几轮 loop
             // 一件一件做 —— 所以这里说的是"已存盘"，屏幕可能晚几百毫秒才对上。
             btLinkReplyf("CFGSAVE", "OK:%d:%lu", n, (unsigned long)spent);

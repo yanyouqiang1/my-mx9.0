@@ -170,13 +170,13 @@
             <button class="btn btn-green" id="remapSaveBtn" style="width: 100%; margin-top: 12px;">💾 保存到键盘（保存后会自动读回确认）</button>
         </div>
 
-        <!-- 3. MA / MB / M1-M12 全局动作合并 -->
+        <!-- 3. M1-M12 全局动作合并 -->
         <div class="card">
-            <h2>2. 全局独立功能键 (MA / MB / M1~M12)</h2>
+            <h2>2. 全局独立功能键 (M1~M12)</h2>
             <div class="hint">
-                这里配的是"按下这一颗键，除了按方案宏（M1-M12 才有）外，还会做什么"。
+                这里配的是"按下这一颗键，除了按方案宏外，还会做什么"。
                 例如 M1 设成"切到 macOS + Ctrl+Alt+T"，按 M1 会先切系统再发热键。
-                MA / MB 是纯全局键（没按方案宏），M1-M12 是按方案宏 + 全局动作双层叠加。
+                <br>（MA / MB 是双状态切换键，不在这里配 —— 它们在下面第 3 区。）
             </div>
 
             <div class="grid-2" style="margin-top: 10px;">
@@ -243,8 +243,7 @@
                         <br>
                         <b>按键规则：</b><br>
                         • M1~M12：先跑全局配置，再播按方案宏<br>
-                        • 不配全局动作 → M1-M12 行为与旧版一致（仅按方案宏）<br>
-                        • MA / MB 已迁到下方「双状态切换」独立设置区
+                        • 不配全局动作 → M1-M12 行为与旧版一致（仅按方案宏）
                         <br>
                         <b>组合键码值：</b>Ctrl=128, Shift=129, Alt=130, Win=131，键位见下方 KEY_OPTIONS
                     </div>
@@ -604,9 +603,17 @@
                 <b>连上蓝牙时会自动拉一次</b>，上面所有配置表单（显示风格 / 闹钟 /
                 方案 / 映射 / 宏 / 全局键）都会随之填成键盘里的真实值。<br><br>
                 整个页面<b>只有这一份配置</b>：在上面的表单里改、在下面的框里手改，
-                保存走的都是同一条路 —— 改模型，再整份发回键盘。所以「从键盘拉取」
+                读写的都是同一条路 —— 改模型，再发回键盘。所以「从键盘拉取」
                 一次就等于以前的「一次性预加载全部」（那个按钮原来是 54 条指令、
                 要跑 30 秒，现在是一次往返）。<br><br>
+                <b>怎么发回去的</b>：<br>
+                · 上面每个控件单独保存时，只发<b>这次改动的那几项</b>（几十字节），
+                  键盘上其它配置一个字节都不动。顺带也解决了"改个亮度键盘自己
+                  跳到设置页" —— 因为补丁里没带 <code>disp_mode</code>，固件就不会
+                  重建主屏。<br>
+                · 下面这个框点「💾 保存到键盘」时走<b>整份</b>（你在框里手改了什么
+                  只有你自己知道，差异不可信）。<br>
+                · 两种发法的语义完全一致：都是"框里有的才动，没写的不动"。<br><br>
                 <b>包含什么</b>：<br>
                 · 十三个标量设置：显示风格、屏保、当前方案、背光、亮度、灯效、
                   状态灯亮度、按键特效、闹钟开关/时/分、温度偏移、时间<br>
@@ -646,7 +653,9 @@
                   但它必须和所在块对得上 —— 写在 <code>mac</code> 块里的
                   <code>"p0_M7"</code> 会被<b>拒绝</b>，因为那几乎一定是复制 Windows
                   那段忘了改。写成 <code>"M7"</code> 最省事。<br>
-                · 点保存时固件会<b>显式提交 flash</b>，所以"已保存"之后断电也不会丢。<br>
+                · 点保存时固件会<b>显式提交 flash</b>，所以"已保存"之后断电也不会丢。
+                  但如果 nvs 分区满了装不下新键，固件会**如实告诉你哪几项没存住**
+                  （状态栏 + 弹窗点名），因为那种情况下键盘当场是新配置、**断电会丢**。
                 · 这些值仍然存在原来那套 NVS 键里（<code>p0_*</code> / <code>p1_*</code>），
                   <b>不会清掉你已有的按键映射和宏</b>：Windows 就是原来的方案 1，
                   macOS 就是原来的方案 2。原来方案 3/4 的数据还留在 NVS 里，
@@ -1547,25 +1556,127 @@
         await loadToggleFromCache();
     }
 
-    // 改模型 → 整份发回键盘 → 成功后再拉一次（用回读结果刷新界面）
+    // ---- 增量：算出"这次到底改了哪些" ----
     //
-    // 为什么保存后要**再拉一次**而不是就地更新界面：固件对 remap 会做回读
+    // 以前每个控件保存都是把 cfgModel 整份发回去（CFGBEGIN/CFGEND），代价有两处：
+    //   ① 传输慢：一次几 KB，分片发 + 收尾还要等固件解析落盘
+    //   ② 更要命：整份里**每一项都带着**，于是固件那边"JSON 里带了 disp_mode
+    //      就挂一次整屏重建" —— 用户只想改个亮度，键盘却自己把主屏拆了重建，
+    //      看起来就是"改个配置，键盘自己跳到设置页面去了"。
+    //
+    // 所以单改一项时只发**差异**（CFGPATCH/CFGPATCHEND）。固件那边的补丁语义
+    // 和整份逐条一致：标量出现 = 写这一项；<块>.remap 出现 = 整份替换该方案的
+    // 映射；<块>.macros.<键> / gkeys.<槽> 出现 = 写/删这一个键（null = 删）。
+    // 没提到的键一律不动。
+    //
+    // 做法是土的但很稳：**让 mutator 在深拷贝上跑一遍，再拿拷贝和当前模型求差**。
+    // 这样所有调用点（改亮度、切风格、存一个宏、删一条映射……）一行都不用改，
+    // 它们本来就是在写 cfgModel —— 差多少是自动算出来的，不存在"忘了把某个
+    // 控件加进补丁清单"这种漏改。
+    function cfgDiffPatch(oldM, newM) {
+        const patch = {};
+        // version / timer / 方案块 / gkeys 都不走这条普通分支，下面单独处理
+        for (const [k, v] of Object.entries(newM)) {
+            if (k === 'version' || k === 'timer' || k === 'gkeys') continue;
+            if (CFG_PROFILES.includes(k)) continue;
+            const o = oldM[k];
+            if (o === v) continue;
+            // 浮点比阈值不比等值：和固件那边同一个道理（sht_offset 之类），
+            // JSON 的 -5.3 解析回来是 -5.299999…，等值比会把这个当成"变了"，
+            // 于是白重建一次界面。
+            if (typeof v === 'number' && typeof o === 'number' && Math.abs(v - o) < 0.0005) continue;
+            patch[k] = v;
+        }
+        for (const p of CFG_PROFILES) {
+            const o = oldM[p] || {}, w = newM[p] || {};
+            const sp = {};
+            let hit = false;
+            // remap 在页面上是一个列表编辑器：用户勾一堆规则点保存，页面手上
+            // 只有保存后的**完整列表**，所以语义是"整份替换"，没变就整块不带上
+            if (JSON.stringify(w.remap || []) !== JSON.stringify(o.remap || [])) {
+                sp.remap = w.remap || []; hit = true;
+            }
+            const om = o.macros || {}, wm = w.macros || {};
+            for (const [mk, mv] of Object.entries(wm)) {
+                if (mv !== om[mk]) { (sp.macros = sp.macros || {})[mk] = mv; hit = true; }
+            }
+            // 删掉的宏必须显式发 null —— 补丁里"键不存在"的意思是**不动它**
+            for (const mk of Object.keys(om)) {
+                if (!(mk in wm)) { (sp.macros = sp.macros || {})[mk] = null; hit = true; }
+            }
+            if (hit) patch[p] = sp;
+        }
+        const og = oldM.gkeys || {}, wg = newM.gkeys || {};
+        const sg = {};
+        let ghit = false;
+        for (const [k, v] of Object.entries(wg)) {
+            if (v !== og[k]) { sg[k] = v; ghit = true; }
+        }
+        for (const k of Object.keys(og)) {
+            if (!(k in wg)) { sg[k] = null; ghit = true; }
+        }
+        if (ghit) patch.gkeys = sg;
+        return patch;
+    }
+
+    // 把 cfgModel 整个换成另一份（cfgModel 是 const，只能就地换内容）
+    function cfgAdoptModel(src) {
+        for (const k of Object.keys(cfgModel)) delete cfgModel[k];
+        Object.assign(cfgModel, src);
+    }
+
+    // 补丁存成功了，但**不**重新整份拉取：这次动的就是 mutator 改的那几项，
+    // 固件没有可能把它"裁短"（回读校验只影响 NVS 写不下的时候，那条路会
+    // 回 PARTIAL，下面会退回去整份重拉）。所以直接用本地这份草稿刷新界面。
+    async function cfgApplyLocalModel(src) {
+        cfgAdoptModel(src);
+        cfgModel.version = CFG_SCHEMA_VERSION;
+        cfgModelToTextbox();
+        cfgFillForms();
+        await cfgRefreshAllLists();
+    }
+
+    // 改模型 → 发回键盘（单控件走增量补丁，"保存整份 JSON"走全量）→ 成功后刷新
+    //
+    // mutator 传 null = **整份**下发：那是 JSON 手改框上的「💾 保存到键盘」，
+    // 用户在框里改了什么只有他自己知道，diff 出来的"差异"是不可信的，所以
+    // 那条路必须原样把整份发过去。
+    //
+    // 为什么全量保存后要**再拉一次**而不是就地更新界面：固件对 remap 会做回读
     // 校验，NVS 分区满的时候它会把 RAM 表裁成"实际存住的那部分"。这时候
     // 页面如果还按用户输入显示，就是"界面说 8 条、键盘上只有 5 条"。
     // 再拉一次，界面显示的就是 flash 里真正有的东西。
     async function cfgPush(mutator, okMsg) {
         if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
+        const full = (typeof mutator !== 'function');
         if (!cfgLoaded) {
-            if (!confirm("还没从键盘拉取过配置。\n\n继续的话会以**当前页面上显示的默认值**为准整份下发，"
-                      + "键盘上已有的配置会被覆盖。\n\n建议先点「📥 从键盘拉取」。确定继续？")) {
-                return false;
-            }
+            const msg = full
+                ? "还没从键盘拉取过配置。\n\n继续的话会以**当前页面上显示的默认值**为准整份下发，"
+                  + "键盘上已有的配置会被覆盖。\n\n建议先点「📥 从键盘拉取」。确定继续？"
+                : "还没从键盘拉取过配置。\n\n继续的话会**只把你这次改动的那几项**发过去，"
+                  + "键盘上其它配置不动。但如果你挑的刚好就是键盘上现在的值，"
+                  + "会以为「没东西要改」而白跑一趟。\n\n建议先点「📥 从键盘拉取」。确定继续？";
+            if (!confirm(msg)) return false;
         }
-        if (typeof mutator === 'function') mutator(cfgModel);
-        cfgModel.version = CFG_SCHEMA_VERSION;
-        cfgModelToTextbox();
-
-        const compact = JSON.stringify(cfgModel);
+        // 补丁从"草稿"上算：草稿没存进去之前，cfgModel 一概不动，
+        // 免得传输失败之后页面显示的和键盘上的对不上
+        let draft = null, compact = null;
+        if (full) {
+            cfgModel.version = CFG_SCHEMA_VERSION;
+            cfgModelToTextbox();
+            compact = JSON.stringify(cfgModel);
+        } else {
+            draft = JSON.parse(JSON.stringify(cfgModel));
+            mutator(draft);
+            const patch = cfgDiffPatch(cfgModel, draft);
+            if (!Object.keys(patch).length) {
+                // 一项都没变。这不是失败：本来就不该去动键盘（NVS 只有 20KB
+                // 且只增不减，白写一遍是在缩短它的寿命）
+                cfgSetStatus("和键盘上的一样，没有要保存的", "#94a3b8");
+                return true;
+            }
+            compact = JSON.stringify(patch);
+        }
         if (compact.indexOf("\n") >= 0 || compact.indexOf("\r") >= 0) {
             return cfgSetStatus("JSON 里有字符串值含换行，传不过去（固件按行收）", "#f87171"), false;
         }
@@ -1583,9 +1694,10 @@
             alert(msg);
             return false;
         }
-        cfgSetStatus(`正在下发 ${total} 字节…`, "#38bdf8");
-        if (!await sendBLE("CFGBEGIN:" + total)) {
-            cfgSetStatus("CFGBEGIN 没发出去，蓝牙可能断了", "#f87171");
+        cfgSetStatus(full ? `正在下发 ${total} 字节…` : `正在下发 ${total} 字节的改动…`, "#38bdf8");
+        const beginCmd = full ? "CFGBEGIN:" : "CFGPATCH:";
+        if (!await sendBLE(beginCmd + total)) {
+            cfgSetStatus(`${beginCmd} 没发出去，蓝牙可能断了`, "#f87171");
             return false;
         }
         for (const piece of cfgSplitForBle(compact, CFG_JSON_MAX_CHUNK)) {   // ⚠ 约定 2
@@ -1594,15 +1706,16 @@
                 return false;
             }
         }
-        // 只有 CFGEND 带请求号，固件回 CFGSAVE:<请求号>:... 时才配得对
+        // 只有收尾这条带请求号，固件回 CFGSAVE:<请求号>:... 时才配得对
+        const endCmd = full ? "CFGEND" : "CFGPATCHEND";
         BtLink._lastSendErr = null;
-        const reply = await BtLink.call("CFGSAVE", "CFGEND", 30000);
+        const reply = await BtLink.call("CFGSAVE", endCmd, 30000);
         if (reply === null) {
             // 三种 null 分开说。其中"没发出去"最要紧：固件那边压根没收到
-            // CFGEND，而它还开着 5 秒接收窗口，超时后会往日志里报
+            // 收尾指令，而它还开着 5 秒接收窗口，超时后会往日志里报
             // "没有在收" —— 看着像固件的问题，其实是连接断了。
             if (BtLink._lastSendErr) {
-                cfgSetStatus("CFGEND 没写进键盘（蓝牙断了？）", "#f87171");
+                cfgSetStatus(`${endCmd} 没写进键盘（蓝牙断了？）`, "#f87171");
             } else {
                 cfgSetStatus("没等到固件回应。配置**可能已经存上了**（可拉取确认）", "#fbbf24");
             }
@@ -1613,13 +1726,26 @@
             alert("固件拒绝保存：\n" + reply.slice(4));
             return false;
         }
-        // 回的是 `OK:<应用项数>:<固件侧耗时毫秒>`。第三个数是固件自己量的
+        // 回的是 `OK:<应用项数>:<固件侧耗时毫秒>`（存不下时还带
+        // `:PARTIAL:<失败数>:<键名>`）。第三个数是固件自己量的
         // （十几项 NVS 页写入 + 显式提交），带出来是为了以后真出问题时
         // 能一眼看出"慢在哪一侧"，不用再去翻日志。
         const p = reply.split(":");
         const ms = p[2] ? `${p[2]} ms` : "耗时未知";
-        await cfgPull(true);
-        cfgSetStatus(`已保存 ${p[1]} 项配置（固件侧 ${ms}）`, "#4ade80");
+        // 固件报"有 M 项没存进 flash"时，页面上的值已经和键盘对不上了，
+        // 必须整份重拉一次把真实状态拉回来；全存住了的话，补丁这条路就地
+        // 刷新就行 —— 省掉的就是这一整轮下载，这才是增量省时间的大头。
+        const partial = p[3] === 'PARTIAL';
+        if (full || partial) await cfgPull(true);
+        else await cfgApplyLocalModel(draft);
+        if (partial) {
+            const names = p[5] || "";
+            cfgSetStatus(`已应用 ${p[1]} 项，但 ${p[4]} 项没存进 flash（断电会丢）：${names}`, "#fbbf24");
+            alert(`以下配置**没能存进 flash**（nvs 分区可能满了），断电后会丢：\n${names}\n\n`
+                + `建议：拉取一次配置 → 删掉几个不用的宏或映射 → 再保存。`);
+        } else {
+            cfgSetStatus(`已保存 ${p[1]} 项配置（固件侧 ${ms}）`, "#4ade80");
+        }
         if (okMsg) alert(okMsg);
         return true;
     }
@@ -1936,8 +2062,29 @@
         });
     }
 
+    // 键码 → 键名。**两套编码都要认**，否则映射列表回显出来是一串 "#128"。
+    //
+    // ⚠ 为什么会有两套：KEY_OPTIONS 里修饰键存的是 HID 标准码 224~231
+    //   （0xE0~0xE7），而固件的 normalizeRemapKey() 在读 NVS 时会把这一段
+    //   折算成 Arduino 风格的 128~135（224 - 96）**再发给网页**。于是：
+    //     · 用户从下拉里选「🔹 Left Ctrl」→ 存 224
+    //     · 键盘读出来折算成 128 → 回传网页
+    //     · codeToKeyName(128) 在表里找不到 → 返回 null → 显示 "#128"
+    //   用户看到的是"我配的明明是 Left Control，怎么回来变成井号 128 了"。
+    //
+    //   折算关系是 code - 0x60（见 lvgl_s3.ino 的 normalizeRemapKey），
+    //   这里照着补一张反向表。两边要改必须一起改。
+    const ARDUINO_MOD_TO_HID = {
+        128: 224, 129: 225, 130: 226, 131: 227,
+        132: 228, 133: 229, 134: 230, 135: 231,
+    };
     function codeToKeyName(code) {
+        if (typeof code === 'string') code = Number(code);
         for (const k in KEY_OPTIONS) if (KEY_OPTIONS[k] === code) return k;
+        const hid = ARDUINO_MOD_TO_HID[code];
+        if (hid !== undefined) {
+            for (const k in KEY_OPTIONS) if (KEY_OPTIONS[k] === hid) return k;
+        }
         return null;
     }
 
