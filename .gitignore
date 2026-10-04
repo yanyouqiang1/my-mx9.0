@@ -31,3 +31,4 @@ ehthumbs.db
 
 # 预览图生成物：mock_bottom.py 跑一次就重新出一张，不进仓库
 mock_bottom*.png
+mock_pet*.png
