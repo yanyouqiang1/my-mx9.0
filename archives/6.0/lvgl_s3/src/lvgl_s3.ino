@@ -460,6 +460,15 @@ TwoWire Wire_SHT(1);
 // 所以**故意排在 IS_SETTING_MODE 区间（3~7）之外**，别被 moveSettingField /
 // adjustSettingField 那套接管。它自己在按键分发里占一个分支。
 #define SYS_MODE_ELOG      10
+// 宠物页。追加在末尾（0~10 已占满），**不是**"设置模式"：
+// 1. 不能落进 IS_SETTING_MODE 的 3~7 连续区间，否则被 moveSettingField /
+//    adjustSettingField 那套接管，按键语义全错。
+// 2. ⚠️ 更要紧的是：**绝对不要把它加进 scanKeyboardMatrix() 里的 inUiMode
+//    表达式**（那个变量在 5899 附近）。inUiMode 一旦命中，5899 之后那一整块
+//    会把按键吃干净、一律不发主机 —— 表现就是"宠物页里一个字都打不出来"。
+//    故意不加：宠物页里矩阵键照常走普通键盘分支发给主机，宠物只作反应。
+//    宠物页的全部操作走 C3 实体键（静音/旋钮/灯光长按），那些键矩阵里没有。
+#define SYS_MODE_PET       11
 #define IS_SETTING_MODE(m) ((m) >= SYS_MODE_SET_TIME && (m) <= SYS_MODE_SET_LIGHT)
 static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
@@ -499,6 +508,47 @@ static const char* modeNamesCN[MODE_COUNT] = { "键盘背光", "屏幕亮度", "
 // 通知系统
 // ===========================
 enum AlertType { ALERT_NONE, ALERT_RED, ALERT_GREEN, ALERT_YELLOW };
+
+// ---- 宠物的类型声明放在这里，不放在宠物那一节 ----
+// Arduino 把 .ino 预处理成 .cpp 时会**给每个函数自动生成一份原型**，插在
+// "第一个函数定义"之前（本文件大约 1000 行处）。原型里出现自定义类型时，
+// 那个类型必须在插入点之前就可见，否则报 "'PetScene' does not name a type"。
+// 同类的坑 formatDateCN 那段注释也记过（参数改成收 int 就是为了躲它）。
+// 所以凡是出现在函数签名里的自定义类型，一律跟着 AlertType 放在这一段。
+enum PetScene { SCENE_NONE = 0, SCENE_PEEK, SCENE_FULL, SCENE_SAVER };
+enum PetPose {
+    POSE_IDLE = 0, POSE_GREET, POSE_HAPPY, POSE_HUNGRY,
+    POSE_SLEEP, POSE_GRUMPY, POSE_SICK
+};
+
+// 心情分档：台词按 moodMin 过滤，所以 mood 的用途只有"决定说什么口吻"
+#define PET_MOOD_SAD    30
+#define PET_MOOD_OK     65
+
+struct PetState {
+    uint8_t  mood;           // 0..100
+    uint16_t bond;           // 亲密度，长期累积
+    uint8_t  pose;
+    uint32_t poseUntilMs;    // 姿态自然结束的时刻（到点自动回 IDLE）
+    uint32_t lastPettedMs;   // 上次被摸（算抚摸冷却）
+    uint32_t lastSeenMs;     // 上次见到人（算"你走了多久"）
+    uint8_t  fedToday;
+    uint32_t fedYmd;
+    uint8_t  peekToday;      // 今日探头次数，对 PET_PEEK_DAILY_MAX
+    uint32_t peekYmd;
+    uint8_t  bothered;       // 连续被打扰次数，>=2 暂停一天
+    uint32_t muteYmd;        // 主动探头暂停到哪一天
+    bool     peekOn;         // 主动打招呼总开关，默认开
+    uint8_t  fromH;          // 显示时段起（小时）
+    uint8_t  toH;            // 显示时段止（小时）
+};
+
+// 让位清单的三个函数声明放这里（宠物本体在 3500 行之后，这里先用）：
+// resetStylePointers()（1400 行出头）要调 petYieldClear()，壁纸和高对比度
+// 两个 build_style_* 也要调 petYieldAdd()，它们都比宠物本体早。
+static void petYieldAdd(lv_obj_t* o);
+static void petYieldClear(void);
+static void petSetBottomYield(bool yield);
 
 #define MAX_NOTIFS 8
 static uint8_t notifCount = 0;
@@ -659,7 +709,12 @@ enum MenuAction {
     MA_REFRESH_SHT,     // 刷新温湿度
     MA_OPEN_CALTEMP,    // 温度校准
     MA_CLEAR_COUNTERS,  // 计数清零
-    MA_OPEN_ELOG        // 错误日志
+    MA_OPEN_ELOG,       // 错误日志
+    MA_PET_PEEK_ON,     // 宠物：主动打招呼开关
+    MA_PET_WINDOW,      // 宠物：显示时段
+    MA_PET_OPEN,        // 宠物：进全屏页
+    MA_PET_RENAME,      // 宠物：改名
+    MA_PET_RESET        // 宠物：清空亲密度
 };
 
 struct MenuEntry {
@@ -695,6 +750,15 @@ static const MenuEntry menuEntriesSystem[] = {
     { "计数清零",     MA_CLEAR_COUNTERS },
     { "错误日志",     MA_OPEN_ELOG }
 };
+// 宠物组**追加在末尾**（第 7 个）。理由和屏保档位一样：分组编号会影响用户的
+// 肌肉记忆，插在中间会让原来"第 N 组"的位置全变。
+static const MenuEntry menuEntriesPet[] = {
+    { "主动打招呼",   MA_PET_PEEK_ON },
+    { "显示时段",     MA_PET_WINDOW },
+    { "去找小橘",     MA_PET_OPEN },
+    { "改名字",       MA_PET_RENAME },
+    { "清空亲密度",   MA_PET_RESET }
+};
 
 struct MenuGroup {
     const char*     cn;
@@ -703,14 +767,15 @@ struct MenuGroup {
     uint8_t          count;
 };
 
-#define MENU_GROUP_COUNT 6
+#define MENU_GROUP_COUNT 7
 static const MenuGroup menuGroups[MENU_GROUP_COUNT] = {
     { "显示",   "DISPLAY",  menuEntriesDisplay,  sizeof(menuEntriesDisplay)  / sizeof(MenuEntry) },
     { "灯光",   "LIGHTING", menuEntriesLight,    sizeof(menuEntriesLight)    / sizeof(MenuEntry) },
     { "时间",   "TIME",     menuEntriesTime,     sizeof(menuEntriesTime)     / sizeof(MenuEntry) },
     { "键盘",   "KEYBOARD", menuEntriesKeyboard, sizeof(menuEntriesKeyboard) / sizeof(MenuEntry) },
     { "温湿度", "SENSOR",   menuEntriesSensor,   sizeof(menuEntriesSensor)   / sizeof(MenuEntry) },
-    { "系统",   "SYSTEM",   menuEntriesSystem,   sizeof(menuEntriesSystem)   / sizeof(MenuEntry) }
+    { "系统",   "SYSTEM",   menuEntriesSystem,   sizeof(menuEntriesSystem)   / sizeof(MenuEntry) },
+    { "宠物",   "PET",      menuEntriesPet,      sizeof(menuEntriesPet)      / sizeof(MenuEntry) }
 };
 
 // 辅助变量
@@ -1178,6 +1243,9 @@ static uint8_t rhythmBars[24] = {0};
 static lv_obj_t* wp_bg = nullptr;
 static lv_obj_t* wp_img = nullptr;
 static lv_obj_t* wp_lbl_time = nullptr;
+// 壁纸右下角那块 112x40 的时钟板。原来是 build_style_wallpaper 里的局部变量，
+// 探头的"底部让位"要隐藏它，提成全局才有句柄。
+static lv_obj_t* wp_plate = nullptr;
 
 // 高对比度（B-1「横向战舰」纯黑 + 横向驾驶舱：LED顶栏 / 时-日卡 / 键名卡 / 数据带 / 状态行）
 static lv_obj_t* hc_bg = nullptr;
@@ -1217,6 +1285,11 @@ static lv_obj_t* hc_lbl_strip_t     = nullptr;   // "温度" 说明
 static lv_obj_t* hc_lbl_strip_t_val = nullptr;   // 温度数值
 static lv_obj_t* hc_lbl_strip_chars = nullptr;   // "字数" 说明
 static lv_obj_t* hc_lbl_strip_chars_val = nullptr; // 字数数值
+// 底部状态条那 12 个平铺对象里的两个：装饰框和竖分隔线。
+// 原来是 build_style_high_contrast 里 { } 块中的局部变量、出了函数就没句柄，
+// 探头的"底部让位"要隐藏它们，只能提为全局。
+static lv_obj_t* hc_bot_box = nullptr;
+static lv_obj_t* hc_bot_div = nullptr;
 static lv_obj_t* hc_lbl_strip_h     = nullptr;   // "湿度" 说明
 static lv_obj_t* hc_lbl_strip_h_val = nullptr;   // 湿度数值
 static lv_obj_t* hc_bar_t_track     = nullptr;   // 温度进度条槽（底）
@@ -1390,6 +1463,10 @@ static lv_obj_t* ensureMainScreen(void) {
 // 全局指针必须同时置空。否则下一次 renderCurrentDisplayBase() 里那六行
 // `lv_obj_del(gk_bg)` 就是在对已释放的内存调用析构，直接踩坏堆。
 static void resetStylePointers(void) {
+    // 让位清单里存的也是这些风格对象的指针。切风格时旧容器已经被删了，
+    // 清单不跟着清就是野指针 —— 探头一收起就往已释放内存写 HIDDEN flag。
+    // 各 build_style_* 末尾会重新填（只有高对比度和壁纸两种会填）。
+    petYieldClear();
     gk_lbl_clock = nullptr; gk_lbl_date = nullptr; gk_lbl_temp = nullptr;
     gk_lbl_hum = nullptr; gk_lbl_keys = nullptr; gk_lbl_profile = nullptr;
     gk_lbl_lastkey = nullptr;
@@ -1408,7 +1485,7 @@ static void resetStylePointers(void) {
     rh_lbl_keys = nullptr; rh_lbl_profile = nullptr;
     for (int i = 0; i < 24; i++) rh_bars[i] = nullptr;
 
-    wp_img = nullptr; wp_lbl_time = nullptr;
+    wp_img = nullptr; wp_lbl_time = nullptr; wp_plate = nullptr;
 
     // 高对比度（B-1「横向战舰」所有指针）
     hc_lbl_time = nullptr; hc_lbl_date = nullptr;
@@ -1424,6 +1501,7 @@ static void resetStylePointers(void) {
     hc_bar_active = nullptr; hc_bar_active_fill = nullptr;
     hc_lbl_strip_t = nullptr; hc_lbl_strip_t_val = nullptr;
     hc_lbl_strip_chars = nullptr; hc_lbl_strip_chars_val = nullptr;
+    hc_bot_box = nullptr; hc_bot_div = nullptr;
     hc_lbl_strip_h = nullptr; hc_lbl_strip_h_val = nullptr;
     hc_bar_t_track = nullptr; hc_bar_t_fill = nullptr;
     hc_bar_h_track = nullptr; hc_bar_h_fill = nullptr;
@@ -1540,6 +1618,23 @@ static void cycleScreensaverMode(void);
 static void updateScreensaver(bool force);
 static void triggerKeyReaction(void);
 static void handleMenuSelect(void);
+// ---- 宠物（定义在"HUD 浮层"那一节之前）----
+// runMenuAction() 在 3119 就得调 petEnterFull()，scanKeyboardMatrix() 的 LOGO
+// 分支和 loop() 也要调，所以这一整组必须先声明。
+static void petPoll(void);
+static void petEnterFull(void);
+static void petExitFull(void);
+static void petDismiss(void);
+static void petDestroyPeek(void);
+static void petBuildPage(void);
+static bool petPeekAllowed(void);
+static bool petPetted(uint8_t n);
+static void petFed(void);
+static void petLoadFromNvs(void);
+static void petSaveMood(void);
+static void petMenuAction(MenuAction act);
+static const char* petName(void);
+static const char* petLineFor(uint8_t pose);
 // build_menu() 在定义之前就被 setScreensaverMode() 调到了（改屏保模式要刷新菜单角标）。
 // Arduino 把 .ino 预处理成 .cpp 时会自动补原型，能编过；但那依赖工具链行为，
 // 显式写上，不给编译期留惊喜。
@@ -2604,16 +2699,21 @@ static void build_style_wallpaper(void) {
     // 时钟挪到**右下角**一小块。
     // 原来是 168x64 的板子杵在正中间、48px 大字 —— 图被挡掉一大块，
     // 用户的原话是"图片都看不清了"。缩到 28px 贴右下角，只压住一个角。
-    lv_obj_t* plate = lv_obj_create(wp_bg);
-    lv_obj_set_size(plate, 112, 40);
-    lv_obj_align(plate, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
-    mkCard(plate, CLR_SURFACE_2, 10);
-    lv_obj_set_style_bg_opa(plate, LV_OPA_70, LV_PART_MAIN);
+    wp_plate = lv_obj_create(wp_bg);
+    lv_obj_set_size(wp_plate, 112, 40);
+    lv_obj_align(wp_plate, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    mkCard(wp_plate, CLR_SURFACE_2, 10);
+    lv_obj_set_style_bg_opa(wp_plate, LV_OPA_70, LV_PART_MAIN);
 
-    wp_lbl_time = lv_label_create(plate);
+    wp_lbl_time = lv_label_create(wp_plate);
     mkLabel(wp_lbl_time, &lv_font_montserrat_28, CLR_TEXT);
     lv_label_set_text(wp_lbl_time, "--:--");
     lv_obj_center(wp_lbl_time);
+
+    // 探头横条 y=168..240 会盖住这块板（它在 y=190..230），登记进让位清单。
+    // 提为全局指针就是为了这一行 —— 原来是局部变量，出函数就没句柄了。
+    petYieldClear();
+    petYieldAdd(wp_plate);
 }
 
 // ===========================
@@ -2840,12 +2940,12 @@ static void build_style_high_contrast(void) {
     //   按键名 y=124 + 52 = 176，框顶 178 只留 2px，不能再往上；
     //   框底 235 → 屏幕底 240 留 4px。
     {
-        lv_obj_t* box = iconRect(hc_bg, 220, 58, LV_ALIGN_TOP_MID, 0, 178,
-                                 0x000000, 8);
-        lv_obj_set_style_border_width(box, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(box, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+        hc_bot_box = iconRect(hc_bg, 220, 58, LV_ALIGN_TOP_MID, 0, 178,
+                              0x000000, 8);
+        lv_obj_set_style_border_width(hc_bot_box, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(hc_bot_box, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
         // 两区之间的竖分隔线：上下各收 3px，比通长更透气
-        iconRect(hc_bg, 1, 48, LV_ALIGN_TOP_LEFT, 156, 183, CLR_STROKE, 0);
+        hc_bot_div = iconRect(hc_bg, 1, 48, LV_ALIGN_TOP_LEFT, 156, 183, CLR_STROKE, 0);
     }
 
     // --- 温度格（上）：小标 + 数值同一行，下面一根满宽条 ---
@@ -2909,6 +3009,28 @@ static void build_style_high_contrast(void) {
     lv_obj_set_style_text_align(hc_lbl_strip_chars_val, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_long_mode(hc_lbl_strip_chars_val, LV_LABEL_LONG_DOT);
     lv_obj_align(hc_lbl_strip_chars_val, LV_ALIGN_TOP_LEFT, 162, 208);
+
+    // ---- 底部让位清单 ----
+    // 探头横条 y=168..240 正好盖住这一整条（y=178..235），探头那 8 秒要把
+    // 它们全藏起来，否则温湿度条会被切成一半露在横条上方（见 mock_pet_yield.png）。
+    //
+    // 为什么是 12 个平铺对象而不是一个容器：这些 label / bar 全是 hc_bg 的
+    // **直接子对象**（box 只是装饰框）。收进一个容器就得把 10 个对象的 y 从
+    // 180/199/209/228 改成 2/21/31/50，动的是上面逐像素调好的版面。所以只登记
+    // 指针，不动版面。
+    petYieldClear();
+    petYieldAdd(hc_bot_box);
+    petYieldAdd(hc_bot_div);
+    petYieldAdd(hc_lbl_strip_t);
+    petYieldAdd(hc_lbl_strip_t_val);
+    petYieldAdd(hc_bar_t_track);
+    petYieldAdd(hc_bar_t_fill);
+    petYieldAdd(hc_lbl_strip_h);
+    petYieldAdd(hc_lbl_strip_h_val);
+    petYieldAdd(hc_bar_h_track);
+    petYieldAdd(hc_bar_h_fill);
+    petYieldAdd(hc_lbl_strip_chars);
+    petYieldAdd(hc_lbl_strip_chars_val);
 }
 
 // ===========================
@@ -3159,6 +3281,15 @@ static void runMenuAction(MenuAction act) {
             break;
         case MA_OPEN_ELOG:       // 错误日志：重启后在这里翻出错内容
             build_elog();
+            break;
+        // 宠物五项。petMenuAction() 内部按 MenuAction 再分派一次，和
+        // runMenuAction 一样走枚举，不按数组下标。
+        case MA_PET_PEEK_ON:
+        case MA_PET_WINDOW:
+        case MA_PET_OPEN:
+        case MA_PET_RENAME:
+        case MA_PET_RESET:
+            petMenuAction(act);
             break;
     }
 }
@@ -3431,6 +3562,859 @@ static void build_menu(void) {
     }
 
     showScreen(scr_menu);
+}
+
+// ===========================
+// 键盘宠物
+// ===========================
+// 一只会自己找你的猫。造型是纯 lv_obj 基本图形拼的（圆 + 圆角矩形 + 细线），
+// 不是贴图：LV_COLOR_SCREEN_TRANSP=0 且禁用 transform_zoom/angle（见 README），
+// 画不出三角形也没有半透明发光，所以耳朵是圆的、阴影走 shadow_opa。
+// 零新增资源、零新增 RAM、零解码器。
+//
+// 四个出场形态互斥，仲裁集中在 petGate()：
+//   NONE  不在场
+//   PEEK  底部横条探头，固定 8s，长按 LOGO 收掉
+//   FULL  全屏宠物页（菜单 / 长按 LOGO 进）
+//   SAVER 屏保里的宠物（v2，SAVER_PET 档位）
+//
+// 键位：**全部走 C3 实体键**（静音 / 旋钮 / 灯光长按），矩阵键一个都不占 ——
+// 那些键矩阵里没有，参与不了正常打字，用它们互动才不会影响输入。
+
+// PetScene / PetPose / PetState 三个类型声明在文件前面的"通知系统"那一段
+// （跟 AlertType 放一起）—— 因为 Arduino 会把函数原型插到第一个函数定义之前，
+// 签名里出现自定义类型时类型必须在那之前可见。
+
+static PetState pet = { 60, 0, POSE_IDLE, 0, 0, 0, 0, 0, 0, 0, 0, true, 23, 7 };
+static PetScene petScene = SCENE_NONE;
+
+// 调参都在这儿，改完直接看效果
+#define PET_PEEK_IDLE_MIN_MS   25000UL   // 闲置多久才进探头候选池
+#define PET_PEEK_GAP_MIN_MS    20000UL   // 两次判定的最小间隔
+#define PET_PEEK_GAP_JIT_MS    20000UL   // 判��间隔的随机抖动上限
+#define PET_PEEK_CHANCE         30       // 每次判定的触发概率（%）
+#define PET_PEEK_DAILY_MAX       8       // 每日探头上限
+#define PET_PEEK_HOLD_MS       8000UL    // 探头停留时长
+#define PET_PET_COOLDOWN_MS     800UL    // 抚摸冷却，防连点刷亲密度
+#define PET_BOTHER_LIMIT         2       // 连续被关几次就安静一天
+#define PET_LOGO_HOLD_MS       600UL    // LOGO 长按阈值
+
+static unsigned long petPeekNextCheckMs = 0;
+static unsigned long petPeekStartMs   = 0;
+static unsigned long petLastLineMs   = 0;
+static uint32_t      petLastLineCls  = 0xFFFFFFFF;   // 上一句的分类，防同分类连播
+
+// LOGO 长按：矩阵键本来没有长按检测（_HOLD 全来自 C3 小 MCU）
+static unsigned long logoDownMs    = 0;
+static bool          logoHoldFired = false;
+static bool          logoIsDown     = false;
+
+// ===========================
+// 台词表
+// ===========================
+// **行宽是硬约束**：全屏气泡 216px、探头台词 168px，汉字 16px，
+// 所以每句必须 ≤10 字（探头的限制更紧），宁可少写也不要超。
+// 加新台词前跑 `python text_width.py "你的台词"` 量一下。
+//
+// 分类位（0x01 探头 / 0x02 全屏 / 0x04 时段 / 0x08 状态）只用于冷却去重。
+struct PetLine {
+    uint8_t     pose;    // POSE_*，和当前姿态不符的不挑
+    uint8_t     moodMin; // mood < moodMin 的不挑
+    uint8_t     cls;     // 分类位
+    const char* text;
+};
+
+static const PetLine petLines[] = {
+    // ---- 探头专用（≤10 字）----
+    { POSE_GREET,   0, 0x01, "你回来啦！" },
+    { POSE_GREET,   0, 0x01, "嘿，我在这儿" },
+    { POSE_IDLE,    0, 0x01, "歇会儿也好" },
+    { POSE_HAPPY,   0, 0x01, "刚才摸我了？" },
+    { POSE_HUNGRY,  0, 0x01, "肚子叫了…" },
+    { POSE_HUNGRY,  0, 0x01, "到饭点啦" },
+    { POSE_IDLE,    0, 0x01, "不急，慢慢打" },
+    { POSE_GRUMPY,  0, 0x01, "哼，不理你了" },
+    { POSE_SLEEP,   0, 0x01, "困了，先眯一会" },
+    { POSE_SICK,    0, 0x01, "好热，趴着不动" },
+    { POSE_SICK,    0, 0x01, "太冷了，蜷起来" },
+    { POSE_IDLE,    0, 0x01, "今天还没吃饭呢" },
+    { POSE_HAPPY,   0, 0x01, "今天你很勤快" },
+    { POSE_IDLE,    0, 0x01, "水记得喝一口" },
+
+    // ---- 全屏专用（≤13 字）----
+    { POSE_IDLE,    0, 0x02, "摸两下试试" },
+    { POSE_HAPPY,   0, 0x02, "呼噜呼噜…" },
+    { POSE_HAPPY,   PET_MOOD_OK, 0x02, "你今天对我真好" },
+    { POSE_GRUMPY,  0, 0x02, "摸我得用静音键" },
+    { POSE_HUNGRY,  0, 0x02, "旋钮按一下就喂我" },
+    { POSE_SICK,    0, 0x02, "太热了，我不动" },
+    { POSE_SLEEP,   0, 0x02, "你不在我就睡了" },
+    { POSE_GREET,   0, 0x02, "好久没见，想你了" },
+
+    // ---- 时段问候（≤10 字，探头用）----
+    { POSE_IDLE,    0, 0x04, "早上好呀" },
+    { POSE_IDLE,    0, 0x04, "中午要吃饭了" },
+    { POSE_IDLE,    0, 0x04, "下午加油鸭" },
+    { POSE_IDLE,    0, 0x04, "这么晚还不睡" },
+    { POSE_GREET,   0, 0x04, "今天也辛苦啦" },
+    { POSE_IDLE,    0, 0x04, "记得站起来走走" },
+
+    // ---- 心情低落（mood 低时才有）----
+    { POSE_GRUMPY,  0, 0x08, "你好久没理我了" },
+    { POSE_IDLE,    0, 0x08, "有点想你了" },
+    { POSE_SLEEP,   0, 0x08, "不太想动…" },
+};
+#define PET_LINE_COUNT (sizeof(petLines) / sizeof(PetLine))
+
+// 宠物名。NVS 里没存过就给默认"小橘"，最长 8 字节（三个汉字）。
+static char petNameBuf[12] = { 0 };
+static const char* petName(void) {
+    if (petNameBuf[0] == '\0') return "小橘";
+    return petNameBuf;
+}
+
+// 时段问候：几点说什么。时间不准（NTP 缺失）时也只是问候错时段，不崩
+static const char* petHourLine(uint8_t h) {    if (h < 5)  return "这么晚还不睡";
+    if (h < 11) return "早上好呀";
+    if (h < 14) return "中午要吃饭了";
+    if (h < 18) return "下午加油鸭";
+    if (h < 23) return "今天也辛苦啦";
+    return "这么晚还不睡";
+}
+
+// 抽一句。clsMask 选分类，pose 选姿态，都传 0xFF / POSE_IDLE 就是不筛。
+static const char* petPickLine(uint8_t clsMask, uint8_t pose, uint8_t mood) {
+    static const PetLine* hit[8];
+    uint8_t n = 0;
+    for (uint16_t i = 0; i < PET_LINE_COUNT; i++) {
+        const PetLine* p = &petLines[i];
+        if (clsMask != 0xFF && (p->cls & clsMask) == 0) continue;
+        if (p->pose != POSE_IDLE && p->pose != pose) continue;
+        if (mood < p->moodMin) continue;
+        if ((p->cls & 0xFF) == petLastLineCls) continue;   // 同一分类不连播
+        if (n < 8) hit[n++] = p;
+    }
+    if (n == 0) return nullptr;   // 全被冷却掉了，调用方决定是不是不说话
+    const PetLine* pick = hit[esp_random() % n];
+    petLastLineCls = pick->cls;
+    petLastLineMs  = millis();
+    return pick->text;
+}
+
+static const char* petLineFor(uint8_t pose) {
+    if (pose == POSE_IDLE) pose = pet.pose;
+    return petPickLine(0xFF, pose, pet.mood);
+}
+
+// ===========================
+// 宠物绘制：几何猫
+// ===========================
+// 全部是 lv_obj 基本图形：圆（radius=CIRCLE）、圆角矩形、细矩形当线。
+// 一个三角形都画不出来（transform_angle 被禁），所以耳朵是圆的。
+//
+// 每个零件一个全局指针，姿态切换只改坐标/半径/显隐，**不重建对象** ——
+// 重建的话 8 秒探头的 8s 内会闪好几下，而且每次重建都是几十个对象的分配。
+
+#define CLR_PET       0xF5A97F
+#define CLR_PET_DARK  0xC4805F
+#define CLR_PET_BODY  0xE8C39E
+#define CLR_PET_BLUSH 0xE8897A
+
+// 全屏页
+static lv_obj_t* pt_bg      = nullptr;
+static lv_obj_t* pt_lblName = nullptr;
+static lv_obj_t* pt_moodBg  = nullptr;
+static lv_obj_t* pt_moodBar = nullptr;
+static lv_obj_t* pt_shadow  = nullptr;
+static lv_obj_t* pt_tail    = nullptr;
+static lv_obj_t* pt_body    = nullptr;
+static lv_obj_t* pt_earL    = nullptr;
+static lv_obj_t* pt_earR    = nullptr;
+static lv_obj_t* pt_earIL   = nullptr;
+static lv_obj_t* pt_earIR   = nullptr;
+static lv_obj_t* pt_head    = nullptr;
+static lv_obj_t* pt_stripe1 = nullptr;
+static lv_obj_t* pt_stripe2 = nullptr;
+static lv_obj_t* pt_stripe3 = nullptr;
+static lv_obj_t* pt_eyeL    = nullptr;
+static lv_obj_t* pt_eyeR    = nullptr;
+static lv_obj_t* pt_lidL    = nullptr;
+static lv_obj_t* pt_lidR    = nullptr;
+static lv_obj_t* pt_eyeBrowL= nullptr;
+static lv_obj_t* pt_eyeBrowR= nullptr;
+static lv_obj_t* pt_nose    = nullptr;
+static lv_obj_t* pt_mouth   = nullptr;
+static lv_obj_t* pt_blushL  = nullptr;
+static lv_obj_t* pt_blushR  = nullptr;
+static lv_obj_t* pt_bubble  = nullptr;
+static lv_obj_t* pt_line1   = nullptr;
+static lv_obj_t* pt_line2   = nullptr;
+static lv_obj_t* pt_hint    = nullptr;
+static lv_obj_t* pt_zs      = nullptr;   // 睡觉的 Z
+
+// 探头横条（lv_layer_top 浮层）
+static lv_obj_t* pk_bar     = nullptr;
+static lv_obj_t* pk_head    = nullptr;
+static lv_obj_t* pk_earL    = nullptr;
+static lv_obj_t* pk_earR    = nullptr;
+static lv_obj_t* pk_earIL   = nullptr;
+static lv_obj_t* pk_earIR   = nullptr;
+static lv_obj_t* pt_eyePkL  = nullptr;   // 探头的眼
+static lv_obj_t* pt_eyePkR  = nullptr;
+static lv_obj_t* pt_nosePk  = nullptr;
+static lv_obj_t* pt_mouthPk = nullptr;
+static lv_obj_t* pk_line1   = nullptr;
+static lv_obj_t* pk_line2   = nullptr;
+static lv_obj_t* pk_line3   = nullptr;
+static lv_obj_t* pk_close   = nullptr;   // 右上角的 ✕ 提示
+
+// 一根实心圆点/圆片。radius 传 LV_RADIUS_CIRCLE 就是正圆。
+static lv_obj_t* petDot(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color) {
+    lv_obj_t* o = iconRect(parent, w, h, LV_ALIGN_TOP_LEFT, x, y, color, LV_RADIUS_CIRCLE);
+    return o;
+}
+
+// 细线段：x1,y1 到 x2,y2，斜的用"竖直细条 + 旋转"做不到（transform_angle 被禁），
+// 所以斜线只能画成"一串小方块"。这里给一条竖线/横线用（胡须省略，改用腮红+嘴传达）。
+static lv_obj_t* petHLine(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color) {
+    return iconRect(parent, w, h, LV_ALIGN_TOP_LEFT, x, y, color, 0);
+}
+
+// ---- 几何猫（全屏版）----
+// 基准几何：头部中心固定在 (120, 104)，下面所有 y 都从这里推，
+// 别再写死 56 / 134 这种"看起来能用"的魔数 —— 挪一次猫头就会全错。
+#define PET_CX      120
+#define PET_CY      104
+#define PT_EAR_Y    (PET_CY - 48)
+#define PT_TAIL_Y   134
+#define PT_TAIL_X   152
+#define PT_MOUTH_X  111
+#define PT_MOUTH_Y  119
+#define PT_LID_XL   99
+#define PT_LID_XR   127
+#define PT_BROW_XL  99
+#define PT_BROW_XR  128
+
+static void petBuildBody(lv_obj_t* parent) {
+    pt_shadow = petDot(parent, PET_CX - 40, PET_CY + 48, 80, 14, 0x000000);
+    pt_tail   = petHLine(parent, PT_TAIL_X, PT_TAIL_Y, 20, 6, CLR_PET);
+    pt_body   = iconRect(parent, 68, 40, LV_ALIGN_TOP_LEFT, PET_CX - 34, PET_CY + 8, CLR_PET_BODY, 19);
+    pt_earL   = petDot(parent, PET_CX - 37, PT_EAR_Y, 26, 26, CLR_PET);
+    pt_earR   = petDot(parent, PET_CX + 11, PT_EAR_Y, 26, 26, CLR_PET);
+    pt_earIL  = petDot(parent, PET_CX - 31, PT_EAR_Y + 7, 12, 12, CLR_PET_DARK);
+    pt_earIR  = petDot(parent, PET_CX + 19, PT_EAR_Y + 7, 12, 12, CLR_PET_DARK);
+    pt_head   = petDot(parent, PET_CX - 34, PET_CY - 43, 68, 68, CLR_PET);
+    pt_stripe1= petHLine(parent, PET_CX - 8,  PET_CY - 29, 2, 10, CLR_PET_DARK);
+    pt_stripe2= petHLine(parent, PET_CX - 1,  PET_CY - 29, 2, 10, CLR_PET_DARK);
+    pt_stripe3= petHLine(parent, PET_CX + 6,  PET_CY - 29, 2, 10, CLR_PET_DARK);
+    pt_eyeL   = petDot(parent, PET_CX - 20, PET_CY - 10, 12, 12, 0x1A1A1A);
+    pt_eyeR   = petDot(parent, PET_CX + 8,  PET_CY - 10, 12, 12, 0x1A1A1A);
+    pt_lidL   = petHLine(parent, PT_LID_XL, PET_CY - 10, 14, 10, CLR_PET);
+    pt_lidR   = petHLine(parent, PT_LID_XR, PET_CY - 10, 14, 10, CLR_PET);
+    pt_eyeBrowL=petHLine(parent, PT_BROW_XL, PET_CY - 20, 13, 3, CLR_PET_DARK);
+    pt_eyeBrowR=petHLine(parent, PT_BROW_XR, PET_CY - 20, 13, 3, CLR_PET_DARK);
+    pt_nose   = petDot(parent, PET_CX - 3, PET_CY + 8, 7, 5, 0xD2694A);
+    pt_mouth  = petHLine(parent, PT_MOUTH_X, PT_MOUTH_Y, 18, 3, 0x1A1A1A);
+    pt_blushL = petDot(parent, PET_CX - 30, PET_CY + 8, 12, 7, 0xE0A090);
+    pt_blushR = petDot(parent, PET_CX + 18, PET_CY + 8, 12, 7, 0xE0A090);
+    lv_obj_t* zbox = iconRect(parent, 16, 16, LV_ALIGN_TOP_LEFT,
+                              PET_CX + 40, PET_CY - 50, 0x0B0F17, 0);
+    pt_zs = lv_label_create(zbox);
+    mkLabel(pt_zs, &lv_font_simsun_16_cjk, CLR_ACCENT);
+    lv_label_set_text(pt_zs, "Z");
+    lv_obj_align(pt_zs, LV_ALIGN_CENTER, 0, 0);   // label 相对那块小方块居中
+}
+
+// 姿态 → 改属性。**只改变了的东西**（setSizePos/setBgColor 内部有比对，
+// 8 秒探头里反复切姿态也不会把屏幕刷爆）。
+static void petApplyPose(uint8_t pose) {
+    bool happy  = (pose == POSE_GREET || pose == POSE_HAPPY);
+    bool hungry = (pose == POSE_HUNGRY);
+    bool grumpy = (pose == POSE_GRUMPY);
+    bool sleep  = (pose == POSE_SLEEP);
+    bool sick   = (pose == POSE_SICK);
+
+    // 眼：开心/困/病 → 眼珠藏起来，用眼皮线表达
+    setHidden(pt_eyeL, happy || sleep || sick);
+    setHidden(pt_eyeR, happy || sleep || sick);
+    setHidden(pt_lidL, !(happy || sleep || sick));
+    setHidden(pt_lidR, !(happy || sleep || sick));
+    // 眼皮高度：困=半闭（盖一半），病=几乎全闭
+    uint8_t lidH = sick ? 9 : 6;
+    setSizePos(pt_lidL, 14, lidH, PT_LID_XL, PET_CY - 10);
+    setSizePos(pt_lidR, 14, lidH, PT_LID_XR, PET_CY - 10);
+
+    // 眉毛：只有生气才显（斜度画不出来，用显隐代替）
+    setHidden(pt_eyeBrowL, !grumpy);
+    setHidden(pt_eyeBrowR, !grumpy);
+
+    // 嘴：一条短横线，靠"位置 + 长度"表达情绪
+    int mW = 18, mY = PT_MOUTH_Y;
+    if (happy)  mY -= 3;
+    if (hungry) { mW = 14; mY += 3; }
+    if (grumpy) { mW = 16; mY += 4; }
+    if (sleep)  { mW = 10; mY += 0; }
+    if (sick)   { mW = 12; mY += 2; }
+    setSizePos(pt_mouth, mW, 3, PT_MOUTH_X + (18 - mW) / 2, mY);
+
+    // 腮红：开心时明显
+    setBgColor(pt_blushL, happy ? CLR_PET_BLUSH : 0xE0A090);
+    setBgColor(pt_blushR, happy ? CLR_PET_BLUSH : 0xE0A090);
+
+    // 耳朵：开心竖起来（上移 3），生气压平（下移 3 + 压扁）
+    int earY = PT_EAR_Y, earH = 26;
+    if (happy) earY -= 3;
+    if (grumpy) { earY += 3; earH = 21; }
+    setSizePos(pt_earL, 26, earH, PET_CX - 37, earY);
+    setSizePos(pt_earR, 26, earH, PET_CX + 11, earY);
+    // 耳内侧跟着耳朵走
+    setSizePos(pt_earIL, 12, earH > 23 ? 12 : 9, PET_CX - 31, earY + 7);
+    setSizePos(pt_earIR, 12, earH > 23 ? 12 : 9, PET_CX + 19, earY + 7);
+
+    // 尾巴：开心翘起来（往上 14px + 拉长），其余垂着
+    setSizePos(pt_tail, happy ? 22 : 20, 6, PT_TAIL_X, happy ? PT_TAIL_Y - 14 : PT_TAIL_Y);
+
+    // 生病整体压暗（没有 alpha 通道可用，只能换颜色）
+    uint32_t fur = sick ? 0xD9A98A : CLR_PET;
+    setBgColor(pt_head, fur);
+    setBgColor(pt_earL, fur);
+    setBgColor(pt_earR, fur);
+    setBgColor(pt_body, sick ? 0xD8BFA0 : CLR_PET_BODY);
+
+    // 睡觉的 Z
+    setHidden(pt_zs, !sleep);
+}
+
+// ===========================
+// 全屏宠物页（SCENE_FULL）
+// ===========================
+// 竖向预算（每一行都是量过的，别乱加）：
+//   0..30    顶栏：名字 + 心情条
+//   56..166  猫 110x112
+//   168..218 对话气泡（2 行，行盒 19px）
+//   219..238 键位提示（1 行）
+// 台词最多 2 行 x 13 字；键位提示一行放得下"静音摸 · 旋钮撸 · 灯长退"（168px）。
+static lv_obj_t* scr_pet = nullptr;
+
+static void petDestroyPage(void) {
+    if (scr_pet) {
+        // 删之前必须先换屏：LVGL 8.4 删掉活动屏会把 disp->act_scr 置 NULL
+        // （见 swapAwayIfActive 的注释，本项目已经为这个坑栽过两次）
+        swapAwayIfActive(scr_pet, nullptr);
+        if (currentScreen == scr_pet) currentScreen = nullptr;
+        lv_obj_del(scr_pet);
+        scr_pet = nullptr;
+    }
+    pt_bg = pt_lblName = pt_moodBg = pt_moodBar = nullptr;
+    pt_shadow = pt_tail = pt_body = nullptr;
+    pt_earL = pt_earR = pt_earIL = pt_earIR = pt_head = nullptr;
+    pt_stripe1 = pt_stripe2 = pt_stripe3 = nullptr;
+    pt_eyeL = pt_eyeR = pt_lidL = pt_lidR = nullptr;
+    pt_eyeBrowL = pt_eyeBrowR = nullptr;
+    pt_nose = pt_mouth = pt_blushL = pt_blushR = nullptr;
+    pt_bubble = pt_line1 = pt_line2 = pt_hint = pt_zs = nullptr;
+}
+
+// 两行台词。long 模式一律 DOT 兜底：超宽就变省略号，绝不画到屏幕外。
+static void petSetSpeech(const char* l1, const char* l2) {
+    if (pt_line1 == nullptr) return;
+    setText(pt_line1, l1 ? l1 : "");
+    setText(pt_line2, l2 ? l2 : "");
+    setHidden(pt_line2, (l2 == nullptr || l2[0] == '\0'));
+}
+
+static void petRefreshPage(void) {
+    if (scr_pet == nullptr) return;
+
+    // 心情条
+    uint8_t m = pet.mood > 100 ? 100 : pet.mood;
+    setSizePos(pt_moodBar, (m * 128) / 100, 10, 100, 9);
+    setBgColor(pt_moodBar, m > PET_MOOD_OK ? CLR_GREEN
+                                          : (m > PET_MOOD_SAD ? CLR_AMBER : CLR_RED));
+
+    petApplyPose(pet.pose);
+    petSetSpeech(petLineFor(pet.pose), nullptr);
+}
+
+static void petBuildPage(void) {
+    petDestroyPage();
+    scr_pet = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_pet, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr_pet, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_pet, LV_OBJ_FLAG_SCROLLABLE);
+    pt_bg = makeRootPanel(scr_pet, CLR_BG);
+
+    // 顶栏：名字（中文库）+ 心情条槽
+    pt_lblName = lv_label_create(pt_bg);
+    mkLabel(pt_lblName, &lv_font_simsun_16_cjk, CLR_TEXT);
+    lv_obj_set_width(pt_lblName, 80);
+    lv_label_set_long_mode(pt_lblName, LV_LABEL_LONG_DOT);
+    lv_label_set_text(pt_lblName, petName());
+    lv_obj_align(pt_lblName, LV_ALIGN_TOP_LEFT, 12, 4);
+
+    pt_moodBg = iconRect(pt_bg, 128, 10, LV_ALIGN_TOP_LEFT, 100, 9, CLR_SURFACE_2, 5);
+    pt_moodBar = iconRect(pt_moodBg, 0, 10, LV_ALIGN_TOP_LEFT, 0, 0, CLR_GREEN, 5);
+    lv_obj_clear_flag(pt_moodBg, LV_OBJ_FLAG_SCROLLABLE);
+    petHLine(pt_bg, 12, 28, 216, 1, CLR_STROKE);
+
+    petBuildBody(pt_bg);
+
+    // 对话气泡
+    pt_bubble = iconRect(pt_bg, 216, 50, LV_ALIGN_TOP_LEFT, 12, 168, 0x141A26, 8);
+    lv_obj_set_style_border_width(pt_bubble, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(pt_bubble, lv_color_hex(CLR_STROKE), LV_PART_MAIN);
+    pt_line1 = lv_label_create(pt_bubble);
+    mkLabel(pt_line1, &lv_font_simsun_16_cjk, CLR_TEXT);
+    lv_obj_set_width(pt_line1, 200);
+    lv_label_set_long_mode(pt_line1, LV_LABEL_LONG_DOT);
+    lv_obj_align(pt_line1, LV_ALIGN_TOP_LEFT, 8, 6);
+    pt_line2 = lv_label_create(pt_bubble);
+    mkLabel(pt_line2, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_obj_set_width(pt_line2, 200);
+    lv_label_set_long_mode(pt_line2, LV_LABEL_LONG_DOT);
+    lv_obj_align(pt_line2, LV_ALIGN_TOP_LEFT, 8, 25);
+
+    // 键位提示：一行。全是 C3 实体键，矩阵键一个都不占。
+    pt_hint = mkHintLine(pt_bg, 220, "静音摸 · 旋钮撸 · 灯长退");
+
+    petRefreshPage();
+}
+
+static void petEnterFull(void) {
+    if (petScene == SCENE_FULL && scr_pet) return;
+    petDestroyPeek();
+    petScene = SCENE_FULL;
+    pet.pose = POSE_GREET;
+    pet.poseUntilMs = millis() + 4000;
+    petBuildPage();
+    currentSysMode = SYS_MODE_PET;
+    showScreen(scr_pet);
+    lastActivityTime = millis();
+    pet.lastSeenMs = millis();
+}
+
+static void petExitFull(void) {
+    if (petScene != SCENE_FULL) return;
+    petScene = SCENE_NONE;
+    petDestroyPage();
+    gotoMainScreen();
+}
+
+// ===========================
+// 底部让位清单
+// ===========================
+// 探头横条 y=168..240，会盖住底部。查过 7 种主屏风格，**只有两种**底部有
+// 内容落在这个区间：高对比度的底部状态条（y=178..235）和壁纸右下角的
+// 时钟板（y=190..230）。其余五种内容都在 y<168，天然不冲突。
+//
+// ⚠️ 底部条不是一棵树，是 12 个平铺对象：10 个具名全局（6 个 label + 4 个
+// 进度条）加上装饰框和竖分隔线两个 iconRect，后两个在 build_style_* 里是
+// 局部变量、出了函数就没句柄。**所以不要 re-parent 成一个容器** —— 那要把
+// 10 个对象的 y 从 180/199/209/228 改成 2/21/31/50，动的是已经逐像素调好的
+// 版面，还正好踩上 README 里 pad 偏移那条雷。收一个指针清单是最小改动。
+//
+// 数组开 16 而不是 12：开 12 的话以后有人加一个对象就静默越界。
+#define PET_YIELD_MAX 16
+static lv_obj_t* petYieldObjs[PET_YIELD_MAX] = { nullptr };
+static uint8_t   petYieldCount    = 0;
+
+static void petYieldAdd(lv_obj_t* o) {
+    if (o == nullptr) return;
+    if (petYieldCount >= PET_YIELD_MAX) return;   // 满了就丢：宁可漏让位也别越界
+    petYieldObjs[petYieldCount++] = o;
+}
+
+static void petYieldClear(void) {
+    for (uint8_t i = 0; i < PET_YIELD_MAX; i++) petYieldObjs[i] = nullptr;
+    petYieldCount = 0;
+}
+
+static void petSetBottomYield(bool yield) {
+    for (uint8_t i = 0; i < petYieldCount; i++) {
+        if (petYieldObjs[i] == nullptr) continue;
+        setHidden(petYieldObjs[i], yield);
+    }
+}
+
+// ===========================
+// 探头横条（SCENE_PEEK）
+// ===========================
+// 挂在 lv_layer_top 上：底下是主屏 / 菜单 / 设置页都一样能盖住，
+// 不需要为了显示它去改 currentSysMode（同 drawRingOverlay 的做法）。
+// 竖向预算：72px 只装得下 3 行（72/19 = 3.8）—— 台词 2 行 + 关闭提示 1 行。
+// 台词区 x=64..232 = 168px -> 每行 10 字。✕ 放提示行右端而不是右上角，
+// 右上角会吃掉台词第一行的宽度。
+
+#define PK_TOP    168
+#define PK_HEAD_CX 36
+#define PK_HEAD_CY 204
+
+static void petDestroyPeek(void) {
+    if (pk_bar) {
+        lv_obj_del(pk_bar);        // 挂在 layer_top 上，删它不影响活动屏
+        pk_bar = nullptr;
+    }
+    pk_head = pk_earL = pk_earR = pk_earIL = pk_earIR = nullptr;
+    pt_eyePkL = pt_eyePkR = pt_nosePk = pt_mouthPk = nullptr;
+    pk_line1 = pk_line2 = pk_line3 = pk_close = nullptr;
+    petSetBottomYield(false);
+}
+
+// 探头的猫：只画到下巴，肩膀在横条之外，视觉上就是"从屏底探出来"
+static void petBuildPeek(void) {
+    petDestroyPeek();
+    pk_bar = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(pk_bar, 240, 72);
+    lv_obj_set_pos(pk_bar, 0, PK_TOP);
+    lv_obj_set_style_bg_color(pk_bar, lv_color_hex(0x141A26), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(pk_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(pk_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(pk_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(pk_bar, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(pk_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    int cx = PK_HEAD_CX, cy = PK_HEAD_CY;
+    pk_earL  = petDot(pk_bar, cx - 21, cy - 30, 14, 14, CLR_PET);
+    pk_earR  = petDot(pk_bar, cx + 7,  cy - 30, 14, 14, CLR_PET);
+    pk_earIL = petDot(pk_bar, cx - 18, cy - 26, 6, 6, CLR_PET_DARK);
+    pk_earIR = petDot(pk_bar, cx + 12, cy - 26, 6, 6, CLR_PET_DARK);
+    pk_head  = petDot(pk_bar, cx - 20, cy - 26, 40, 40, CLR_PET);
+    pt_eyePkL  = petDot(pk_bar, cx - 12, cy - 12, 8, 8, 0x1A1A1A);
+    pt_eyePkR  = petDot(pk_bar, cx + 4,  cy - 12, 8, 8, 0x1A1A1A);
+    pt_nosePk  = petDot(pk_bar, cx - 3,  cy - 1,  6, 4, 0xD2694A);
+    pt_mouthPk = petHLine(pk_bar, cx - 8, cy + 7, 16, 2, 0x1A1A1A);
+
+    pk_line1 = lv_label_create(pk_bar);
+    pk_line2 = lv_label_create(pk_bar);
+    pk_line3 = lv_label_create(pk_bar);
+    lv_obj_t* ls[3] = { pk_line1, pk_line2, pk_line3 };
+    uint32_t   cols[3] = { CLR_TEXT, CLR_TEXT_DIM, CLR_TEXT_DIM };
+    for (int i = 0; i < 3; i++) {
+        mkLabel(ls[i], &lv_font_simsun_16_cjk, cols[i]);
+        lv_obj_set_width(ls[i], 168);
+        lv_label_set_long_mode(ls[i], LV_LABEL_LONG_DOT);
+        lv_obj_align(ls[i], LV_ALIGN_TOP_LEFT, 64, 3 + 19 * i);
+    }
+    lv_label_set_text(pk_line3, "长按 LOGO 收起我");
+
+    // 关闭提示的 ✕：一个 16px 圆圈 + 里面一个 Montserrat 的 "X"。
+    // 为什么用字形而不是两条斜线：transform_angle 被禁（见 README），
+    // 斜线只能画成一串小方块，边缘全是锯齿。ASCII 的 X 正好就是那个形状，
+    // 而且 Montserrat 一定有它 —— 不用碰字库。
+    lv_obj_t* cb = iconRect(pk_bar, 16, 16, LV_ALIGN_TOP_LEFT, 212, 211, 0x1A1A1A, 8);
+    pk_close = lv_label_create(cb);
+    mkLabel(pk_close, &lv_font_montserrat_14, CLR_TEXT_DIM);
+    lv_label_set_text(pk_close, "X");
+    lv_obj_align(pk_close, LV_ALIGN_CENTER, 0, 0);
+
+    petSetBottomYield(true);
+}
+
+// 探头说什么。优先时段问候，其次按心情挑一句。
+static void petPeekSpeak(void) {
+    if (pk_line1 == nullptr) return;
+    time_t t = time(nullptr);
+    struct tm tmNow;
+    const char* hour = nullptr;
+    if (localtime_r(&t, &tmNow)) hour = petHourLine((uint8_t)tmNow.tm_hour);
+    setText(pk_line1, hour ? hour : "我在这儿");
+    const char* l2 = petPickLine(0x02, pet.pose, pet.mood);
+    if (l2 == nullptr) l2 = petPickLine(0x01, pet.pose, pet.mood);
+    setText(pk_line2, l2 ? l2 : "");
+    setHidden(pk_line2, l2 == nullptr);
+}
+
+static void petStartPeek(void) {
+    petDestroyPeek();
+    petScene = SCENE_PEEK;
+    petPeekStartMs = millis();
+    pet.pose = POSE_GREET;
+    petBuildPeek();
+    petPeekSpeak();
+    pet.peekToday++;
+    preferences.putUChar("pet_peek_n", pet.peekToday);
+}
+
+// 用户主动关掉：收起 + 记一次打扰。连续 2 次就安静一天。
+static void petDismiss(void) {
+    if (petScene != SCENE_PEEK) return;
+    petDestroyPeek();
+    petScene = SCENE_NONE;
+    pet.pose = POSE_GRUMPY;
+    pet.mood = pet.mood > 20 ? pet.mood - 10 : 0;
+    if (pet.bothered < 250) pet.bothered++;
+    petSaveMood();
+    if (pet.bothered >= PET_BOTHER_LIMIT) {
+        time_t t = time(nullptr);
+        struct tm tmNow;
+        if (localtime_r(&t, &tmNow)) {
+            uint32_t ymd = (tmNow.tm_year + 1900) * 10000
+                         + (tmNow.tm_mon + 1) * 100 + tmNow.tm_mday;
+            pet.muteYmd = ymd + 1;                 // 安静到明天同一时刻
+            pet.bothered = 0;
+            preferences.putUInt("pet_mute_y", pet.muteYmd);
+        }
+        triggerHud("小橘", "那我安静一天", lv_color_hex(CLR_TEXT_DIM));
+    }
+}
+
+// ===========================
+// 互动
+// ===========================
+// 摸 / 撸：静音键和旋钮进来。有冷却，否则按住旋钮能一路刷满亲密度。
+// 互动时**不回顶部窗口**（832-834 那段）—— 在宠物页里回主屏毫无意义。
+static bool petPetted(uint8_t n) {
+    unsigned long now = millis();
+    if (now - pet.lastPettedMs < PET_PET_COOLDOWN_MS) return false;
+    pet.lastPettedMs = now;
+    if (pet.mood < 250 - n) pet.mood = (uint8_t)(pet.mood + n);
+    if (pet.bond < 60000) pet.bond += 1;
+    pet.pose = POSE_HAPPY;
+    pet.poseUntilMs = now + 2500;
+
+    // 在探头里摸它 = 被欢迎，打扰计数减一
+    if (petScene == SCENE_PEEK && pet.bothered > 0) pet.bothered--;
+
+    if (petScene == SCENE_FULL) {
+        // ⚠️ 一次互动里**只能调一次** petPickLine()：它内部会写 petLastLineCls
+        // 做"同分类不连播"的去重，第二次调用会把第一次刚抽中的分类直接排除掉。
+        const char* l = petPickLine(0x02, pet.pose, pet.mood);
+        petApplyPose(pet.pose);
+        petSetSpeech(l ? l : "呼噜呼噜…", nullptr);
+    } else if (petScene == SCENE_PEEK) {
+        petPeekSpeak();
+    }
+    return true;
+}
+
+static void petFed(void) {
+    time_t t = time(nullptr);
+    struct tm tmNow;
+    uint32_t ymd = 0;
+    if (localtime_r(&t, &tmNow)) {
+        ymd = (tmNow.tm_year + 1900) * 10000 + (tmNow.tm_mon + 1) * 100 + tmNow.tm_mday;
+    }
+    if (ymd && pet.fedYmd != ymd) {   // 跨日：喂食次数归零
+        pet.fedYmd = ymd;
+        pet.fedToday = 0;
+        preferences.putUInt("pet_fed_y", ymd);
+    }
+    pet.fedToday++;
+    preferences.putUChar("pet_fed_n", pet.fedToday);
+    pet.mood = pet.mood < 250 ? (uint8_t)(pet.mood + 15) : 100;
+    pet.pose = POSE_HAPPY;
+    pet.poseUntilMs = millis() + 3000;
+    if (petScene == SCENE_FULL) {
+        petApplyPose(pet.pose);
+        petSetSpeech("吃饱了，谢谢你", nullptr);
+        petRefreshPage();
+    } else if (petScene == SCENE_PEEK) {
+        petPeekSpeak();
+    }
+}
+
+static void petSaveMood(void) {
+    preferences.putUChar("pet_mood", pet.mood);
+    preferences.putUInt("pet_bond", pet.bond);
+}
+
+// ===========================
+// 出场仲裁
+// ===========================
+// 判定**必须集中在这一个函数里** —— 照 updateCountdownVisibility 的教训：
+// 散在各处迟早漏一处，表现就是"进了菜单底下还冒探头"。
+//
+// 顺序有讲究：SCENE_FULL 必须排在"界面态"这条**前面**。宠物页自己是
+// SYS_MODE_PET（!= SYS_MODE_NORMAL），放后面的话永远走不到，用户一进
+// 宠物页它就把自己关掉了。
+static PetScene petGate(void) {
+    if (ringingKind != RING_NONE)           return SCENE_NONE;   // 响铃压过一切
+    if (petScene == SCENE_FULL)            return SCENE_FULL;   // 用户主动进的不踢
+    if (currentSysMode == SYS_MODE_SLEEP)   return SCENE_SAVER;  // 屏保归屏保管
+    if (currentSysMode != SYS_MODE_NORMAL)  return SCENE_NONE;   // 菜单/设置/录制/日志
+    if (countdownShown && timerRunning)     return SCENE_NONE;
+    if (notifCount > 0)                     return SCENE_NONE;   // 通知告警优先
+    if (millis() - lastActivityTime < 3000) return SCENE_NONE;   // 刚敲过键，别打断
+    if (!pet.peekOn)                        return SCENE_NONE;
+    return petPeekAllowed() ? SCENE_PEEK : SCENE_NONE;
+}
+
+// 探头该不该来：时段、每日上限、24h 静默、判定节拍。**全都硬约束** ——
+// 会主动出现的东西不收敛频率，三天就被拔电。
+static bool petPeekAllowed(void) {
+    if (pet.bothered >= PET_BOTHER_LIMIT)   return false;
+    unsigned long now = millis();
+    if (now < petPeekNextCheckMs)           return false;
+    // 20~40s 随机间隔：固定间隔会被训练出"到点必有东西"的预期
+    petPeekNextCheckMs = now + PET_PEEK_GAP_MIN_MS
+                       + (esp_random() % PET_PEEK_GAP_JIT_MS);
+
+    if (now - lastActivityTime < PET_PEEK_IDLE_MIN_MS) return false;
+    if (pet.peekToday >= PET_PEEK_DAILY_MAX)           return false;
+
+    time_t t = time(nullptr);
+    struct tm tmNow;
+    if (!localtime_r(&t, &tmNow)) return false;
+    uint32_t ymd = (tmNow.tm_year + 1900) * 10000 + (tmNow.tm_mon + 1) * 100 + tmNow.tm_mday;
+
+    // 24 小时静默。⚠ 判据是 ymd >= muteYmd（跨日的整数比较），不是判"今天
+    // 还在暂停期里"：muteYmd 存的是到期那天的 YYYYMMDD，用等号判会在到期
+    // 那天早上 00:00 就解封，比"安静一整天"实际短了 24 小时。
+    if (pet.muteYmd != 0) {
+        if (ymd >= pet.muteYmd) {
+            pet.muteYmd = 0;
+            pet.bothered = 0;
+            preferences.putUInt("pet_mute_y", 0);
+            preferences.putUChar("pet_bother", 0);
+        } else {
+            return false;
+        }
+    }
+
+    // 跨日：探头次数清零
+    if (ymd != pet.peekYmd) {
+        pet.peekYmd = ymd;
+        pet.peekToday = 0;
+        pet.bothered = 0;
+        preferences.putUInt("pet_peek_y", ymd);
+        preferences.putUChar("pet_peek_n", 0);
+    }
+
+    // 显示时段。⚠ from > to 是跨零点（默认 23:00-07:00 就是），
+    // 写成 h >= from && h < to 会永远不成立，等于探头被静默关掉。
+    uint8_t h = (uint8_t)tmNow.tm_hour;
+    bool inWin;
+    if (pet.fromH == pet.toH)              inWin = true;
+    else if (pet.fromH < pet.toH)          inWin = (h >= pet.fromH && h < pet.toH);
+    else                                   inWin = (h >= pet.fromH || h < pet.toH);
+    if (!inWin) return false;
+
+    return (int)(esp_random() % 100) < PET_PEEK_CHANCE;
+}
+
+// ===========================
+// 每轮轮询
+// ===========================
+// 头像条的消失、姿态回 IDLE、探头超时都在这里。
+// ⚠️ 这里**绝不能**顺手去跳过 updateDynamicElements()：lockStateDirty 是靠
+// 它内部清的，跳过会退化成每轮 loop 都往 C3 推 61 字节灯帧、Serial1 堵死，
+// 6 秒后监测任务判定卡死 → esp_restart()。见 loop() 里 9680 那段注释。
+static void petPoll(void) {
+    unsigned long now = millis();
+
+    // 姿态到点自然回 IDLE（不是在外部 tick 驱动的）
+    if (pet.pose != POSE_IDLE && pet.poseUntilMs != 0 && now >= pet.poseUntilMs) {
+        pet.pose = POSE_IDLE;
+        pet.poseUntilMs = 0;
+    }
+
+    // 探头的 8 秒到了就自己缩回去
+    if (petScene == SCENE_PEEK && now - petPeekStartMs > PET_PEEK_HOLD_MS) {
+        petDestroyPeek();
+        petScene = SCENE_NONE;
+    }
+
+    // 长期不互动 → 越来越闷
+    if (petScene == SCENE_NONE && pet.lastSeenMs != 0
+        && now - pet.lastSeenMs > 1800000UL) {
+        if (pet.mood > 5) pet.mood--;
+    }
+
+    PetScene want = petGate();
+    if (want == SCENE_PEEK && petScene != SCENE_PEEK) {
+        petStartPeek();
+    } else if (want == SCENE_NONE && petScene == SCENE_PEEK) {
+        petDestroyPeek();          // 让位：响铃/通知/进菜单/刚敲了键
+        petScene = SCENE_NONE;
+    }
+}
+
+// ===========================
+// NVS
+// ===========================
+// ⚠️ pet_peek_on 的默认值是 **true**：Preferences::getBool 的第二个参数是
+// "键不存在时返回什么"，传 false 等于默认关，与需求相反。
+//
+// 状态一律走 GSET:/直接 preferences 写，**别用 SET:** —— SET: 会自动给键名
+// 加方案号前缀（见 handleCommand 里的 hasProfPrefix）。
+static void petLoadFromNvs(void) {
+    pet.mood     = preferences.getUChar("pet_mood", 60);
+    pet.bond     = preferences.getUShort("pet_bond", 0);
+    pet.fedToday = preferences.getUChar("pet_fed_n", 0);
+    pet.fedYmd   = preferences.getUInt("pet_fed_y", 0);
+    pet.peekToday= preferences.getUChar("pet_peek_n", 0);
+    pet.peekYmd  = preferences.getUInt("pet_peek_y", 0);
+    pet.bothered = preferences.getUChar("pet_bother", 0);
+    pet.muteYmd  = preferences.getUInt("pet_mute_y", 0);
+    pet.peekOn   = preferences.getBool("pet_peek_on", true);
+    pet.fromH    = preferences.getUChar("pet_from_h", 23);
+    pet.toH      = preferences.getUChar("pet_to_h", 7);
+    if (pet.mood > 100) pet.mood = 60;
+    if (pet.fromH > 23) pet.fromH = 23;
+    if (pet.toH   > 23) pet.toH   = 7;
+    pet.pose = POSE_IDLE;
+    pet.poseUntilMs = 0;
+    petPeekNextCheckMs = millis() + PET_PEEK_GAP_MIN_MS;
+    petLastLineMs = 0;
+    petLastLineCls = 0xFFFFFFFF;
+
+    String nm = preferences.getString("pet_name", "");
+    nm.trim();
+    if (nm.length() == 0) {
+        snprintf(petNameBuf, sizeof(petNameBuf), "小橘");
+        preferences.putString("pet_name", petNameBuf);
+    } else {
+        nm.toCharArray(petNameBuf, sizeof(petNameBuf));
+        petNameBuf[sizeof(petNameBuf) - 1] = '\0';
+    }
+}
+
+// ===========================
+// 菜单动作
+// ===========================
+// 直接吃 MenuAction 枚举，不再另编一套动作号 —— 两套编号迟早会对不上，
+// 而且宏必须在文本上先定义（runMenuAction 在 3000 行，这里在 3900 行，
+// 用 #define 做转发会报"未声明"）。枚举和函数则不受位置限制。
+static uint8_t petMenuField = 0;   // 时段那一项里：0=起始小时 1=结束小时
+
+static void petMenuAction(MenuAction act) {
+    char buf[24];
+    switch (act) {
+        case MA_PET_PEEK_ON:
+            pet.peekOn = !pet.peekOn;
+            preferences.putBool("pet_peek_on", pet.peekOn);
+            triggerHud("主动打招呼", pet.peekOn ? "已开启" : "已关闭",
+                       lv_color_hex(pet.peekOn ? CLR_GREEN : CLR_TEXT_DIM));
+            break;
+        case MA_PET_WINDOW:
+            // ←→ 调起、↑↓ 调止。跨零点合法（23->07），不拦。
+            if (petMenuField == 0) {
+                pet.fromH = (uint8_t)((pet.fromH + 1) % 24);
+            } else {
+                pet.toH = (uint8_t)((pet.toH + 1) % 24);
+            }
+            preferences.putUChar("pet_from_h", pet.fromH);
+            preferences.putUChar("pet_to_h", pet.toH);
+            snprintf(buf, sizeof(buf), "%02u:00 - %02u:00", pet.fromH, pet.toH);
+            triggerHud("显示时段", buf, lv_color_hex(CLR_ACCENT));
+            break;
+        case MA_PET_OPEN:
+            petEnterFull();
+            break;
+        case MA_PET_RENAME:
+            triggerHud("改名", "暂未开放", lv_color_hex(CLR_TEXT_DIM));
+            break;
+        case MA_PET_RESET:
+            pet.bond = 0;
+            pet.mood = 60;
+            pet.bothered = 0;
+            petSaveMood();
+            preferences.putUChar("pet_bother", 0);
+            triggerHud("亲密度", "已清零", lv_color_hex(CLR_ACCENT));
+            break;
+        default:
+            break;
+    }
 }
 
 // ===========================
@@ -5810,6 +6794,20 @@ static void scanKeyboardMatrix(void) {
         }
     }
 
+    // LOGO 长按判定。矩阵键本来**没有**长按检测（工程里所有 _HOLD 都来自
+    // C3 小 MCU 的 Serial1 上报），这里按"按下时记时刻 + 每拍看一次还按着没有"
+    // 自己实现。放在列循环前面，一拍一次就够（SCAN_INTERVAL = 8ms）。
+    //
+    // ⚠️ Fn 按住时**完全不进**这段：Fn+LOGO 是系统重启（见按键分发里
+    // baseKey == K_LOGO 那个分支），长按不能把它抢走。
+    if (logoIsDown && !logoHoldFired && !fnPressed
+        && millis() - logoDownMs >= PET_LOGO_HOLD_MS) {
+        logoHoldFired = true;
+        if (petScene == SCENE_FULL)      petExitFull();    // 页内：退出
+        else if (petScene == SCENE_PEEK) petDismiss();     // 探头：收起 + 记打扰
+        else                             petEnterFull();   // 平时：进宠物页
+    }
+
     for (int c = 0; c < NUM_COLS; c++) {
         // 选列只用一次寄存器写。
         //
@@ -5903,6 +6901,21 @@ static void scanKeyboardMatrix(void) {
                                               || IS_SETTING_MODE(currentSysMode)
                                               || inRecMode
                                               || inElogMode;
+
+                        // 宠物页**故意不在** inUiMode 里：那个分支会把按键吃干净、
+                        // 一律不发主机，进去就一个字都打不出来。宠物页要的是
+                        // 矩阵键照常发主机、宠物只作反应。
+                        //
+                        // 但 ESC 得有个说法：不管当前是什么界面，按 ESC 都先
+                        // 回到主屏（这是全键盘通用的逃生出口）。否则宠物页在
+                        // 场时按 ESC 会被当成普通字符发给主机，主机那边收到一个
+                        // 莫名其妙的 ESC —— 而这里又不能简单地"因为不在界面态就
+                        // 照常发"，那和"宠物页是全屏页面"的事实矛盾。
+                        if (currentSysMode == SYS_MODE_PET && baseKey == 0x29 /* ESC */) {
+                            petExitFull();
+                            hostKeyHeld[r][c] = false;   // 这键没发过 press，别补 release
+                            continue;
+                        }
 
                         if (inUiMode) {
                             // ---- 界面态：这一整块把按键吃干净，一律不发到主机 ----
@@ -6015,12 +7028,18 @@ static void scanKeyboardMatrix(void) {
                             // 静音键在 C3 上（BTN:MUTE），别在这儿加分支。
                             else if (baseKey >= MACRO_BASE) {
                                 if (baseKey == K_LOGO) {
-                                    // LOGO 短按 = 切换主屏风格；Fn+LOGO 仍然保留重启
+                                    // LOGO 现在要区分长按（进/退宠物页）和短按
+                                    // （切主屏风格），所以动作**从按下挪到松手**。
+                                    // 按下只记时刻；松手时没触发过长按才算短按。
+                                    // ⚠️ Fn+LOGO 的重启保持"按下即执行"，不受影响 ——
+                                    //    它是唯一一个要求"按下就有反应"的组合键。
                                     if (fnPressed) {
                                         triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
                                         pendingRestartMs = millis() + 600;
                                     } else {
-                                        cycleDisplayStyle();
+                                        logoIsDown = true;
+                                        logoDownMs = millis();
+                                        logoHoldFired = false;
                                     }
                                 } else if (baseKey == K_PLAY) {
                                     if (fnPressed) {
@@ -6086,8 +7105,18 @@ static void scanKeyboardMatrix(void) {
                         }
                         else if (baseKey >= MACRO_BASE) {
                             // 消费级键松开才发 release。
-                            // LOGO 的切风格动作已经挪到"按下"时做了（press 更跟手，
-                            // 放在 release 上会让人以为没反应），这里不用再管。
+                            // LOGO 的短按动作在"松手"时补做（因为要区分长按）；
+                            // 长按已经由 scanKeyboardMatrix 开头的判定处理过了。
+                            if (baseKey == K_LOGO) {
+                                logoIsDown = false;
+                                if (!logoHoldFired) {
+                                    if (petScene == SCENE_FULL) petExitFull();
+                                    else if (petScene == SCENE_PEEK) { /* 吞掉：不切风格 */ }
+                                    else cycleDisplayStyle();
+                                }
+                                logoHoldFired = false;
+                            }
+                            // PLAY/NEXT/PREV 的 Consumer 松键照旧
                             if (baseKey == K_PLAY || baseKey == K_NEXT || baseKey == K_PREV) {
                                 ConsumerControl.release();
                             }
@@ -8232,6 +9261,35 @@ static void handleC3Command(const String& cmd) {
     // 息屏期间任何 C3 动作都算"有人回来了"（旋钮碰一下也算）
     if (currentSysMode == SYS_MODE_SLEEP) gotoMainScreen();
 
+    // ---- 宠物：接管 C3 实体键 ----
+    // 这些键物理上挂在小 MCU 上、**矩阵里没有这一格**（README:122-123），
+    // 所以用它们互动完全不影响打字。设计原则是"借道不吞键"：宠物拿到
+    // 一次反应，但该键的原有语义照常落回下面 —— 摸猫的时候手按到静音键，
+    // 它喵一声，你的电脑同时也静音了（和 8285 那段静音处理是同一个态度）。
+    //
+    // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"进下载模式重启"。
+    if (currentSysMode == SYS_MODE_PET) {
+        if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头
+        else if (cmd.startsWith("ROT:") || cmd == "ENC:+"
+                 || cmd == "ENC:-") { petPetted(1); }            // 撸（连续转）
+        else if (cmd == "BTN:KNOB") { petFed(); }                // 喂食
+        else if (cmd == "BTN:LIGHT_HOLD") {                       // 长按灯光 = 退出
+            petExitFull();
+            return;
+        }
+        // 其余 C3 键（灯效 / 短按灯光）不在宠物页接管，掉回下面照常处理
+    } else if (petScene == SCENE_PEEK) {
+        // 探头在场：只"顺便"算一次被摸，**不吞任何键**。探头出现时用户多半
+        // 正在打字，吞键就卡壳了。
+        if (cmd == "BTN:MUTE" || cmd == "BTN:KNOB"
+            || cmd.startsWith("ROT:") || cmd == "ENC:+" || cmd == "ENC:-") {
+            petPetted(1);
+        } else if (cmd == "BTN:LIGHT_HOLD") {
+            petDismiss();
+            return;
+        }
+    }
+
     if (cmd == "ENC:+")      { knobAdjust(1);  return; }
     if (cmd == "ENC:-")      { knobAdjust(-1); return; }
     if (cmd.startsWith("ROT:")) { knobAdjust(cmd.substring(4) == "R" ? 1 : -1); return; }
@@ -9299,6 +10357,9 @@ void setup() {
     indBrightness = indLevelValues[indLevel];
 
     shtTempOffset = preferences.getFloat("sht_offset", SHT_TEMP_OFFSET_DEFAULT);
+    // 宠物：14 项状态。pet_peek_on 默认 true（getBool 第二个参数是
+    // "键不存在时返回什么"，传 false 就等于默认关）。
+    petLoadFromNvs();
     // 老固件把这里当成"内部基准"存，值是 62.0（那个值在校准页里怎么调都不生效）。
     // 新语义下 62.0 会被当成 "+62°C 的偏移"加进去，读数直接爆掉 —— 所以
     // 跳出 ±20 范围的历史值一律丢掉，回落到默认补偿。
@@ -9709,6 +10770,12 @@ if (lockStateDirty) {
     if (currentSysMode == SYS_MODE_SET_TIMER && timerRunning) {
         update_setting_timer_display();
     }
+
+    // ---- 宠物：姿态回 IDLE / 探头 8 秒超时 / 出场仲裁 ----
+    // ⚠️ 绝不能为了"宠物页看不见主屏"就跳过上面那个 updateDynamicElements()：
+    // lockStateDirty 是靠它内部清的，跳过会退化成每轮 loop 都往 C3 推 61 字节
+    // 灯帧，Serial1 堵死，6 秒后监测任务判定卡死 → esp_restart()。
+    petPoll();
 
     // ---- 响铃卡片：lv_layer_top 上的浮层，压在任何一块屏上面 ----
     // 每轮都调，内部按 500ms 节流：起铃、停铃、描边翻转时才会真重建。
