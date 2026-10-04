@@ -732,6 +732,45 @@ static unsigned long timerStartMs = 0;
 static uint32_t timerTotalSec = 0;
 static uint32_t timerRemainSec = 0;
 
+// ===========================
+// 响铃引擎（闹钟 / 倒计时到点共用）
+// ===========================
+// 为什么要有这一层：闹钟和倒计时到点之后要做的事**完全一样** ——
+// 主背光整排黄灯快闪 + 屏幕上一张常驻卡片，等用户按灯光键/静音键停。
+// 只有文案和大字不一样（闹钟报"本该几点响"，倒计时报"刚才设了多久"），
+// 所以走同一套，不再各写一份。
+//
+// 这一整块以前是**没有**的：alarmHour/alarmMinute/alarmEnabled 三个变量
+// 存得进 NVS、网页上"设置成功"也照样弹绿条，但全工程没有任何一处去比对
+// 当前时间（alarmLastFiredYday 在 604 行声明了却一次都没被读过），
+// timerRemainSec 也只被赋值、从没被减过 —— 所以"设了闹钟不响"、
+// "设了倒计时不走"都是同一个病因：只有状态，没有驱动它们的状态机。
+enum RingKind { RING_NONE = 0, RING_ALARM, RING_TIMER };
+static RingKind ringingKind = RING_NONE;   // 当前响的是哪种铃
+static unsigned long ringStartMs = 0;      // 本次起铃时刻，用于兜底超时
+static bool ringBlinkOn = true;            // 卡片描边的亮/暗，用于重画节流
+
+// 响铃卡片。挂在 lv_layer_top() 上而不是做成一块独立屏幕：这样菜单、设置页、
+// 息屏中的任何一种底下都能直接盖住，不用先想办法退回主屏。
+static lv_obj_t* ring_win = nullptr;
+static lv_obj_t* ring_lbl_title = nullptr;
+static lv_obj_t* ring_lbl_big = nullptr;
+
+// ===========================
+// 倒计时全屏
+// ===========================
+// 用户要的是"整屏只显示这一个倒计时，文字很大"（见 README「倒计时全屏」）。
+// 所以它是**一块独立屏幕**（lv_obj_create(NULL)）而不是浮层：底层什么都不画，
+// 240x240 全部让给那一个数字。
+//
+// countdownShown = 用户是否允许这块屏接管显示。刚设上倒计时时置 true；
+// 按住灯光键退出接管后置 false，但**倒计时本身继续在后台跑**（用户原话：
+// 「按住灯光键可以退出全屏。然后后台继续跑」）。false 期间随时可以再设一次
+// 把它叫回来，或者干脆等它跑完响铃。
+static lv_obj_t* scr_countdown = nullptr;
+static lv_obj_t* cd_lbl_main = nullptr;
+static bool countdownShown = false;
+
 // 温度校准
 static float calTempOriginal = SHT_TEMP_OFFSET_DEFAULT;
 static int calTempField = 0;
@@ -1416,6 +1455,18 @@ static void build_settings_caltemp(void);
 static void build_settings_light(void);
 static void moveSettingField(int dir);
 static void adjustSettingField(int delta);
+// 响铃 / 倒计时全屏（见「响铃引擎」处的注释）
+static void startRinging(RingKind kind);
+static void stopRinging(void);
+static void drawRingOverlay(void);
+static void updateTimers(void);
+static void startCountdown(uint32_t totalSec);
+static void stopCountdown(bool silent);
+static void toggleCountdownFromKeyboard(void);
+static void updateCountdownVisibility(void);
+static void destroyCountdownScreen(void);
+static void buildCountdownScreen(void);
+static void updateCountdownScreenText(void);
 static void saveSettingScreen(void);
 static void cancelSettingScreen(void);
 static void update_setting_time_display(void);
@@ -3305,6 +3356,311 @@ static bool acknowledgeAlert(void) {
 }
 
 // ===========================
+// 响铃：闹钟和倒计时到点共用
+// ===========================
+// 卡片是**常驻**的，不自动消失 —— 闹钟的价值全在"别漏掉"，弹 3 秒就没了
+// 等于什么都没发生。停铃只有两个键：灯光键和静音键（用户定的），
+// 别的键照常发给主机，不吃。
+//
+// 60 秒没人理会会自动停铃，但会留一条通知在队列里（"闹钟未确认"），
+// 不这么兜底的话一排黄灯能闪一整晚。
+#define RING_SAFETY_MS 60000UL
+
+// 颜色按通道各自压暗（用于响铃卡片描边的"暗"那一半）。
+//
+// ⚠ **不能写成 `hex >> 2`**。0xRRGGBB 是一个打包整数，整体右移会让位从
+// 通道边界穿过去：琥珀 0xFBBF24 右移 2 位得到 0x3EEFC9 —— 绿 191 变 239、
+// 蓝 36 变 201，颜色从琥珀变成青，闪的时候一眼就看得出不对。
+// 必须先拆出三个 8 位通道、各自移位、再重新打包。
+static uint32_t dimRGB(uint32_t hex, uint8_t shift) {
+    uint8_t r = (uint8_t)((hex >> 16) & 0xFF);
+    uint8_t g = (uint8_t)((hex >> 8) & 0xFF);
+    uint8_t b = (uint8_t)(hex & 0xFF);
+    return ((uint32_t)(r >> shift) << 16) | ((uint32_t)(g >> shift) << 8) | (b >> shift);
+}
+
+static void startRinging(RingKind kind) {
+    if (kind == RING_NONE) return;
+    // 已经在响了就别打断，也别把兜底计时重置掉
+    if (ringingKind != RING_NONE) return;
+
+    ringingKind = kind;
+    ringStartMs = millis();
+    ringBlinkOn = true;
+
+    // 响铃比 HUD 重要：先把浮层让出来，别让一条 3 秒的提示压在响铃上面
+    if (hud.active) {
+        hud.active = false;
+        if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
+    }
+
+    // 屏幕可能正息着。只闪灯不看屏等于没提醒，所以把屏幕叫醒。
+    lastActivityTime = millis();
+    if (currentSysMode == SYS_MODE_SLEEP) {
+        currentSysMode = SYS_MODE_NORMAL;
+        gotoMainScreen();
+    }
+
+    // 倒计时全屏让位给响铃：倒计时已经跑完了，这块屏本来就要收掉
+    countdownShown = false;
+    destroyCountdownScreen();
+}
+
+static void stopRinging(void) {
+    if (ringingKind == RING_NONE) return;
+    ringingKind = RING_NONE;
+    if (ring_win) { lv_obj_del(ring_win); ring_win = nullptr; }
+    ring_lbl_title = nullptr;
+    ring_lbl_big = nullptr;
+}
+
+// 响铃卡片。描边每 500ms 亮/暗翻一次 —— 屏幕在闪 + 整排灯在闪，
+// 两个一起才够"闹钟"的份量；只有一个的话很容易当成普通通知划过去。
+static void drawRingOverlay(void) {
+    if (ringingKind == RING_NONE) {
+        if (ring_win) { lv_obj_del(ring_win); ring_win = nullptr; }
+        return;
+    }
+
+    // 兜底超时：到点没人理就停铃，但留一条通知，不算静默丢失
+    if (millis() - ringStartMs > RING_SAFETY_MS) {
+        const char* what = (ringingKind == RING_ALARM) ? "闹钟未确认" : "倒计时未确认";
+        stopRinging();
+        pushNotification(ALERT_YELLOW, what);
+        return;
+    }
+
+    // 描边翻转只需要改颜色，但整张卡重建也只有 5 个控件，量很小；
+    // 换来的是只有一条绘制路径，不会出现"某次重建漏了某个指针"的野指针问题。
+    static unsigned long lastBlinkMs = 0;
+    static bool dirty = true;
+    unsigned long nowMs = millis();
+    if (nowMs - lastBlinkMs >= 500) {
+        lastBlinkMs = nowMs;
+        ringBlinkOn = !ringBlinkOn;
+        dirty = true;
+    }
+    if (!dirty && ring_win) return;
+    dirty = false;
+
+    if (ring_win) { lv_obj_del(ring_win); ring_win = nullptr; }
+
+    const bool isAlarm = (ringingKind == RING_ALARM);
+    const uint32_t accent = CLR_AMBER;
+
+    // 纯黑底 + 3px 琥珀描边，228x196 居中（屏 240x240）。
+    // 描边亮时满色、暗时压到 1/4，肉眼就是"一闪一闪"。
+    ring_win = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(ring_win, 228, 196);
+    lv_obj_center(ring_win);
+    mkCard(ring_win, 0x000000, 14);
+    lv_obj_set_style_border_width(ring_win, 3, LV_PART_MAIN);
+    lv_obj_set_style_border_color(ring_win,
+        lv_color_hex(ringBlinkOn ? accent : dimRGB(accent, 2)), LV_PART_MAIN);
+    lv_obj_move_foreground(ring_win);
+
+    // 标题：就是用户要的那几个字
+    ring_lbl_title = lv_label_create(ring_win);
+    mkLabel(ring_lbl_title, &lv_font_simsun_16_cjk, accent);
+    lv_label_set_text(ring_lbl_title, isAlarm ? "闹钟响了" : "倒计时结束");
+    lv_obj_align(ring_lbl_title, LV_ALIGN_TOP_MID, 0, 26);
+
+    // 中间大字。中文只有 16px 子集字库（见 README「改完界面文案后必须重生成字体」），
+    // 放不大，所以"大"这件事交给 48 号数字：闹钟报本该几点响，倒计时报刚才设了多久。
+    char big[24];
+    if (isAlarm) {
+        snprintf(big, sizeof(big), "%02u:%02u", (unsigned)alarmHour, (unsigned)alarmMinute);
+    } else if (timerTotalSec >= 3600) {
+        snprintf(big, sizeof(big), "%02u:%02u:%02u",
+                 (unsigned)(timerTotalSec / 3600),
+                 (unsigned)((timerTotalSec / 60) % 60),
+                 (unsigned)(timerTotalSec % 60));
+    } else {
+        snprintf(big, sizeof(big), "%02u:%02u",
+                 (unsigned)(timerTotalSec / 60), (unsigned)(timerTotalSec % 60));
+    }
+    ring_lbl_big = lv_label_create(ring_win);
+    mkLabel(ring_lbl_big, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(ring_lbl_big, big);
+    lv_obj_align(ring_lbl_big, LV_ALIGN_CENTER, 0, 6);
+
+    // 底部：只提真正能停铃的那两个键
+    lv_obj_t* hint = lv_label_create(ring_win);
+    mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(hint, "按灯光键或静音键停止");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
+}
+
+// ===========================
+// 倒计时全屏
+// ===========================
+// 用户的要求很直白：「全屏幕就是展示这一个倒计时」，所以这块屏上
+// **只有那一个数字** —— 连进度条、"按灯光键退出"都不加。要看提示去 README，
+// 加了提示它就变成另一块主屏，那就不是用户要的东西了。
+static void destroyCountdownScreen(void) {
+    if (scr_countdown) {
+        // 必须先切走再删：LVGL 8.4 删掉活动屏会把 disp->act_scr 置成 NULL，
+        // 紧接着的刷新就解引用空指针 → panic → 重启（理由同 swapScreen 的注释）。
+        if (currentScreen == scr_countdown) {
+            currentScreen = nullptr;
+            showScreen(ensureMainScreen());
+        }
+        lv_obj_del(scr_countdown);
+        scr_countdown = nullptr;
+    }
+    cd_lbl_main = nullptr;
+}
+
+static void updateCountdownScreenText(void) {
+    if (!scr_countdown || !cd_lbl_main) return;
+    char buf[24];
+    if (timerRemainSec >= 3600) {
+        snprintf(buf, sizeof(buf), "%02u:%02u:%02u",
+                 (unsigned)(timerRemainSec / 3600),
+                 (unsigned)((timerRemainSec % 3600) / 60),
+                 (unsigned)(timerRemainSec % 60));
+    } else {
+        snprintf(buf, sizeof(buf), "%02u:%02u",
+                 (unsigned)(timerRemainSec / 60), (unsigned)(timerRemainSec % 60));
+    }
+    setText(cd_lbl_main, buf);
+}
+
+static void buildCountdownScreen(void) {
+    if (scr_countdown) { lv_obj_del(scr_countdown); scr_countdown = nullptr; }
+
+    scr_countdown = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_countdown, lv_color_hex(CLR_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr_countdown, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_countdown, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 48 号 Montserrat 里数字宽 28~32px、冒号约 11px。
+    // 最坏情况 "88:88:88" = 6 数字 + 2 冒号 ≈ 203px，240px 的屏放得下；
+    // 不满 1 小时只排 "MM:SS"（约 142px），字大到隔着半张桌子也看得清。
+    cd_lbl_main = lv_label_create(scr_countdown);
+    mkLabel(cd_lbl_main, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(cd_lbl_main, "--:--");
+    lv_obj_center(cd_lbl_main);
+
+    showScreen(scr_countdown);
+    // 起跑那一瞬间就要出数字，不能等下一秒的节拍
+    updateCountdownScreenText();
+}
+
+// 这块屏什么时候该在、什么时候该让位，一次说清：
+//   允许接管（countdownShown）且倒计时在跑 → 盖在主屏上
+//   进了菜单/任一设置页/录制/日志           → 让位，别把人困在倒计时里出不来
+//   响铃中                                 → 让位（响铃卡片是浮层，优先级更高）
+//   息屏                                   → 让位给屏保
+static void updateCountdownVisibility(void) {
+    const bool wantIt = countdownShown && timerRunning
+                        && (ringingKind == RING_NONE)
+                        && (currentSysMode == SYS_MODE_NORMAL);
+    if (!wantIt) {
+        if (scr_countdown) destroyCountdownScreen();
+        return;
+    }
+    if (currentScreen != scr_countdown) buildCountdownScreen();
+    else                               updateCountdownScreenText();
+}
+
+// 启停倒计时的唯一入口：设时长、起表、把全屏叫起来。
+// 网页的 TIMERSET: 和键盘设置页的回车键都走这里，避免两处各写一份
+// "谁负责把 countdownShown 置上"的初始化。
+static void startCountdown(uint32_t totalSec) {
+    if (totalSec == 0) {
+        triggerHud("倒计时", "时长不合法", lv_color_hex(CLR_RED));
+        return;
+    }
+    if (totalSec > 86400UL) totalSec = 86400UL;   // 24 小时封顶
+
+    timerTotalSec = totalSec;
+    timerRemainSec = totalSec;
+    timerStartMs = millis();
+    timerRunning = true;
+    timerEditH = (int)(totalSec / 3600);
+    timerEditM = (int)((totalSec / 60) % 60);
+    timerEditS = (int)(totalSec % 60);
+    countdownShown = true;
+}
+
+static void stopCountdown(bool silent) {
+    timerRunning = false;
+    timerRemainSec = 0;
+    countdownShown = false;
+    destroyCountdownScreen();
+    if (!silent) triggerHud("倒计时", "已停止", lv_color_hex(CLR_AMBER));
+}
+
+// 键盘设置页倒计时那一屏的回车键 = 页面那颗"开始/停止"按钮。
+//
+// 原来这里是个**摆设**：按钮画出来了、文案会跟着 timerRunning 在"开始/停止"
+// 之间变，但全工程没有任何一行代码处理它；回车键走的是通用保存分支，
+// 只把时长记进 timerTotalSec 就退出界面，一次都没起过表。所以"在键盘上
+// 设倒计时"和"在网页上设倒计时"一样，从来就没跑起来过。
+// 现在让按钮说的话成真：没在跑就起跑（并把全屏让给倒计时），在跑就停。
+static void toggleCountdownFromKeyboard(void) {
+    if (timerRunning) {
+        stopCountdown(false);
+    } else {
+        uint32_t total = (uint32_t)(timerEditH * 3600 + timerEditM * 60 + timerEditS);
+        if (total == 0) {
+            triggerHud("倒计时", "时长不合法", lv_color_hex(CLR_RED));
+            return;   // 停在设置页，让人改时长，别把界面弹走
+        }
+        startCountdown(total);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", timerEditH, timerEditM, timerEditS);
+        triggerHud("倒计时", buf, lv_color_hex(CLR_ACCENT));
+    }
+    gotoMainScreen();   // 交回主屏，倒计时全屏下一轮 loop 自己接管
+}
+
+// ===========================
+// 每秒跑一遍：闹钟到点判定 + 倒计时推进
+// ===========================
+// 放主循环里，不占任何中断。
+static void updateTimers(void) {
+    static unsigned long lastSec = 0;
+    unsigned long nowSec = millis() / 1000UL;
+    if (nowSec == lastSec) return;
+    lastSec = nowSec;
+
+    time_t t = time(nullptr);
+    struct tm* lt = localtime(&t);
+
+    // ---- 闹钟 ----
+    // 时间没校准（tm_year < 124，1970 前后）时不判定，否则开机瞬间正好撞上
+    // 00:00 的闹钟会莫名其妙响一次。
+    // 一天只响一次靠 tm_yday 去重：跨过整点后这一分钟内会连续命中很多次 loop，
+    // 没有 yday 就会连着响一整分钟。
+    if (lt && lt->tm_year > 124 && alarmEnabled && ringingKind == RING_NONE) {
+        int nowMin = lt->tm_hour * 60 + lt->tm_min;
+        if (nowMin == alarmHour * 60 + alarmMinute && lt->tm_yday != alarmLastFiredYday) {
+            alarmLastFiredYday = lt->tm_yday;   // 先记再去重，否则起铃失败会一直重试
+            startRinging(RING_ALARM);
+        }
+    }
+
+    // ---- 倒计时 ----
+    if (!timerRunning) return;
+
+    // 剩余量从"开始时刻"反算，而不是每秒自减：中间被宏的 delay() 或壁纸解码
+    // 阻塞过几百毫秒也不会越欠越多（自减会把这段时间白吃掉）。
+    // 无符号减法让 millis() 每 49.7 天回绕一次也天然正确。
+    unsigned long elapsedSec = (millis() - timerStartMs) / 1000UL;
+    if (elapsedSec >= timerTotalSec) {
+        timerRemainSec = 0;
+        timerRunning = false;
+        countdownShown = false;
+        destroyCountdownScreen();
+        startRinging(RING_TIMER);
+        return;
+    }
+    timerRemainSec = timerTotalSec - (uint32_t)elapsedSec;
+}
+
+// ===========================
 // 设置界面显示更新函数
 // ===========================
 static void update_setting_time_display(void) {
@@ -5138,7 +5494,13 @@ static void scanKeyboardMatrix(void) {
                                 else if (baseKey == KEY_RIGHT_ARROW) moveSettingField(1);
                                 else if (baseKey == KEY_UP_ARROW) adjustSettingField(1);
                                 else if (baseKey == KEY_DOWN_ARROW) adjustSettingField(-1);
-                                else if (baseKey == KEY_RETURN) saveSettingScreen();
+                                else if (baseKey == KEY_RETURN) {
+                                    // 倒计时那一屏的回车是"启停"，不是"保存" ——
+                                    // 页面上那颗开始/停止按钮就是这么标的（见
+                                    // toggleCountdownFromKeyboard 的注释）
+                                    if (currentSysMode == SYS_MODE_SET_TIMER) toggleCountdownFromKeyboard();
+                                    else saveSettingScreen();
+                                }
                                 else if (baseKey == KEY_ESC || baseKey == K_MC) cancelSettingScreen();
                             }
                             // 宏录制：M1-M12 保存 / MR 走三段 / ESC·MC 取消 / 其余记进键流
@@ -6436,13 +6798,36 @@ static void handleCommand(const String& cmd) {
         epochCache = (uint32_t)t;   // 内存副本跟着走，否则 CFGGET 拉出来的还是旧时间
         triggerHud("时间", "已同步", lv_color_hex(CLR_GREEN));
     }
-    // ALARMSET:HH:MM - Set alarm
+    // ALARMSET:HH:MM | ALARMSET:OFF - Set / clear alarm
     else if (cmd.startsWith("ALARMSET:")) {
         String timeStr = cmd.substring(9);
+        timeStr.trim();
+        String up = timeStr;
+        up.toUpperCase();
+
+        // OFF / 0 关闹钟。kbctl.py 和 kbctl_hid.py 关闹钟发的是 `ALARMSET:OFF`，
+        // 以前这里只认带冒号的写法，"OFF" 里没有 ':'，于是 indexOf 返回 -1，
+        // 整个分支被静默跳过 —— 网页/Pc 端点了"关闭闹钟"，键盘上其实还开着，
+        // 到点照样响。关不掉比开不了更气人，因为它没有任何报错。
+        if (up == "OFF" || up == "0" || up == "DISABLE" || up == "CANCEL") {
+            alarmEnabled = false;
+            preferences.putBool("alarm_on", false);
+            triggerHud("闹钟", "已关闭", lv_color_hex(CLR_TEXT_DIM));
+            return;
+        }
+
         int colonIdx = timeStr.indexOf(':');
         if (colonIdx > 0) {
-            alarmHour = (uint8_t)timeStr.substring(0, colonIdx).toInt();
-            alarmMinute = (uint8_t)timeStr.substring(colonIdx + 1).toInt();
+            int h = timeStr.substring(0, colonIdx).toInt();
+            int m = timeStr.substring(colonIdx + 1).toInt();
+            if (h < 0 || h > 23 || m < 0 || m > 59) {
+                // 越界值以前是直接截断存进 uint8_t 的，网页上填个 99:99
+                // 就会存成 99:99，第二天永远等不到那一声。存之前先拒掉并说清楚。
+                triggerHud("闹钟", "时间超出范围", lv_color_hex(CLR_RED));
+                return;
+            }
+            alarmHour = (uint8_t)h;
+            alarmMinute = (uint8_t)m;
             alarmEnabled = true;
             preferences.putUChar("alarm_h", alarmHour);
             preferences.putUChar("alarm_m", alarmMinute);
@@ -6452,28 +6837,49 @@ static void handleCommand(const String& cmd) {
             triggerHud("闹钟", buf, lv_color_hex(CLR_GREEN));
         }
     }
-    // TIMERSET:HH:MM:SS or TIMERSET:STOP
+    // TIMERSET:<秒数> | TIMERSET:MM:SS | TIMERSET:HH:MM:SS | TIMERSET:STOP
+    //
+    // 三种写法都收，纯秒数排第一，因为**所有**远端客户端实际发的就是它：
+    //   s3-setting.html:  `TIMERSET:` + (h*3600 + m*60 + s)   → "TIMERSET:300"
+    //   kbctl.py:         "TIMERSET:%d" % total              → "TIMERSET:300"
+    //   kbctl_hid.py:     同上
+    // 而这里原来只认 HH:MM:SS（要求两个冒号），"300" 走不进来，
+    // 整个分支被静默跳过 —— 网页点"启动"只弹了个 alert，键盘上什么也没发生。
+    // 老版 s3/s3.ino 是三种都收的，移植到 LVGL 时这段容错被漏掉了。
     else if (cmd.startsWith("TIMERSET:")) {
-        String timeStr = cmd.substring(9);
-        if (timeStr == "STOP") {
-            timerRunning = false;
-            timerRemainSec = timerTotalSec;
-            triggerHud("倒计时", "已停止", lv_color_hex(CLR_AMBER));
+        String v = cmd.substring(9);
+        v.trim();
+        String vUp = v;
+        vUp.toUpperCase();
+
+        if (vUp == "STOP" || vUp == "OFF" || vUp == "CANCEL") {
+            stopCountdown(false);
         } else {
-            int firstColon = timeStr.indexOf(':');
-            int secondColon = timeStr.lastIndexOf(':');
-            if (firstColon > 0 && secondColon > firstColon) {
-                timerEditH = timeStr.substring(0, firstColon).toInt();
-                timerEditM = timeStr.substring(firstColon + 1, secondColon).toInt();
-                timerEditS = timeStr.substring(secondColon + 1).toInt();
-                timerTotalSec = timerEditH * 3600 + timerEditM * 60 + timerEditS;
-                timerRemainSec = timerTotalSec;
-                timerRunning = true;
-                timerStartMs = millis();
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%02d:%02d:%02d", timerEditH, timerEditM, timerEditS);
-                triggerHud("倒计时", buf, lv_color_hex(CLR_ACCENT));
+            int p1 = v.indexOf(':');
+            uint32_t total = 0;
+            if (p1 < 0) {
+                total = (uint32_t)v.toInt();
+            } else {
+                int p2 = v.indexOf(':', p1 + 1);
+                if (p2 < 0) {
+                    total = (uint32_t)v.substring(0, p1).toInt() * 60UL
+                          + (uint32_t)v.substring(p1 + 1).toInt();
+                } else {
+                    total = (uint32_t)v.substring(0, p1).toInt() * 3600UL
+                          + (uint32_t)v.substring(p1 + 1, p2).toInt() * 60UL
+                          + (uint32_t)v.substring(p2 + 1).toInt();
+                }
             }
+            if (total == 0) {
+                // 时长非法/误码。原来这里什么都不做，用户看到的就是"按了没反应"
+                triggerHud("倒计时", "时长不合法", lv_color_hex(CLR_RED));
+                return;
+            }
+            startCountdown(total);
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+                     timerEditH, timerEditM, timerEditS);
+            triggerHud("倒计时", buf, lv_color_hex(CLR_ACCENT));
         }
     }
     // MARQUEE:text - Set marquee text
@@ -7375,6 +7781,10 @@ static void handleC3Command(const String& cmd) {
     if (cmd == "BTN:LIGHT") {
         // 菜单里按灯光键 = 退回主屏（和 MC 一样的手感，别把人困在菜单里）
         if (currentSysMode == SYS_MODE_MENU) { gotoMainScreen(); return; }
+        // 响铃排在最前：闹钟/倒计时到点时，这一下就是"停铃"（用户指定的
+        // 停铃键就是灯光键和静音键）。必须排在通知之前 —— 不然响铃期间先被
+        // 通知确认吃掉，用户会以为按了没反应，而灯还在闪。
+        if (ringingKind != RING_NONE) { stopRinging(); return; }
         // 告警排在最前：有待处理通知时，这一下是"我已知晓"，
         // 只掉最新一条，剩下的继续显示、继续闪。不切控制目标，
         // 免得通知刚确认完旋钮就调到别的东西上。
@@ -7385,6 +7795,19 @@ static void handleC3Command(const String& cmd) {
         return;
     }
     if (cmd == "BTN:LIGHT_HOLD") {
+        // 倒计时全屏的退出口（用户定的）：按住灯光键收回全屏，
+        // 但**倒计时继续在后台跑** —— 屏只是"看一眼还剩多久"，
+        // 收走屏不等于取消这次计时。跑完照样会响铃提醒。
+        //
+        // 注意这里不 return：退出全屏之后这一次长按仍然按原逻辑切背光总开关，
+        // 免得"退出全屏"顺手把用户的灯关掉了、还得再按一次才能开回来。
+        if (scr_countdown) {
+            countdownShown = false;
+            destroyCountdownScreen();
+            if (currentSysMode == SYS_MODE_NORMAL) showScreen(ensureMainScreen());
+            triggerHud("倒计时", "已收回屏幕，仍在计时", lv_color_hex(CLR_TEXT_DIM));
+            return;
+        }
         lightOn = !lightOn;
         preferences.putBool("light_on", lightOn);
         triggerHud("背光总开关", lightOn ? "已开启" : "已关闭", lv_color_hex(CLR_AMBER));
@@ -7395,7 +7818,14 @@ static void handleC3Command(const String& cmd) {
         currentMode = MODE_MUTE;
         ConsumerControl.press(CONSUMER_CONTROL_MUTE);
         ConsumerControl.release();
-        // 静音键同时也是告警的确认键：顺手把最新一条处理掉
+        // 静音键同时也是停铃键（和灯光键一起，用户指定的两个）。
+        // 静音本身照常发给主机 —— 响铃期间用户很可能正在放声音，
+        // 把静音也吞掉反而是帮倒忙。所以只停铃，不 return。
+        if (ringingKind != RING_NONE) {
+            stopRinging();
+            return;
+        }
+        // 顺手把最新一条通知处理掉
         if (!acknowledgeAlert()) {
             triggerHud("静音控制", "静音切换", lv_color_hex(CLR_GREEN));
         }
@@ -7554,6 +7984,31 @@ static bool applyKeyReaction(void) {
 }
 
 static void renderLightingEngine(void) {
+    // 响铃优先于一切：闹钟/倒计时到点时，整排主背光全亮黄灯快闪，
+    // 平时设的灯效、背光亮度、背光总开关这期间一律不生效。
+    //
+    // 为什么排在通知告警（下面那段）前面：通知是主机推过来的"消息"，
+    // 响铃是"到点了、现在不动手就来不及"，后者才该抢整排灯。
+    // 反过来的话，主机恰好在这时候推一条红告警，屏上写着"闹钟响了"、
+    // 灯却在闪红，两边各说各话。
+    if (ringingKind != RING_NONE) {
+        static unsigned long lastRingBlinkMs = 0;
+        static bool ringBlink = false;
+        unsigned long nowMs = millis();
+        if (nowMs - lastRingBlinkMs >= 250) { lastRingBlinkMs = nowMs; ringBlink = !ringBlink; }
+
+        if (ringBlink) {
+            // 琥珀 = (255,180,0)，和屏上描边、卡片标题同一个色
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, 255, 180, 0);
+        } else {
+            // 灭的那半拍只压到 1/4 而不是全灭：全灭在余光里等于"灯坏了"，
+            // 留一点底色才看得出是在闪。255/180/0 各除 4 = 63/45/0。
+            for (int i = 0; i < NUM_MAIN_LEDS; i++) setLedRGB(i, 63, 45, 0);
+        }
+        renderIndicators();
+        return;
+    }
+
     // 告警优先：队列里有东西的时候，0~15 主背光整个让出来给告警闪，
     // 平时设的灯效和背光亮度这期间一律不生效 —— 告警就该是全场最显眼的东西。
     // 16~18 三颗锁状态灯照旧由 renderIndicators 驱动，锁状态不能被吞掉。
@@ -7667,7 +8122,9 @@ static void sendLedFrameToC3(void) {
     packet[2] = 0x01;
 
     // 0~15 主背光：按 brightness 缩放
-    uint8_t ledScale = brightness;
+    // 响铃期间强制满量：用户可能平时把亮度调到很低（夜里用），
+    // 按那个比例缩下去，"闪"就几乎看不见了，闹钟等于没响。
+    uint8_t ledScale = (ringingKind != RING_NONE) ? 255 : brightness;
     for (int i = 0; i < NUM_MAIN_LEDS; i++) {
         packet[3 + i * 3 + 0] = (ledRgb[i][0] * ledScale) / 255;
         packet[3 + i * 3 + 1] = (ledRgb[i][1] * ledScale) / 255;
@@ -8682,6 +9139,12 @@ void loop() {
         scanKeyboardMatrix();
     }
 
+    // 闹钟到点判定 + 倒计时推进。函数内部自己按整秒节流，所以这里每轮调
+    // 只是几次整数比较。放在按键扫描之后、灯光引擎之前：起铃要在这一轮
+    // 就把灯效让出来，屏要在显示段把响铃卡片画出来。
+    ct_mark(CT_S_SCAN);
+    updateTimers();
+
     // 锁状态脏：不等 20ms 灯效节拍，立刻推一帧纯指示灯帧。
 // renderLightingEngine() 每帧尾巴也会调 renderIndicators()，
 // 这条分支只是把"按 Caps Lock → 看到屏幕/灯变化"的延迟从最坏 20ms 压到下一轮 loop。
@@ -8700,7 +9163,14 @@ if (lockStateDirty) {
     }
 
     // 息屏
-    if (currentSysMode == SYS_MODE_NORMAL && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
+    //
+    // 响铃中 / 倒计时全屏期间**不许**息屏：这两个状态的全部意义就是
+    // "抬头看一眼"，屏幕一黑就等于没有。startRinging() 已经把
+    // lastActivityTime 拨到当下，所以这里只要不放响铃漏过去就行。
+    if (currentSysMode == SYS_MODE_NORMAL
+        && ringingKind == RING_NONE
+        && !(countdownShown && timerRunning)
+        && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
         currentSysMode = SYS_MODE_SLEEP;
         ct_mark(CT_S_SLEEP);
         // SAVER_OFF 走老路径拆主屏；壁纸/时间温湿度则另起一块屏保屏，
@@ -8718,14 +9188,36 @@ if (lockStateDirty) {
     // 主显示
     if (currentSysMode == SYS_MODE_NORMAL) {
         ct_mark(CT_S_DYNAMIC);
-        updateDynamicElements();
-        // 律动页的柱子动画走独立 16ms 节拍，跟上面 100ms 的慢刷新解耦。
-        // 放在 updateDynamicElements() 里面就是"律动很慢"的根因。
-        tickRhythm();
+        // 倒计时全屏接管期间，主屏那些 label 全都不可见，刷它们纯属白费 CPU；
+        // 锁灯/温湿度这些变化留到退出全屏后由这个分支补上。
+        if (!scr_countdown) {
+            updateDynamicElements();
+            // 律动页的柱子动画走独立 16ms 节拍，跟上面 100ms 的慢刷新解耦。
+            // 放在 updateDynamicElements() 里面就是"律动很慢"的根因。
+            tickRhythm();
+        }
     } else if (currentSysMode == SYS_MODE_SLEEP) {
         // 息屏期间 updateDynamicElements() 不跑，屏保的时钟/温湿度自己刷
         updateScreensaver(false);
     }
+
+    // ---- 倒计时全屏：该不该接管显示，每轮判一次 ----
+    // 放这里而不是各调用点自己 showScreen()：进菜单/设置页要收、退出要放、
+    // 倒计时跑完也要收，分散在三个地方判迟早会漏一处，表现就是"进了菜单
+    // 底下还是倒计时"或者"跑完了屏幕还停在倒计时上"。
+    updateCountdownVisibility();
+
+    // 倒计时设置页在跑的时候要跟着走秒：那个"停止"按钮摆在那里，
+    // 用户就是靠这块屏看还剩多久的，数字不跳等于按钮是假的。
+    if (currentSysMode == SYS_MODE_SET_TIMER && timerRunning) {
+        update_setting_timer_display();
+    }
+
+    // ---- 响铃卡片：lv_layer_top 上的浮层，压在任何一块屏上面 ----
+    // 每轮都调，内部按 500ms 节流：起铃、停铃、描边翻转时才会真重建。
+    // 它挂的是 top 层而不是活动屏，所以底下是主屏/菜单/设置页/黑屏都一样能盖住，
+    // 不需要为了显示它去改 currentSysMode。
+    drawRingOverlay();
 
     // HUD 消失
     ct_mark(CT_S_HUD);
