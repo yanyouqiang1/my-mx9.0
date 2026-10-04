@@ -608,6 +608,40 @@
                  white-space: pre-wrap; word-break: break-all; line-height: 1.4;
                  border: 1px solid #1e293b;">（还没有日志。按"开流"开始接收实时日志,或"拉历史"一次性拉回最近 80 行）</pre>
         </div>
+
+        <!-- 6. 配置 JSON（整份拉取 / 保存） -->
+        <div class="card">
+            <h2>5. 配置 JSON（整份拉取 / 保存）</h2>
+            <div class="hint">
+                键盘里所有<b>小配置项</b>（显示风格、屏保、当前方案、背光、灯效、按键特效、
+                闹钟、温度偏移、时间）会拼成<b>一整份 JSON</b>。下面这个框就是它的原文：
+                <br><br>
+                <b>从键盘拉取</b>：把键盘当前真实配置整份读回来（连接后建议先拉一次，
+                这样框里就不是页面默认值了）。<br>
+                <b>保存到键盘</b>：把框里的 JSON 校验一遍、写进 NVS 并立即生效。<br><br>
+                几个约定：<br>
+                · <b>version 是版本闸门，不能改</b>。固件只认它自己那一个版本号，
+                  改成别的会被整份拒绝并提示"版本对不上，请重新拉取"。它不是设置项。<br>
+                · <b>没写的字段保持原样</b>（不会被清零），所以可以只改一个数再存。<br>
+                · <b>超出范围的字段会整份拒绝</b>并告诉你错在哪一项，不会偷偷夹取值 ——
+                  比如 brightness 只接受 0~255。<br>
+                · 不认识的字段会被<b>忽略</b>（所以网页比固件新时也能用）。<br>
+                · 点保存时固件会<b>显式提交 flash</b>，所以"已保存"之后断电也不会丢。<br>
+                · 这些值仍然存在原来那套 NVS 键里，<b>不会清掉你已有的按键映射和宏</b>。
+            </div>
+            <div style="display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;">
+                <button class="btn btn-orange" id="cfgPullBtn" style="flex: 1; min-width: 140px;">📥 从键盘拉取</button>
+                <button class="btn btn-green" id="cfgSaveBtn" style="flex: 1; min-width: 140px;">💾 保存到键盘</button>
+                <button class="btn btn-tag" id="cfgFormatBtn" style="flex: 0 0 auto;">格式化</button>
+            </div>
+            <div id="cfgStatus" style="font-size: 0.85rem; color: #94a3b8; margin-top: 8px;">
+                状态:还没拉取过
+            </div>
+            <textarea id="cfgJson" spellcheck="false" rows="16" style="width: 100%; margin-top: 8px;
+                 background: #0b1220; color: #a7f3d0; padding: 10px; border-radius: 6px;
+                 font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem;
+                 border: 1px solid #1e293b; resize: vertical;"></textarea>
+        </div>
     </div>
 
 <script>
@@ -1044,6 +1078,138 @@
         if (!myCharacteristic) return alert("请先连接蓝牙！");
         await sendBLE("LOG:clear");
         logBuffer = []; renderLogBox();
+    });
+
+    // ========== 配置 JSON：整份拉取 / 保存 ==========
+    //
+    // 走的就是 bt_link 那套通用链路，没有另开通道：
+    //   拉取：发 `CFGGET#<请求号>`，固件用 `CFGDUMP:<请求号>:<片段>` 分片回传，
+    //         最后一条是空的（= 收尾标记 END）。BtLink.call 等的就是它 ——
+    //         因为固件的 key 自动取请求号，两边靠它配对，不用猜。
+    //   保存：发 CFGBEGIN:<总字节数> + 若干 CFGDATA:<片段> + CFGEND#<请求号>，
+    //         固件回 CFGSAVE:<请求号>:OK:<字段数> 或 ERR:<原因>。
+    //
+    // ⚠ 三件必须守住的事（错了网页和键盘两边都只会看到"超时"）：
+    //
+    // 1. **正文里不能有 \n / \r**。固件接收侧是按行攒的，混进换行会被切成多条
+    //    指令，JSON 被劈成两半。所以发之前一律用 JSON.stringify 压成一行 ——
+    //    用户在框里写的是缩进过的漂亮 JSON，不压就必失败。
+    //
+    // 2. **切片要按 UTF-8 字符边界切，不能按字节硬切**。一个汉字 3 字节，从中间
+    //    切开再解码就是两个 U+FFFD 豆腐块，固件那边拼回来就不是合法 JSON 了。
+    //    本项目的字段值都是数字/布尔，理论上全是 ASCII，但**别依赖这一点** ——
+    //    cfgSplitForBle 用 Array.from 按码点切，是稳的写法。
+    //
+    // 3. **CFGBEGIN 里的总长必须是 UTF-8 字节数**，不是字符串长度。固件按字节
+    //    核对收没收齐，写成字符数会在有中文时误判成"没收齐"然后整份丢弃。
+    const CFG_JSON_MAX_CHUNK = 180;   // 固件那边 CFG_RX_CHUNK_MAX=200，留足余量
+
+    function cfgEncodeLen(str) { return new TextEncoder().encode(str).length; }
+
+    // 按码点切，每片的 UTF-8 字节数不超过 maxBytes。
+    function cfgSplitForBle(str, maxBytes) {
+        const enc = new TextEncoder();
+        const out = [];
+        let cur = "", curBytes = 0;
+        for (const ch of Array.from(str)) {          // 码点迭代 = 不会劈开多字节字符
+            const n = enc.encode(ch).length;
+            if (curBytes + n > maxBytes) { out.push(cur); cur = ""; curBytes = 0; }
+            cur += ch;
+            curBytes += n;
+        }
+        if (cur) out.push(cur);
+        return out;
+    }
+
+    function cfgSetStatus(text, color) {
+        const el = document.getElementById('cfgStatus');
+        el.textContent = "状态:" + text;
+        el.style.color = color || "#94a3b8";
+    }
+
+    document.getElementById('cfgPullBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        cfgSetStatus("正在从键盘拉取...", "#38bdf8");
+        // 固件不是一口气发完，它把整份 JSON 摊到很多轮主循环上慢慢发
+        // （不然一条大 JSON 会把主循环按住、触发任务看门狗重启）。所以这里
+        // 是 await 到收尾标记才返回，超时给宽一点。
+        const body = await BtLink.call("CFGDUMP", "CFGGET", 8000);
+        if (body === null) {
+            cfgSetStatus("拉取超时或链路忙，键盘没回话", "#f87171");
+            return;
+        }
+        let obj;
+        try {
+            obj = JSON.parse(body);
+        } catch (e) {
+            // 到这里说明固件发出来的正文拼起来仍不是合法 JSON —— 属于协议层
+            // 出问题了，把原文留着方便查，别悄悄清空框子。
+            cfgSetStatus("拉回来的内容不是合法 JSON：" + e.message, "#f87171");
+            document.getElementById('cfgJson').value = body;
+            return;
+        }
+        // 存**格式化**后的，方便人读和手改；发出去时再压回一行。
+        document.getElementById('cfgJson').value = JSON.stringify(obj, null, 2);
+        cfgSetStatus("已拉回 " + Object.keys(obj).length + " 项配置", "#4ade80");
+    });
+
+    document.getElementById('cfgSaveBtn').addEventListener('click', async () => {
+        if (!myCharacteristic) return alert("请先连接蓝牙！");
+        const ta = document.getElementById('cfgJson');
+        if (!ta.value.trim()) return cfgSetStatus("框里是空的，没什么可存", "#f87171");
+
+        // 先在本地过一遍 JSON.parse + stringify：
+        //   · 语法错当场就报，不用把半份垃圾发给键盘
+        //   · stringify 不带缩进 = 自动压成一行（约定 1），顺手解决缩进 JSON 必失败
+        let compact;
+        try {
+            compact = JSON.stringify(JSON.parse(ta.value));
+        } catch (e) {
+            return cfgSetStatus("JSON 语法不对：" + e.message, "#f87171");
+        }
+        if (compact.indexOf("\n") >= 0 || compact.indexOf("\r") >= 0) {
+            // stringify 出来还带换行，只可能是某个字符串值里真的有换行。
+            // 固件那边按行攒，这种值传不过去 —— 明确告诉用户，别发出去等超时。
+            return cfgSetStatus("JSON 里有字符串值含换行，传不过去（固件按行收）", "#f87171");
+        }
+
+        const total = cfgEncodeLen(compact);        // ⚠ 字节数，不是长度（约定 3）
+        cfgSetStatus(`正在下发 ${total} 字节…`, "#38bdf8");
+        if (!await sendBLE("CFGBEGIN:" + total)) {
+            return cfgSetStatus("CFGBEGIN 没发出去，蓝牙可能断了", "#f87171");
+        }
+        for (const piece of cfgSplitForBle(compact, CFG_JSON_MAX_CHUNK)) {   // ⚠ 约定 2
+            if (!await sendBLE("CFGDATA:" + piece)) {
+                return cfgSetStatus("传到一半断了，固件会在 5 秒后丢弃这段", "#f87171");
+            }
+        }
+        // 只有 CFGEND 带请求号，固件回 CFGSAVE:<请求号>:... 时才配得对
+        const reply = await BtLink.call("CFGSAVE", "CFGEND", 8000);
+        if (reply === null) {
+            cfgSetStatus("没等到固件回应。配置**可能已经存上了**（可拉取确认）", "#fbbf24");
+            return;
+        }
+        if (reply.startsWith("OK:")) {
+            // 固件回的是 `OK:<应用字段数>:<固件侧耗时毫秒>`。第三个数是固件自己
+            // 量的（十几项 NVS 页写入 + 显式提交），带出来是为了以后真出问题时
+            // 能一眼看出"慢在哪一侧"，不用再去翻日志。
+            const p = reply.split(":");
+            const cnt = p[1];
+            const ms = p[2] ? `${p[2]} ms` : "耗时未知";
+            cfgSetStatus(`已保存 ${cnt} 项配置（固件侧 ${ms}；屏幕可能晚半秒才对上）`, "#4ade80");
+        } else {
+            cfgSetStatus("固件拒绝：" + reply.slice(4), "#f87171");
+        }
+    });
+
+    document.getElementById('cfgFormatBtn').addEventListener('click', () => {
+        const ta = document.getElementById('cfgJson');
+        try {
+            ta.value = JSON.stringify(JSON.parse(ta.value), null, 2);
+            cfgSetStatus("已格式化", "#94a3b8");
+        } catch (e) {
+            cfgSetStatus("JSON 语法不对，格式化失败：" + e.message, "#f87171");
+        }
     });
 
     // 连接成功时同步把状态栏刷新一下,免得一直停在"未连接"

@@ -304,6 +304,15 @@ bool btLinkStreamBegin(const char* verb, const char* key, size_t totalLen) {
     return true;
 }
 
+// 处理请求的分支里起流式回复：key 自动取当前请求号（原因见 bt_link.h）。
+// 主机没带请求号时退化成自增 key，和 btLinkReplyC 的行为一致。
+bool btLinkReplyStreamBegin(const char* verb, size_t totalLen) {
+    char key[BT_KEY_MAX];
+    if (s_curReq[0]) copyField(key, sizeof(key), s_curReq);
+    else             autoKey(key, sizeof(key));
+    return btLinkStreamBegin(verb, key, totalLen);
+}
+
 // 正文再长也只往单槽里塞，满了返回 false 让调用方下一轮再来 —— 于是
 // 8KB 的回拉变成"每轮 loop 喂一段、发一段"，而不是一次堆 400 个包。
 static bool streamFeed(const void* data, size_t len) {

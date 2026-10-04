@@ -231,6 +231,21 @@ bool btLinkStreamBusy();      // 还有片段没喂完 / 没发完 → 调用方
 bool btLinkStreamFull();      // 单槽缓冲满了 → 调用方这一轮别再喂了
 size_t btLinkStreamRoom();    // 单槽还能塞多少字节 → 给自己的切片封顶（必看）
 
+// **处理请求的分支里起一条流式回复，用这个**，别用 btLinkStreamBegin 配业务 key。
+//
+// 和 btLinkReply 的理由一样：key 自动取当前请求号（主机在指令末尾加的 `#123`），
+// 主机不用凑对。配置 JSON 回拉这类"请求 → 大块正文"就靠它：
+//     else if (cmd == "CFGGET") {
+//         size_t n = cfgBuildJson(cfgJsonBuf, sizeof(cfgJsonBuf));
+//         if (!btLinkReplyStreamBegin("CFGDUMP", n))
+//             btLinkReplyf("CFGERR", "链路忙，稍后重试");
+//     }
+// 之后照样在 loop() 里按 btLinkStreamRoom() 的节奏喂片段、btLinkStreamEnd() 收尾。
+//
+// ⚠ 请求号只在**指令派发那个调用栈里**有效，所以这个函数必须在 handleCommand
+//   里面调（和 btLinkReplyC 一样）。出了这个栈再想起流，主机那边没有号可对。
+bool btLinkReplyStreamBegin(const char* verb, size_t totalLen);
+
 // ---------------------------------------------------------------- 接收
 //
 // onWrite 回调里只调这一个：喂狗 → 二进制旁路判定 → 按行攒 → 入队。

@@ -52,6 +52,7 @@
 #define CT_S_LVGL        15   // LVGL 定时器 / 刷屏
 #define CT_S_REBUILD     16   // 主屏内容重建
 #define CT_S_HANG        17   // 监测任务判定：心跳停了 6 秒
+#define CT_S_CFG_POST   18   // 配置 JSON 保存后摊到 loop 里的界面副作用
 
 // 磁标：RTC 慢存里没有有效记录时用它区分（顺便挡掉随机数恰好撞上）
 #define CT_MAGIC 0x4B4D5831UL   // "KMX1"
