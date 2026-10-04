@@ -1390,12 +1390,15 @@ static void destroyMainScreen(void) {
             lv_obj_clear_flag(blank, LV_OBJ_FLAG_SCROLLABLE);
             currentScreen = blank;
             lv_scr_load(blank);
+        } else if (currentScreen == scr_main) {
+            // currentScreen 指着要删的主屏，但它此刻不是活动屏（活动的是
+            // 倒计时全屏 / 菜单 / 设置页）。先摘掉这个指针，别让它悬在
+            // 已释放的地址上，后面谁拿它去 lv_scr_load 就是 use-after-free。
+            currentScreen = nullptr;
         }
         lv_obj_del(scr_main);
         scr_main = nullptr;
     }
-    // currentScreen 指着刚被释放的屏幕，同样作废
-    currentScreen = nullptr;
     mainContentValid = false;
 }
 
@@ -2655,10 +2658,19 @@ static void destroyScreensaver(void) {
     sv_lbl_time = nullptr; sv_lbl_date = nullptr;
     sv_lbl_temp = nullptr; sv_lbl_hum = nullptr;
     if (scr_saver != nullptr) {
+        // 活动屏不能直接删：LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL，
+        // 下一帧刷新就是野指针 panic（见 swapAwayIfActive 的注释）。
+        // enterScreensaver() 会连续进两次（再按一次唤醒、马上又超时息屏），
+        // 这条路径上 scr_saver 确实可能正显示着。
+        swapAwayIfActive(scr_saver, nullptr);
+        // ⚠ 原来的判据写在 scr_saver = nullptr **之后**：
+        //     if (currentScreen == scr_saver) currentScreen = nullptr;
+        // 拿已经置空的指针去比，永远为假，currentScreen 就留在已释放的屏上，
+        // 后面谁拿它去 lv_scr_load 就是 use-after-free。必须在置空前比。
+        if (currentScreen == scr_saver) currentScreen = nullptr;
         lv_obj_del(scr_saver);
         scr_saver = nullptr;
     }
-    if (currentScreen == scr_saver) currentScreen = nullptr;
 }
 
 // 屏保信息面板：时间 / 日期 / 温湿度全收在**这一块**面板里。
@@ -3491,6 +3503,33 @@ static void drawRingOverlay(void) {
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
 }
 
+// 删一块屏之前，先确认它不是**当前正在显示**的那块。
+//
+// LVGL 8.4 的 lv_obj_del() 删掉的正好是活动屏时，会把 disp->act_scr 直接置成
+// NULL（lv_obj_tree.c 里那句 `if(act_scr_del) disp->act_scr = NULL;`），
+// 之后 lv_scr_act() 一直返回 NULL，任何解引用它的操作都是野指针 panic → 重启。
+// 本项目已经为这个坑栽过两次（swapScreen / destroyMainScreen），这是第三处。
+//
+// 判据必须用 lv_scr_act()，**不能用 currentScreen**：
+// destroyMainScreen() 结尾会把 currentScreen 无脑置成 nullptr，可它临时造的
+// blank 屏还活着并且正在显示。那时候 currentScreen 是 nullptr，
+// "currentScreen == 我要删的屏" 这个判断恒为假，可实际在显示的偏偏就是它
+// —— 于是本该先换屏的动作被跳过，直接把活动屏删了。
+// 问 LVGL「当前活动的是谁」才是准的。
+//
+// 返回值：换屏用的替身屏（调用方负责记进 currentScreen）。
+static lv_obj_t* swapAwayIfActive(lv_obj_t* doomed, lv_obj_t* replacement) {
+    if (doomed == nullptr) return nullptr;
+    if (lv_scr_act() != doomed) return nullptr;
+    if (replacement == nullptr || replacement == doomed) {
+        replacement = ensureMainScreen();
+    }
+    if (replacement == doomed) return nullptr;   // 无处可退，交给调用方处理
+    currentScreen = replacement;
+    lv_scr_load(replacement);
+    return replacement;
+}
+
 // ===========================
 // 倒计时全屏
 // ===========================
@@ -3499,12 +3538,8 @@ static void drawRingOverlay(void) {
 // 加了提示它就变成另一块主屏，那就不是用户要的东西了。
 static void destroyCountdownScreen(void) {
     if (scr_countdown) {
-        // 必须先切走再删：LVGL 8.4 删掉活动屏会把 disp->act_scr 置成 NULL，
-        // 紧接着的刷新就解引用空指针 → panic → 重启（理由同 swapScreen 的注释）。
-        if (currentScreen == scr_countdown) {
-            currentScreen = nullptr;
-            showScreen(ensureMainScreen());
-        }
+        swapAwayIfActive(scr_countdown, nullptr);
+        if (currentScreen == scr_countdown) currentScreen = nullptr;
         lv_obj_del(scr_countdown);
         scr_countdown = nullptr;
     }
@@ -3527,7 +3562,13 @@ static void updateCountdownScreenText(void) {
 }
 
 static void buildCountdownScreen(void) {
-    if (scr_countdown) { lv_obj_del(scr_countdown); scr_countdown = nullptr; }
+    if (scr_countdown) {
+        // 同样先换屏再删，别裸着 lv_obj_del 一块可能正在显示的屏
+        swapAwayIfActive(scr_countdown, nullptr);
+        if (currentScreen == scr_countdown) currentScreen = nullptr;
+        lv_obj_del(scr_countdown);
+        scr_countdown = nullptr;
+    }
 
     scr_countdown = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_countdown, lv_color_hex(CLR_BG), LV_PART_MAIN);
@@ -9188,14 +9229,22 @@ if (lockStateDirty) {
     // 主显示
     if (currentSysMode == SYS_MODE_NORMAL) {
         ct_mark(CT_S_DYNAMIC);
-        // 倒计时全屏接管期间，主屏那些 label 全都不可见，刷它们纯属白费 CPU；
-        // 锁灯/温湿度这些变化留到退出全屏后由这个分支补上。
-        if (!scr_countdown) {
-            updateDynamicElements();
-            // 律动页的柱子动画走独立 16ms 节拍，跟上面 100ms 的慢刷新解耦。
-            // 放在 updateDynamicElements() 里面就是"律动很慢"的根因。
-            tickRhythm();
-        }
+        // 倒计时全屏接管期间**照样**要跑 updateDynamicElements()，不能因为
+        // "主屏看不见了"就跳过。
+        //
+        // 跳过会踩到一个很隐蔽的雷：lockStateDirty 是靠 updateDynamicElements()
+        // 内部清掉的（见它开头那个 100ms 节拍 early return 和末尾的
+        // lockStateDirty = false）。loop() 里另有 `if (lockStateDirty) {
+        // renderIndicators(); sendLedFrameToC3(); }` —— 脏位不清就变成
+        // **每一轮 loop 都往 C3 推一帧 61 字节的灯帧**（每秒几千帧），
+        // Serial1 缓冲直接堵死，主循环被饿死，6 秒后监测任务判定卡死 →
+        // esp_restart()。表现就是"倒计时一跑就重启"和"按了 Caps 就重启"。
+        // 那个 early return 本来就把它限成 100ms 一次，主屏不可见时刷的是
+        // 看不见的 label，没有性能负担 —— 当初那个"省 CPU"的判断是纯亏。
+        updateDynamicElements();
+        // 律动页的柱子动画走独立 16ms 节拍，跟上面 100ms 的慢刷新解耦。
+        // 放在 updateDynamicElements() 里面就是"律动很慢"的根因。
+        tickRhythm();
     } else if (currentSysMode == SYS_MODE_SLEEP) {
         // 息屏期间 updateDynamicElements() 不跑，屏保的时钟/温湿度自己刷
         updateScreensaver(false);
