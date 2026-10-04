@@ -1172,6 +1172,7 @@ static bool         wpReady   = false;     // wpPixels 里有有效像素
 #define LOGO_RX_TIMEOUT_MS 5000
 
 static uint8_t*     logoRxBuf   = nullptr;
+static uint32_t     logoRxCap   = 0;            // logoRxBuf 的**真实**容量（字节）
 static uint32_t     logoRxTotal = 0;
 static uint32_t     logoRxGot   = 0;
 static bool         logoRxDone  = false;
@@ -2226,11 +2227,30 @@ static int logoJpegDraw(JPEGDRAW* d) {
 // loop 已经 free 掉之后才处理到上一轮尾巴上那一包，接着往已释放的地址里 memcpy：
 // 踩坏堆，表现为"一上传壁纸键盘就重启"。常驻一块 PSRAM 缓冲把这个整类问题消掉。
 // 重传时不清空内容，只把 logoRxGot 归零重新覆盖。
-static uint8_t* logoRxAlloc(uint32_t total) {
-    if (logoRxBuf != nullptr) return logoRxBuf;
-    logoRxBuf = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (logoRxBuf == nullptr) logoRxBuf = (uint8_t*)malloc(total);   // PSRAM 不可用时回落
-    if (logoRxBuf != nullptr) memset(logoRxBuf, 0, total);
+//
+// ⚠⚠ 但"常驻"必须配一个**固定容量**，不能拿第一次的 total 来定大小。
+//   这里原来写的是 heap_caps_malloc(total)，于是缓冲区的容量被**第一次**上传的
+//   图片大小永久钉死：先传过一张 2KB 的图，之后再传 4KB 的图时，
+//   logoRxAlloc() 看到 logoRxBuf != nullptr 就直接返回那块 2KB 的内存，
+//   而 logoRxTotal 已经是 4096 —— handleLogoChunk() 拿 total 当边界，
+//   于是在第 2049 字节之后一路 memcpy 越界，把 PSRAM 里紧邻的分配
+//   （解码输出缓冲 / LVGL 的对象池）全踩烂。
+//   表现就是"第一张图好好的，换张大一点的图传到一半就重启"，
+//   而且崩在别人的内存上，日志里只会看到"异常复位"，连阶段号都是旧的
+//   —— 上一轮上传留下的小缓冲把人引到"是不是解码炸了"，真凶在这儿。
+//   所以：按 LOGO_RX_MAX(256KB) 一次性分配，把容量和每次声明的长度彻底解耦。
+//   代价是 8MB PSRAM 里常驻 256KB（3%），换来"任何合法长度的图都不会越界"。
+static uint8_t* logoRxAlloc(uint32_t need) {
+    if (logoRxBuf != nullptr) return logoRxBuf;   // 常驻，永不释放、永不改容量
+    uint32_t want = LOGO_RX_MAX;
+    if (want < need) want = need;                 // 理论上不会，兜底
+    logoRxBuf = (uint8_t*)heap_caps_malloc(want, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (logoRxBuf == nullptr) logoRxBuf = (uint8_t*)malloc(want);   // PSRAM 不可用时回落
+    if (logoRxBuf == nullptr) { logoRxCap = 0; return nullptr; }
+    logoRxCap = want;
+    memset(logoRxBuf, 0, want);
+    LOG_PORT.printf("[WALLPAPER] rx buffer %u bytes (cap %u)\n",
+                    (unsigned)want, (unsigned)logoRxCap);
     return logoRxBuf;
 }
 
@@ -2258,7 +2278,14 @@ static void handleLogoChunk(const uint8_t* data, size_t len) {
     if (logoRxBuf == nullptr) return;
     logoRxLastMs = millis();
 
+    // 两道边界都要卡：logoRxTotal 是网页声明的长度，logoRxCap 才是这块内存
+    // 真实的容量。正常情况下 total <= cap（LOGO_JPEG_START 已经验过），
+    // 但这函数跑在蓝牙任务里、拿不到 START 的上下文，边界必须自己再兜一次 ——
+    // 越界写进 PSRAM 是静默的内存破坏，不会当场报错，只会在几十毫秒后
+    // 以"莫名其妙重启"的形式出现，那是最难查的一类故障。
+    if (logoRxGot >= logoRxCap) return;
     uint32_t room = logoRxTotal - logoRxGot;
+    if (room > logoRxCap - logoRxGot) room = logoRxCap - logoRxGot;
     if (len > room) len = room;      // 多出来的丢掉，只认网页声明过的长度
     if (len == 0) return;
 
@@ -2283,6 +2310,7 @@ static void bindWallpaperSource(void) {
 // 解码收齐的 JPEG -> wpPixels -> 落盘。解码 + 写盘要几百毫秒，
 // 所以放 loop 里跑，不占着 NimBLE 的主机任务。
 static void finishLogoUpload(void) {
+    ct_mark(CT_S_WP_DECODE);   // 现场：这一步要几百毫秒，崩在里面最常见
     logoRxDone  = false;
     logoRxActive = false;
     if (logoRxTotal == 0 || logoRxGot < logoRxTotal) {
@@ -7644,11 +7672,21 @@ static void handleCommand(const String& cmd) {
         uint32_t total = (uint32_t)cmd.substring(16).toInt();
         LOG_PORT.printf("[WALLPAPER] START, total=%lu\n", (unsigned long)total);
 
+        // 常驻缓冲的容量和本次声明的长度是两回事（见 logoRxAlloc 的说明），
+        // 所以这里必须拿**真实容量**再验一次。以前只验 total <= LOGO_RX_MAX，
+        // 而实际那块内存可能比 total 还小 —— 于是固件自己放行了一个注定越界的传输。
         if (total == 0 || total > LOGO_RX_MAX) {
-            triggerHud("壁纸传输", "长度不合法", lv_color_hex(CLR_RED));
+            abortLogoUpload("长度不合法");
         } else if (logoRxAlloc(total) == nullptr) {
-            triggerHud("壁纸传输", "内存不足", lv_color_hex(CLR_RED));
+            abortLogoUpload("内存不足");
+        } else if (total > logoRxCap) {
+            char why[40];
+            snprintf(why, sizeof(why), "超出接收缓冲 %u KB", (unsigned)(logoRxCap / 1024));
+            LOG_PORT.printf("[WALLPAPER] reject: total=%lu > cap=%lu\n",
+                            (unsigned long)total, (unsigned long)logoRxCap);
+            abortLogoUpload(why);
         } else {
+            ct_mark(CT_S_WP_RX);      // 现场：正在收 JPEG
             // 重传：不释放缓冲，只把写入位置归零重新覆盖（见 logoRxAlloc 的说明）
             logoRxTotal  = total;
             logoRxGot    = 0;
@@ -8572,6 +8610,8 @@ static const char* ctStageName(uint32_t s) {
         case CT_S_REBUILD:      return "主屏重建";
         case CT_S_HANG:         return "心跳中断";
         case CT_S_CFG_POST:     return "配置生效中";
+        case CT_S_WP_RX:        return "壁纸接收中";
+        case CT_S_WP_DECODE:    return "壁纸解码写盘";
         default:                return "未知阶段";
     }
 }
