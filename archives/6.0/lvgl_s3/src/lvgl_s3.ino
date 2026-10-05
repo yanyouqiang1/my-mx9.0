@@ -538,6 +538,7 @@ struct PetState {
     uint32_t peekYmd;
     uint8_t  bothered;       // 连续被打扰次数，>=2 暂停一天
     uint32_t muteYmd;        // 主动探头暂停到哪一天
+    uint8_t  strokeStreak;   // 旋钮连撸的连续格数（>1.2s 断开）
     bool     peekOn;         // 主动打招呼总开关，默认开
     uint8_t  fromH;          // 显示时段起（小时）
     uint8_t  toH;            // 显示时段止（小时）
@@ -549,6 +550,12 @@ struct PetState {
 static void petYieldAdd(lv_obj_t* o);
 static void petYieldClear(void);
 static void petSetBottomYield(bool yield);
+
+// 宠物的运行时状态也放这里，不能放到宠物那一节：静态**变量**和函数不一样，
+// 必须在文本上先声明，而 destroyScreensaver()（3000 行出头）和
+// enterScreensaver() 都要读 petScene —— 那两处比宠物本体早 600 行。
+static PetState pet = { 60, 0, POSE_IDLE, 0, 0, 0, 0, 0, 0, 0, 0, 0, true, 23, 7 };
+static PetScene petScene = SCENE_NONE;
 
 #define MAX_NOTIFS 8
 static uint8_t notifCount = 0;
@@ -723,7 +730,6 @@ enum MenuAction {
     MA_PET_PEEK_ON,     // 宠物：主动打招呼开关
     MA_PET_WINDOW,      // 宠物：显示时段
     MA_PET_OPEN,        // 宠物：进全屏页
-    MA_PET_RENAME,      // 宠物：改名
     MA_PET_RESET        // 宠物：清空亲密度
 };
 
@@ -762,11 +768,11 @@ static const MenuEntry menuEntriesSystem[] = {
 };
 // 宠物组**追加在末尾**（第 7 个）。理由和屏保档位一样：分组编号会影响用户的
 // 肌肉记忆，插在中间会让原来"第 N 组"的位置全变。
+// 原来有第五项"改名字"，它只会弹一句"暂未开放" —— 死路比没有更让人烦，去掉。
 static const MenuEntry menuEntriesPet[] = {
     { "主动打招呼",   MA_PET_PEEK_ON },
     { "显示时段",     MA_PET_WINDOW },
     { "去找小橘",     MA_PET_OPEN },
-    { "改名字",       MA_PET_RENAME },
     { "清空亲密度",   MA_PET_RESET }
 };
 
@@ -818,8 +824,9 @@ static char lastKeyPressed[8] = "-";
 #define SAVER_WALL  1   // 壁纸轮播
 #define SAVER_INFO  2   // 信息面板
 #define SAVER_OFF   3   // 关闭：空闲也不息屏
-#define TOTAL_SAVER_MODES 4
-static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板", "关闭" };
+#define SAVER_PET   4   // 小橘在屏保里（同样只能追加在末尾）
+#define TOTAL_SAVER_MODES 5
+static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板", "关闭", "小橘" };
 static uint8_t saverMode = SAVER_OFF;   // 默认不自动息屏
 static lv_obj_t* scr_saver = nullptr;
 static lv_obj_t* sv_img = nullptr;
@@ -1637,6 +1644,8 @@ static void petExitFull(void);
 static void petDismiss(void);
 static void petDestroyPeek(void);
 static void petBuildPage(void);
+static void petDestroySaver(void);
+static void petSaverTick(bool force);
 static bool petPeekAllowed(void);
 static bool petPetted(uint8_t n);
 static void petFed(void);
@@ -3058,6 +3067,12 @@ static void destroyScreensaver(void) {
     sv_panel = nullptr;
     sv_lbl_time = nullptr; sv_lbl_date = nullptr;
     sv_lbl_temp = nullptr; sv_lbl_hum = nullptr;
+    // 屏保里的小橘：指针必须在这里清掉。它和全屏宠物页共用 pt_* 那套全局，
+    // 清晚了 petBuildPage() 重新建猫时会往已释放的屏上挂对象。
+    if (petScene == SCENE_SAVER) {
+        petDestroySaver();
+        petScene = SCENE_NONE;
+    }
     if (scr_saver != nullptr) {
         // 活动屏不能直接删：LVGL 8.4 删活动屏会把 disp->act_scr 置 NULL，
         // 下一帧刷新就是野指针 panic（见 swapAwayIfActive 的注释）。
@@ -3172,6 +3187,15 @@ static void enterScreensaver(void) {
         if (!wpReady) setHidden(sv_img, true);   // 没图就别留一块空底色
     }
 
+    if (saverMode == SAVER_PET) {
+        // 小橘在场：不建时间/温湿度那块面板，屏保里只有猫和它的一句话。
+        petScene = SCENE_SAVER;
+        petBuildSaver();
+        updateScreensaver(true);
+        showScreen(scr_saver);
+        return;
+    }
+
     buildSaverPanel();
     // 没上传过壁纸时没有可轮播的图，直接常显面板
     setHidden(sv_panel, (saverMode == SAVER_WALL) && wpReady);
@@ -3192,6 +3216,12 @@ static void updateScreensaver(bool force) {
     unsigned long nowMs = millis();
     if (!force && nowMs - lastRunMs < 100UL) return;
     lastRunMs = nowMs;
+
+    // 小橘屏保：没有时间温湿度面板，只有它每 10 秒换一个姿态说一句。
+    if (saverMode == SAVER_PET) {
+        petSaverTick(force);
+        return;
+    }
 
     // 壁纸轮播：每 5 秒在"纯壁纸"和"信息面板"之间翻一次。
     // 计时器用 tick 计数而不是记时间戳 —— 这个函数既被 100ms 的节拍调，
@@ -3297,7 +3327,6 @@ static void runMenuAction(MenuAction act) {
         case MA_PET_PEEK_ON:
         case MA_PET_WINDOW:
         case MA_PET_OPEN:
-        case MA_PET_RENAME:
         case MA_PET_RESET:
             petMenuAction(act);
             break;
@@ -3346,8 +3375,8 @@ static uint8_t menuCurRow(void) {
 }
 
 // 菜单滚动相关
-// 一级 6 行、二级最多 3 行，都不超过 MENU_VISIBLE_ITEMS，所以实际用不到滚动；
-// 但滚动逻辑留着，二级项以后变多也不会被卡在窗口外。
+// 一级现在 7 行、二级最多 4 行，都比 MENU_VISIBLE_ITEMS(6) 大一点点，
+// 所以滚动是真的会用上了：第 7 个大类靠 menuScrollOffset 滚进窗口。
 static void build_menu(void) {
     uint8_t rows  = menuRowCount();
     uint8_t cur   = menuCurRow();
@@ -3591,12 +3620,11 @@ static void build_menu(void) {
 // 键位：**全部走 C3 实体键**（静音 / 旋钮 / 灯光长按），矩阵键一个都不占 ——
 // 那些键矩阵里没有，参与不了正常打字，用它们互动才不会影响输入。
 
-// PetScene / PetPose / PetState 三个类型声明在文件前面的"通知系统"那一段
-// （跟 AlertType 放一起）—— 因为 Arduino 会把函数原型插到第一个函数定义之前，
-// 签名里出现自定义类型时类型必须在那之前可见。
-
-static PetState pet = { 60, 0, POSE_IDLE, 0, 0, 0, 0, 0, 0, 0, 0, true, 23, 7 };
-static PetScene petScene = SCENE_NONE;
+// PetScene / PetPose / PetState 三个类型声明、以及 pet / petScene 两个运行时
+// 变量，都在文件前面的"通知系统"那一段（跟 AlertType 放一起）：
+//   · Arduino 会把函数原型插到第一个函数定义之前，签名里的自定义类型必须可见
+//   · petScene 被 destroyScreensaver()/enterScreensaver() 读到，那两处比
+//     宠物本体早 600 行，静态变量必须文本上先声明
 
 // 调参都在这儿，改完直接看效果
 #define PET_PEEK_IDLE_MIN_MS   25000UL   // 闲置多久才进探头候选池
@@ -3896,6 +3924,18 @@ static void petApplyPose(uint8_t pose) {
 }
 
 // ===========================
+// 全屏宠物页和屏保里的猫共用这一套 pt_* 指针（两者永远互斥），
+// 所以清指针的动作也共用一个。
+static void petDestroyBody(void) {
+    pt_shadow = pt_tail = pt_body = nullptr;
+    pt_earL = pt_earR = pt_earIL = pt_earIR = pt_head = nullptr;
+    pt_stripe1 = pt_stripe2 = pt_stripe3 = nullptr;
+    pt_eyeL = pt_eyeR = pt_lidL = pt_lidR = nullptr;
+    pt_eyeBrowL = pt_eyeBrowR = nullptr;
+    pt_nose = pt_mouth = pt_blushL = pt_blushR = nullptr;
+    pt_zs = nullptr;
+}
+
 // 全屏宠物页（SCENE_FULL）
 // ===========================
 // 竖向预算（每一行都是量过的，别乱加）：
@@ -3916,13 +3956,8 @@ static void petDestroyPage(void) {
         scr_pet = nullptr;
     }
     pt_bg = pt_lblName = pt_moodBg = pt_moodBar = nullptr;
-    pt_shadow = pt_tail = pt_body = nullptr;
-    pt_earL = pt_earR = pt_earIL = pt_earIR = pt_head = nullptr;
-    pt_stripe1 = pt_stripe2 = pt_stripe3 = nullptr;
-    pt_eyeL = pt_eyeR = pt_lidL = pt_lidR = nullptr;
-    pt_eyeBrowL = pt_eyeBrowR = nullptr;
-    pt_nose = pt_mouth = pt_blushL = pt_blushR = nullptr;
-    pt_bubble = pt_line1 = pt_line2 = pt_hint = pt_zs = nullptr;
+    petDestroyBody();
+    pt_bubble = pt_line1 = pt_line2 = pt_hint = nullptr;
 }
 
 // 两行台词。long 模式一律 DOT 兜底：超宽就变省略号，绝不画到屏幕外。
@@ -4051,8 +4086,71 @@ static void petSetBottomYield(bool yield) {
 }
 
 // ===========================
+// 屏保形态（SCENE_SAVER / SAVER_PET = 4）
+// ===========================
+// 闲置到点它出现在屏保里，等你回来。和探头最大的区别是**它不催你**：
+// 屏保该有的样子是安静，所以不画心情条也不画键位提示，只有猫 + 一行字。
+// 猫和全屏页用同一套 pt_* 指针（宠物页和屏保永远互斥 —— petGate() 里
+// SCENE_FULL 的判断排在屏保之前），所以进/出都要先 petDestroyBody()。
+static lv_obj_t* sv_petLine = nullptr;
+static uint8_t   sv_petTick = 0;
+
+static void petDestroySaver(void) {
+    petDestroyBody();
+    sv_petLine = nullptr;
+    sv_petTick = 0;
+}
+
+// 屏保里猫的位置：全屏页那套是 cy=104（顶栏 30 + 猫 56..166 + 气泡 168 起）。
+// 屏保没有顶栏也没气泡，整块往上提 16px 更居中。
+static void petBuildSaver(void) {
+    petDestroySaver();
+    // root 在 (0,0)，所以全屏页那套绝对坐标在这里原样成立 ——
+    // 猫占 56..166，台词贴在底部 -18（屏幕约 203），中间留白正好。
+    lv_obj_t* root = makeRootPanel(scr_saver, 0x000000);
+    petBuildBody(root);
+
+    sv_petLine = lv_label_create(root);
+    mkLabel(sv_petLine, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_obj_set_width(sv_petLine, 208);
+    lv_label_set_long_mode(sv_petLine, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(sv_petLine, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(sv_petLine, LV_ALIGN_BOTTOM_MID, 0, -18);
+
+    pet.pose = POSE_IDLE;
+    petApplyPose(pet.pose);
+    setText(sv_petLine, petLineFor(POSE_IDLE));
+}
+
+// 屏保的慢刷新（走 updateScreensaver 的 100ms 节拍）：每 10 秒换个姿态说一句。
+// 定时器用 tick 计数而不是时间戳 —— updateScreensaver() 既被 100ms 节拍调、
+// 也被 enterScreensaver() 直接调一次（force），用时间戳会被那次调用搅乱
+// （这是壁纸轮播早就踩过的坑，见那段注释）。
+static void petSaverTick(bool force) {
+    if (sv_petLine == nullptr) return;
+    if (force) {
+        sv_petTick = 0;
+        return;
+    }
+    if (++sv_petTick < 100) return;      // 100 × 100ms = 10s
+    sv_petTick = 0;
+
+    // 久坐不动久了就让它打盹
+    if (millis() - lastActivityTime > 300000UL) {
+        pet.pose = POSE_SLEEP;
+    } else {
+        pet.pose = POSE_IDLE;
+    }
+    pet.poseUntilMs = 0;
+    petApplyPose(pet.pose);
+    const char* l = petLineFor(pet.pose);
+    if (l) setText(sv_petLine, l);
+}
+
+// ===========================
 // 探头横条（SCENE_PEEK）
 // ===========================
+
 // 挂在 lv_layer_top 上：底下是主屏 / 菜单 / 设置页都一样能盖住，
 // 不需要为了显示它去改 currentSysMode（同 drawRingOverlay 的做法）。
 // 竖向预算：72px 只装得下 3 行（72/19 = 3.8）—— 台词 2 行 + 关闭提示 1 行。
@@ -4183,20 +4281,26 @@ static void petDismiss(void) {
 // ===========================
 // 互动
 // ===========================
-// 摸 / 撸：静音键和旋钮进来。有冷却，否则按住旋钮能一路刷满亲密度。
-// 互动时**不回顶部窗口**（832-834 那段）—— 在宠物页里回主屏毫无意义。
-static bool petPetted(uint8_t n) {
-    unsigned long now = millis();
-    if (now - pet.lastPettedMs < PET_PET_COOLDOWN_MS) return false;
-    pet.lastPettedMs = now;
-    if (pet.mood < 250 - n) pet.mood = (uint8_t)(pet.mood + n);
-    if (pet.bond < 60000) pet.bond += 1;
-    pet.pose = POSE_HAPPY;
-    pet.poseUntilMs = now + 2500;
+// 两种摸法，手感必须分开：
+//
+// petPetted(n) —— 静音键，**离散**的一下。有固定冷却，连点只算一次。
+// petStroke()  —— 旋钮，**连续**地撸。按"距上一格过了多久"给不同增益，
+//                 一个事件都不丢。原来的写法是每格 +1 走 800ms 冷却，
+//                 结果转得越快被丢掉的越多 —— 手感是"越使劲越没反应"，
+//                 正好和"撸猫要越使劲越爽"相反。
+static void petMoodAdd(uint8_t n) {
+    // 心情是 uint8_t 但语义上限 100。原来的 `if (pet.mood < 250 - n)` 能涨到 250，
+    // 画进度条时被 clamp 到 100 看着没事，可 `mood > PET_MOOD_OK` 这类比较
+    // 会永远成立，"心情掉了"就再也检测不到了。这里老老实实夹在 100。
+    uint16_t m = (uint16_t)pet.mood + n;
+    pet.mood = (uint8_t)(m > 100 ? 100 : m);
+}
 
-    // 在探头里摸它 = 被欢迎，打扰计数减一
-    if (petScene == SCENE_PEEK && pet.bothered > 0) pet.bothered--;
-
+static void petReactToTouch(void) {
+    // ⚠️ 这里**没有** SCENE_SAVER 分支，而且不该加：handleC3Command() 开头就有
+    // `if (currentSysMode == SYS_MODE_SLEEP) gotoMainScreen();` —— 屏保在场时
+    // 任何 C3 动作都先把屏保拆了才往下走，所以屏保里的猫永远不会被"互动到"，
+    // 写那条分支就是死代码。屏保的台词只由 petSaverTick() 换。
     if (petScene == SCENE_FULL) {
         // ⚠️ 一次互动里**只能调一次** petPickLine()：它内部会写 petLastLineCls
         // 做"同分类不连播"的去重，第二次调用会把第一次刚抽中的分类直接排除掉。
@@ -4206,7 +4310,57 @@ static bool petPetted(uint8_t n) {
     } else if (petScene == SCENE_PEEK) {
         petPeekSpeak();
     }
+}
+
+// 摸头（静音键）。返回 false 表示还在冷却里。
+static bool petPetted(uint8_t n) {
+    unsigned long now = millis();
+    if (now - pet.lastPettedMs < PET_PET_COOLDOWN_MS) return false;
+    pet.lastPettedMs = now;
+    petMoodAdd(n);
+    if (pet.bond < 60000) pet.bond += 1;
+    pet.pose = POSE_HAPPY;
+    pet.poseUntilMs = now + 2500;
+    // 摸一下就算把连撸断开了 —— 要连撸得转旋钮
+    pet.strokeStreak = 0;
+
+    // 在探头里摸它 = 被欢迎，打扰计数减一
+    if (petScene == SCENE_PEEK && pet.bothered > 0) pet.bothered--;
+
+    petReactToTouch();
     return true;
+}
+
+// 撸（旋钮转一格）。**不丢事件**，靠增益区分快慢。
+void petStroke(void) {
+    unsigned long now = millis();
+    unsigned long gap = now - pet.lastPettedMs;
+    pet.lastPettedMs = now;
+
+    uint8_t gain;
+    if (gap < 120UL)       gain = 3;    // 飞快地搓
+    else if (gap < 260UL)  gain = 2;    // 正常速度
+    else if (gap < 700UL)  gain = 1;    // 慢
+    else                   gain = 2;    // 隔了一会儿又撸一下 = 又惊又喜
+
+    // 连撸计数：超过 1.2s 没动静就断开，免得"早上撸一下、晚上再撸一下"
+    // 也算成一路连撸到天亮。
+    if (gap > 1200UL) pet.strokeStreak = 0;
+    if (pet.strokeStreak < 250) pet.strokeStreak++;
+
+    petMoodAdd(gain);
+    if (pet.bond < 60000) pet.bond += 1;
+    pet.pose = POSE_HAPPY;
+    pet.poseUntilMs = now + 2500;
+
+    if (petScene == SCENE_PEEK && pet.bothered > 0) pet.bothered--;
+
+    // 连撸到一定次数就换个说法，让"撸对了"有正反馈
+    if (pet.strokeStreak > 0 && (pet.strokeStreak % 8) == 0) {
+        if (petScene == SCENE_FULL) petSetSpeech("呼噜呼噜…别停", nullptr);
+    } else {
+        petReactToTouch();
+    }
 }
 
 static void petFed(void) {
@@ -4422,9 +4576,6 @@ static void petMenuAction(MenuAction act) {
             break;
         case MA_PET_OPEN:
             petEnterFull();
-            break;
-        case MA_PET_RENAME:
-            triggerHud("改名", "暂未开放", lv_color_hex(CLR_TEXT_DIM));
             break;
         case MA_PET_RESET:
             pet.bond = 0;
@@ -9291,9 +9442,9 @@ static void handleC3Command(const String& cmd) {
     //
     // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"进下载模式重启"。
     if (currentSysMode == SYS_MODE_PET) {
-        if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头
+        if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头（离散一下）
         else if (cmd.startsWith("ROT:") || cmd == "ENC:+"
-                 || cmd == "ENC:-") { petPetted(1); }            // 撸（连续转）
+                 || cmd == "ENC:-") { petStroke(); }             // 撸（连续，按快慢给增益）
         else if (cmd == "BTN:KNOB") { petFed(); }                // 喂食
         else if (cmd == "BTN:LIGHT_HOLD") {                       // 长按灯光 = 退出
             petExitFull();
@@ -9303,9 +9454,10 @@ static void handleC3Command(const String& cmd) {
     } else if (petScene == SCENE_PEEK) {
         // 探头在场：只"顺便"算一次被摸，**不吞任何键**。探头出现时用户多半
         // 正在打字，吞键就卡壳了。
-        if (cmd == "BTN:MUTE" || cmd == "BTN:KNOB"
-            || cmd.startsWith("ROT:") || cmd == "ENC:+" || cmd == "ENC:-") {
+        if (cmd == "BTN:MUTE" || cmd == "BTN:KNOB") {
             petPetted(1);
+        } else if (cmd.startsWith("ROT:") || cmd == "ENC:+" || cmd == "ENC:-") {
+            petStroke();
         } else if (cmd == "BTN:LIGHT_HOLD") {
             petDismiss();
             return;
