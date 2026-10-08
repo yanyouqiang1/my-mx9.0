@@ -7655,6 +7655,7 @@ static int cfgGkeySlotOf(const char* k) {
 // 共用是故意的 —— 两条路必须落出**完全一样**的 NVS 布局，否则用户在 JSON 里
 // 改一遍、老协议再存一遍，两边会互相覆盖出不同的结果。
 static int cfgStoreRemap(int prof, const RemapRule* rules, int nRules) {
+    ct_mark(CT_S_CFG_APPLY);       // remap 是目前唯一"一改就崩"的路径,单独也标一次
     if (prof < 0 || prof >= TOTAL_PROFILES) return 0;
     if (nRules > MAX_REMAP_RULES) nRules = MAX_REMAP_RULES;
 
@@ -7807,6 +7808,9 @@ static bool cfgBufEnsure(void) {
 // · gkeys  —— 同上稀疏，但两个相位（MA_ph / MB_ph）**永远发**，因为 0
 //            是合法值，"没发"和"是 0"必须能区分开。
 static size_t cfgBuildJson(char* out, size_t cap) {
+    ELINFO("MEM", "组JSON前 栈余%u字节 堆余%uK",
+           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4),
+           (unsigned)(esp_get_free_heap_size() / 1024));
     JsonDocument doc;
     doc["version"] = CFG_SCHEMA_VERSION;
     for (size_t i = 0; i < CFG_FIELD_COUNT; i++) {
@@ -7969,6 +7973,12 @@ static size_t cfgBuildJson(char* out, size_t cap) {
 // 和一份带着 disp_mode 的整份配置，在这套语义下作用完全一样 —— 区别只在
 // 有没有 version 那道闸门。
 static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, size_t errCap) {
+    ct_mark(CT_S_CFG_APPLY);       // 崩在这一段里时,RTC 慢存能指出是"配置落盘"
+    // 动手前把栈/堆余量记一笔。崩了之后这一行就是"出事瞬间"的余量，
+    // 比开机那次有意义得多（开机时一切正常，余量看着很宽裕）。
+    ELINFO("MEM", "落盘前 栈余%u字节 堆余%uK",
+           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4),
+           (unsigned)(esp_get_free_heap_size() / 1024));
     nNvsFail = 0;                 // 每次请求从零开始，失败名单不跨请求累积
     cfgFailNames[0] = '\0';
     JsonDocument doc;
@@ -9213,6 +9223,7 @@ static void handleCommand(const String& cmd) {
         cfgRxBegin(cmd.substring(9), patch);
     }
     else if (cmd.startsWith("CFGDATA:")) {
+        ct_mark(CT_S_CFG_RX);        // 崩在这一段 = 攒包,和"落盘"是两回事
         String chunk = cmd.substring(8);
         if (!cfgRxActive) {
             // CFGBEGIN/CFGPATCH 丢了（老网页直接发 DATA，或那一包被协议栈吞了）。
@@ -10385,6 +10396,8 @@ static const char* ctStageName(uint32_t s) {
         case CT_S_CFG_POST:     return "配置生效中";
         case CT_S_WP_RX:        return "壁纸接收中";
         case CT_S_WP_DECODE:    return "壁纸解码写盘";
+        case CT_S_CFG_RX:       return "配置收包";
+        case CT_S_CFG_APPLY:    return "配置落盘";
         default:                return "未知阶段";
     }
 }
@@ -10443,17 +10456,33 @@ static void showBootDiagnostics(void) {
     triggerHud(abnormal ? "重启原因" : "开机", resetReasonName(why),
                lv_color_hex(abnormal ? CLR_AMBER : CLR_GREEN));
 
-    // 第二张：PSRAM 与内部堆余量（内存耗尽是之前重启的主因之一）
+    // 第二张：PSRAM、内部堆余量，以及**主任务栈的最小剩余**。
+    //
+    // 栈这一项是专门为"连蓝牙就崩 / 清空方案就崩"加的：这两条路都走
+    // handleCommand() → cfgBuildJson / cfgApplyDoc，而 handleCommand 本身是个几百个
+    // else-if 的巨函数，局部 String / ArduinoJson 临时对象把栈帧撑得很大。
+    // loopTask 默认只有 8KB，越界就是 panic；更麻烦的是 panic handler 自己也跑在
+    // 溢出的栈上 → 二次异常 → 现场记录写不进去（"上次异常复位但没留下现场"）。
+    //
+    // uxTaskGetStackHighWaterMark 返回**字**数（ESP32 上 1 字 = 4 字节），换算成
+    // 字节再打屏幕。低于 1024 就说明真的贴着边了。
+    uint32_t stackFreeBytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * 4;
     char buf[40];
     if (psram > 0) {
-        snprintf(buf, sizeof(buf), "PSRAM%uM 余%uK 第%u次",
-                 (unsigned)(psram / (1024 * 1024)), (unsigned)(heapFree / 1024), (unsigned)boots);
+        snprintf(buf, sizeof(buf), "余%uK 栈%uK 第%u次",
+                 (unsigned)(heapFree / 1024), (unsigned)(stackFreeBytes / 1024), (unsigned)boots);
     } else {
         // PSRAM 没起来时 LVGL 对象池回落内部堆，余量会小很多
-        snprintf(buf, sizeof(buf), "无PSRAM 余%uK 第%u次",
-                 (unsigned)(heapFree / 1024), (unsigned)boots);
+        snprintf(buf, sizeof(buf), "无PSRAM 余%uK 栈%uK",
+                 (unsigned)(heapFree / 1024), (unsigned)(stackFreeBytes / 1024));
     }
     pushBootHud(1400, "内存", buf, CLR_ACCENT);
+    // 同一份数字也落进错误日志：开机 HUD 一闪而过，日志是能翻回来查的。
+    ELINFO("MEM", "内堆余%uK 栈余%u字节 最小堆%uK",
+           (unsigned)(heapFree / 1024), (unsigned)stackFreeBytes, (unsigned)(heapMin / 1024));
+    if (stackFreeBytes < 1024) {
+        ELERR("MEM", "主任务栈只剩 %u 字节,离栈溢出只差一点点", (unsigned)stackFreeBytes);
+    }
 
     // 第三张：上次运行是怎么结束的。
     // 关键在于 panic 之后 USB 会重新枚举，PC 侧串口句柄失效，崩溃回溯抓不到，

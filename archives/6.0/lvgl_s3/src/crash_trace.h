@@ -55,6 +55,12 @@
 #define CT_S_CFG_POST   18   // 配置 JSON 保存后摊到 loop 里的界面副作用
 #define CT_S_WP_RX      19   // 壁纸 JPEG 接收中
 #define CT_S_WP_DECODE  20   // 壁纸解码 / 写 /logo.bin
+// 配置 JSON 的**下发处理**：解析、校验、逐键落盘、NVS 提交。
+// 为什么单独分两级：实测"连蓝牙就崩"和"清空方案就崩"都发生在这一段里，
+// 而整段 loop 有十几秒都不调 ct_mark()，崩在里面时 RTC 里留下的是上一次
+// 有标记的地方（多半是"循环末尾"），等于什么都没说。
+#define CT_S_CFG_RX     21   // 攒 CFGDATA / 收尾
+#define CT_S_CFG_APPLY  22   // cfgApplyDoc：校验 + 逐键写 NVS + 提交
 
 // 磁标：RTC 慢存里没有有效记录时用它区分（顺便挡掉随机数恰好撞上）
 #define CT_MAGIC 0x4B4D5831UL   // "KMX1"
