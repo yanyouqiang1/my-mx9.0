@@ -6085,14 +6085,26 @@ static void build_elog(void) {
             lv_label_set_text(l1, "");
             lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 10, 3);
 
-            // 第二行：**级别字样 + 正文**（16px 中文，行高 19，可折两行）。
-            // 级别放在正文前面而不是单独一行，是为了把行高压回 58：
-            // 每条只占两行，三条就填满列表区。
+            // 第二行：**级别字样 + 正文**（16px 中文）。
+            //
+            // ⚠ 这里**只能放一行**。原来写的是 LONG_WRAP、注释说"可折两行"，那是错的：
+            //   行容器只有 ELOG_ROW_H-2 = 42px 高，第一行(12px 字体)在 y=3 占到 y~17，
+            //   正文从 y=17 开始，16px 中文行高 19 —— 两行要占到 y=55，直接超出容器，
+            //   第二行被裁掉一半，屏幕上看到的就是"第一行正常、第二行残缺"。
+            //   （之前把 ELOG_ROW_H 从 58 压到 44 就是为了塞进 3 行，压的时候没同步
+            //     收掉"折两行"的余量。）
+            //
+            // 宽度也只有 166px 可用：206px 减去级别字样"信息"(2 个汉字 32px) 加空格。
+            // 所以正文超长时**用省略号截断**（显式给高度才会触发 DOT），而不是让它
+            // 折行 —— 折行截断出来的半截字比"..."更难认。
+            //
+            // ⚠ 因此**日志正文一律要写短**：一行 ≈ 10 个汉字 / 20 个 ASCII 字符。
             lv_obj_t* l2 = lv_label_create(row);
             mkLabel(l2, &lv_font_simsun_16_cjk, CLR_TEXT);
             lv_label_set_text(l2, "");
             lv_obj_set_width(l2, 206);
-            lv_label_set_long_mode(l2, LV_LABEL_LONG_WRAP);
+            lv_obj_set_height(l2, 19);          // 给死高度，DOT 模式才会截断而不是撑高
+            lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
             lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 10, 17);
 
             elog_row[i] = row;
@@ -7808,9 +7820,7 @@ static bool cfgBufEnsure(void) {
 // · gkeys  —— 同上稀疏，但两个相位（MA_ph / MB_ph）**永远发**，因为 0
 //            是合法值，"没发"和"是 0"必须能区分开。
 static size_t cfgBuildJson(char* out, size_t cap) {
-    ELINFO("MEM", "组JSON前 栈余%u字节 堆余%uK",
-           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4),
-           (unsigned)(esp_get_free_heap_size() / 1024));
+    ELINFO("MEM", "组串 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4));
     JsonDocument doc;
     doc["version"] = CFG_SCHEMA_VERSION;
     for (size_t i = 0; i < CFG_FIELD_COUNT; i++) {
@@ -7974,11 +7984,10 @@ static size_t cfgBuildJson(char* out, size_t cap) {
 // 有没有 version 那道闸门。
 static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, size_t errCap) {
     ct_mark(CT_S_CFG_APPLY);       // 崩在这一段里时,RTC 慢存能指出是"配置落盘"
-    // 动手前把栈/堆余量记一笔。崩了之后这一行就是"出事瞬间"的余量，
+    // 动手前把栈余量记一笔。崩了之后这一行就是"出事瞬间"的余量，
     // 比开机那次有意义得多（开机时一切正常，余量看着很宽裕）。
-    ELINFO("MEM", "落盘前 栈余%u字节 堆余%uK",
-           (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4),
-           (unsigned)(esp_get_free_heap_size() / 1024));
+    // 正文要短：错误日志一页只有一行正文的位置（见 elog 行那段）。
+    ELINFO("MEM", "落盘 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4));
     nNvsFail = 0;                 // 每次请求从零开始，失败名单不跨请求累积
     cfgFailNames[0] = '\0';
     JsonDocument doc;
@@ -10478,10 +10487,10 @@ static void showBootDiagnostics(void) {
     }
     pushBootHud(1400, "内存", buf, CLR_ACCENT);
     // 同一份数字也落进错误日志：开机 HUD 一闪而过，日志是能翻回来查的。
-    ELINFO("MEM", "内堆余%uK 栈余%u字节 最小堆%uK",
-           (unsigned)(heapFree / 1024), (unsigned)stackFreeBytes, (unsigned)(heapMin / 1024));
+    // 正文必须**一行放得下**（见 elog 行那段的约束：可用宽度约 166px）。
+    ELINFO("MEM", "栈%uB 内%uK", (unsigned)stackFreeBytes, (unsigned)(heapFree / 1024));
     if (stackFreeBytes < 1024) {
-        ELERR("MEM", "主任务栈只剩 %u 字节,离栈溢出只差一点点", (unsigned)stackFreeBytes);
+        ELERR("MEM", "栈只剩%uB 危险", (unsigned)stackFreeBytes);
     }
 
     // 第三张：上次运行是怎么结束的。
