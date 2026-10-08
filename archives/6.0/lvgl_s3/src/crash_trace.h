@@ -74,19 +74,22 @@ typedef struct {
     uint32_t dispMode;   // 当时的 currentDispMode
     uint32_t hang;       // 1 = 监测任务判定为卡死
     uint32_t uptimeMs;   // 出事时已运行的毫秒数
+    uint32_t ovf;        // 1 = FreeRTOS 检到栈溢出（见 vApplicationStackOverflowHook）
+    uint32_t ovfStack;   // 溢出瞬间的栈余量（字节）
+    char     ovfTask[16];// 溢出的任务名（"loopTask" / "ctmon" / "IDLE" ...）
 } CrashTrace;
 
-static RTC_DATA_ATTR CrashTrace ct_rec = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0 };
-
-// 心跳计数**不能是 static** —— bt_link.cpp 也 include 这个头文件（那里要在
-// btLinkKeepAlive() 里报活），static 会让每个 .cpp 各得一份自己的副本，
-// 主任务推进的那份和监测任务读的那份就成了两个变量，卡死监测会永远失灵。
-// 唯一的定义放在 lvgl_s3.ino 里，这里只做声明。
+// ⚠️ ct_rec / ct_prev / ct_heartbeat 的**唯一定义都在 lvgl_s3.ino 里**，
+//   这里只做 extern 声明。
+//
+//   原因和 ct_heartbeat 的坑完全一样，只是后果更隐蔽：bt_link.cpp 也 include
+//   本头文件，而**栈溢出钩子只在 .ino 里定义**、写的是 .ino 那份 ct_rec。
+//   如果这里放 static，bt_link.cpp 会另得一份副本，从此"钩子写进去的现场"
+//   和"某个读者读到的现场"可以互不相干 —— 而"溢出的到底是哪个任务"恰恰是
+//   这个钩子存在的唯一理由，读到错的那份等于白做。
+extern RTC_DATA_ATTR CrashTrace ct_rec;
+extern CrashTrace ct_prev;
 extern volatile uint32_t    ct_heartbeat;
-
-// 上一次运行的现场快照。ct_begin() 会把 ct_rec 清成本次的状态，
-// 所以开机诊断（showBootDiagnostics）要读的是这份快照。
-static CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0 };
 
 // 写阶段。热路径里就是一条 volatile 写，可以放心每处都调。
 // 顺带推进心跳，监测任务靠它判断 loop() 还活着没有。
@@ -132,6 +135,9 @@ static inline void ct_begin(void) {
         ct_rec.dispMode = 0;
         ct_rec.hang     = 0;
         ct_rec.uptimeMs = 0;
+        ct_rec.ovf      = 0;
+        ct_rec.ovfStack = 0;
+        for (int i = 0; i < (int)sizeof(ct_rec.ovfTask); i++) ct_rec.ovfTask[i] = 0;
     }
     ct_rec.stage = CT_S_IDLE;
     ct_rec.ready = 0;
@@ -183,5 +189,46 @@ static inline void ct_startMonitor(void) {
     started = true;
     xTaskCreate(ct_monitor_task_entry, "ctmon", 3072, NULL, 1, NULL);
 }
+
+// ===========================
+// 栈溢出钩子
+// ===========================
+//
+// 为什么要自己写这个：
+//   FreeRTOS 在 CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y（本工程就是）
+//   下，每次任务切换都会检查栈尾的"金丝雀"（canary）有没有被踩。一旦踩到，
+//   就调用 vApplicationStackOverflowHook(xTask, pcTaskName)。这个符号在
+//   ESP-IDF 里是 **weak**（ELF 里能看到 `W vApplicationStackOverflowHook`），
+//   默认实现直接 abort() → panic → 复位。
+//
+//   问题就在"直接 abort"：此刻正主自己的栈已经被踩烂了，栈上的现场（局部
+//   变量、返回地址）全是垃圾，默认实现连"是哪个任务"都没来得及留。
+//   而本工程最需要回答的问题恰恰是"是谁溢出的" —— 是 loopTask 那个几百个
+//   else-if 的 handleCommand，还是我们自己的 ctmon 监测任务。
+//
+//   所以覆盖它：先把任务名 + 当时的栈余量写进 RTC 慢存（这段代码本身极短、
+//   几乎不占栈，安全），再走原来的复位流程。下次开机就能直接看到：
+//   "上次栈溢出：任务 loopTask，栈余 0B，阶段 配置落盘"。
+//
+// 为什么写任务名而不是只写标志位：任务名由 FreeRTOS 常量给出，拷进 RTC
+//   慢存里是安全的（不指向任何易失内存）。若栈溢出发生在**别的**任务上，
+//   这个名字就是唯一能区分的线索 —— "是我怀疑的 loopTask" 还是"是我从没
+//   怀疑过的 ctmon"，排查方向完全不同。
+//
+// ⚠️ 这里的写法刻意保守：不用 snprintf / 不用 String / 不递归。
+//   因为它可能在**任意**任务的栈已经损坏时被调用，任何复杂的调用链都可能
+//   二次溢出，反而把唯一的机会也弄丢。strncpy + 手动补 0 是这里能用的
+//   最重的手法。
+static void ct_copyTaskName(char* dst, size_t cap, const char* src) {
+    if (!src) { dst[0] = '\0'; return; }
+    size_t i = 0;
+    for (; i + 1 < cap && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+// 钩子本体在 lvgl_s3.ino 里（唯一定义，理由见该处注释）。这里只声明。
+// 放在文件末尾而不是结构体旁边，是为了让上面 ct_mark / ct_begin 等
+// inline 函数先看到 ct_rec 的 extern 声明。
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName);
 
 #endif  // CRASH_TRACE_H

@@ -370,6 +370,11 @@ static void pushLogLine(const char* line);
 // 每个 .cpp 会各得一份副本，主任务推进的和监测任务读的就成了两个变量。
 volatile uint32_t ct_heartbeat = 0;
 
+// ct_rec / ct_prev 的唯一定义，原因同上（栈溢出钩子要写 ct_rec，
+// 而 bt_link.cpp 也 include 了 crash_trace.h）。
+RTC_DATA_ATTR CrashTrace ct_rec = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
+CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
+
 #include <esp_heap_caps.h>
 #include <nvs.h>          // nvs_get_stats：开机报告分区还剩多少槽位
 
@@ -7820,7 +7825,7 @@ static bool cfgBufEnsure(void) {
 // · gkeys  —— 同上稀疏，但两个相位（MA_ph / MB_ph）**永远发**，因为 0
 //            是合法值，"没发"和"是 0"必须能区分开。
 static size_t cfgBuildJson(char* out, size_t cap) {
-    ELINFO("MEM", "组串 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4));
+    ELINFO("MEM", "组串 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL)));
     JsonDocument doc;
     doc["version"] = CFG_SCHEMA_VERSION;
     for (size_t i = 0; i < CFG_FIELD_COUNT; i++) {
@@ -7987,7 +7992,11 @@ static int cfgApplyDoc(const char* json, size_t len, bool isPatch, char* err, si
     // 动手前把栈余量记一笔。崩了之后这一行就是"出事瞬间"的余量，
     // 比开机那次有意义得多（开机时一切正常，余量看着很宽裕）。
     // 正文要短：错误日志一页只有一行正文的位置（见 elog 行那段）。
-    ELINFO("MEM", "落盘 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4));
+    // ⚠️ uxTaskGetStackHighWaterMark 在 ESP-IDF 里返回的是**字节**，不是原版
+    //   FreeRTOS 的"字数"（IDF 改过这个 API：in bytes not words, unlike
+    //   vanilla FreeRTOS）。之前这里多乘了 4，报出 21856B —— 比 loopTask
+    //   整个栈（8192B）还大，一眼就知道换算错了。真实值是 5464B。
+    ELINFO("MEM", "落盘 栈%uB", (unsigned)(uxTaskGetStackHighWaterMark(NULL)));
     nNvsFail = 0;                 // 每次请求从零开始，失败名单不跨请求累积
     cfgFailNames[0] = '\0';
     JsonDocument doc;
@@ -10473,9 +10482,11 @@ static void showBootDiagnostics(void) {
     // loopTask 默认只有 8KB，越界就是 panic；更麻烦的是 panic handler 自己也跑在
     // 溢出的栈上 → 二次异常 → 现场记录写不进去（"上次异常复位但没留下现场"）。
     //
-    // uxTaskGetStackHighWaterMark 返回**字**数（ESP32 上 1 字 = 4 字节），换算成
-    // 字节再打屏幕。低于 1024 就说明真的贴着边了。
-    uint32_t stackFreeBytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * 4;
+    // uxTaskGetStackHighWaterMark 返回**字节**（ESP-IDF 改过这个 API，原版
+    // FreeRTOS 返回的是"字数"：in bytes not words, unlike vanilla FreeRTOS）。
+    // 之前这里多乘了 4，报出 21856B —— 比 loopTask 整个栈（8192B）还大，
+    // 是个自相矛盾的数字。真实值 5464B。低于 1024 就说明真的贴着边了。
+    uint32_t stackFreeBytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
     char buf[40];
     if (psram > 0) {
         snprintf(buf, sizeof(buf), "余%uK 栈%uK 第%u次",
@@ -10503,7 +10514,17 @@ static void showBootDiagnostics(void) {
         } else {
             snprintf(keyName, sizeof(keyName), "%s", getKeyName((uint16_t)ct_prev.keyCode));
         }
-        if (ct_prev.ready == 0) {
+        if (ct_prev.ovf) {
+            // 栈溢出**优先于**阶段名显示。它是 FreeRTOS 金丝雀亲自抓到的，
+            // 比阶段号更接近"到底哪一步炸的"：阶段号只说明"崩在配置落盘
+            // 这一大段里"，而这条直接点名是哪个任务把栈踩烂的 —— 如果是
+            // loopTask，下一步就是砍 handleCommand 的栈帧；如果是 ctmon，
+            // 那我前面盯着的方向（配置下发路径）就整个是错的。
+            snprintf(buf, sizeof(buf), "%s 余%uB %s",
+                     ct_prev.ovfTask[0] ? ct_prev.ovfTask : "?",
+                     (unsigned)ct_prev.ovfStack, ctStageName(ct_prev.stage));
+            pushBootHud(2900, "上次栈溢出", buf, CLR_RED);
+        } else if (ct_prev.ready == 0) {
             // 上一次没跑完 setup 就没了 —— 启动流程里就崩了，跟运行期是两回事
             snprintf(buf, sizeof(buf), "启动未完成 %s", ctStageName(ct_prev.stage));
             pushBootHud(2900, "上次死在", buf, CLR_RED);
@@ -10557,7 +10578,14 @@ static void elog_notePrevRun(void) {
         const char* keyName = (ct_prev.keyCode == 0xFFFFFFFFUL)
                               ? "无" : getKeyName((uint16_t)ct_prev.keyCode);
         char msg[ELOG_MSG_MAX];
-        if (ct_prev.ready == 0) {
+        if (ct_prev.ovf) {
+            // 栈溢出单独一条、且排在最前面：这是 FreeRTOS 金丝雀直接抓到的，
+            // 比阶段号更硬。阶段号只说"崩在配置落盘这一段"，这条点名**是哪个
+            // 任务**把栈踩烂的 —— 排查方向完全由它决定。
+            snprintf(msg, sizeof(msg), "栈溢出 %s 余%uB 于%s",
+                     ct_prev.ovfTask[0] ? ct_prev.ovfTask : "?",
+                     (unsigned)ct_prev.ovfStack, ctStageName(ct_prev.stage));
+        } else if (ct_prev.ready == 0) {
             // 上一次连 setup 都没跑完 —— 死在启动流程里（多半是硬件/配置问题）
             snprintf(msg, sizeof(msg), "上次死在启动中 阶段:%s", ctStageName(ct_prev.stage));
         } else {
@@ -10915,6 +10943,29 @@ void setup() {
     ct_startMonitor();
 
     LOG_PORT.println("YYQ-MX9.0 LVGL Ready");
+}
+
+// ===========================
+// 栈溢出钩子（覆盖 FreeRTOS 的 weak 默认实现）
+// ===========================
+// 详细理由见 crash_trace.h 里同名函数的注释。这里只说为什么要放在这个位置：
+// Arduino 会自动生成函数原型，并把原型插到**第一个函数定义之前**。这个文件
+// 第一个函数定义出现得很早，而本钩子要用 TaskHandle_t / crash_trace.h 里的
+// 东西，放前面会被生成器把原型甩到 `#include <Arduino.h>` 之前，直接编译不过
+// （之前踩过这个坑，见 ctQueueRemapHud 的注释）。
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName) {
+    (void)xTask;
+    // 先记现场再复位。ovf=1 **最后**写 —— 它是"这份记录本身可信"的标志位，
+    // 万一中间就二次异常了，至少 magic 还是上一次的有效值。
+    ct_rec.uptimeMs = (uint32_t)millis();
+    ct_rec.ovfStack = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    ct_copyTaskName(ct_rec.ovfTask, sizeof(ct_rec.ovfTask), pcTaskName);
+    ct_rec.ovf = 1;
+
+    // 走原来的复位流程。abort() 会让 panic handler 打印 Guru Meditation 回溯；
+    // 保留它是为了在**恰好有人盯着串口**时仍能拿到回溯。现在没接 CDC，这段
+    // 输出无处可去，但不影响本钩子留记录的作用。
+    abort();
 }
 
 // ===========================
