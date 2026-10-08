@@ -267,7 +267,34 @@ static uint32_t epochCache = 0;
 // ⚠ 原来还有 CFG_PEND_PROF 0x04。curr_prof 摘出 CFG_FIELDS 之后已经没人
 //   置它了，位也空出来留给下一个。方案切换的 UI 刷新归 switchProfile() 自己管。
 #define CFG_PEND_SAVER   0x08
+// 映射表"没存住"的红色提示。它不是上面那几个副作用之一，但同样是**界面**动作，
+// 同样必须在 cfgPostPump 里出，不能在配置下发的那条指令里直接建 HUD —— 理由见下面
+// cfgQueueRemapHud 的注释。
+#define CFG_PEND_RMHUD   0x10
 static uint8_t cfgPend = 0;
+
+// remap 的 HUD 正文。只有 CFG_PEND_RMHUD 挂着的时候才有意义，存不下就截断。
+static char cfgRemapHudMsg[48] = { 0 };
+
+// 映射落盘失败时，**只记正文、不建 HUD**。
+//
+// 为什么不能在这里直接 triggerHud()：本文件里所有"配置保存后的界面动作"都被刻意
+// 挪到了 cfgPostPump（见 :248 那段），因为把界面工作内联进 CFGEND 的处理分支正是
+// 本模块第一版把键盘搞崩溃的直接原因。cfgStoreRemap 是最后一条漏网的 —— 它在
+// handleCommand 的调用栈里（此时 ArduinoJson 的 doc 还占着几 KB 内部堆）直接
+// lv_obj_del + lv_obj_create 建 HUD。
+//
+// 现场表现和它完全吻合：**只有清空方案 / 删一条映射会崩**，别的保存都不崩 ——
+// 因为只有这条路径会在下发过程中建 HUD，而它又只在 NVS 写不下时才走到。
+// （宏和全局键写不下时只 ELWARN，不建 HUD，所以那两条路没事。）
+//
+// ⚠⚠ 这里只有前置声明，函数体在 cfgPostPump 旁边。位置不是随便挑的：本文件靠
+// Arduino 的自动原型生成器补声明，而它把原型块插在**第一个函数定义之前**。
+// 把函数定义放在这里就等于告诉生成器"从这儿开始插" —— 而 `#include "lvgl.h"`
+// 还在几百行之后，于是生成器插出来的那一堆 `void setBgColor(lv_obj_t*)` 全部
+// 编译不过（'lv_obj_t' does not name a type，报的行号正好落在这一段）。
+// 文件里其它函数也都遵守这条：靠前的一律只留声明。
+static void cfgQueueRemapHud(const char* msg);
 
 // 实现都在 handleCommand 前面那一段（"配置 JSON"），loop() 里只调 cfgJsonPump
 // 和 cfgPostPump。
@@ -4628,7 +4655,19 @@ static void petMenuAction(MenuAction act) {
 static void build_hud(void) {
     if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
 
+    // ⚠⚠ 每一个 lv_obj_create / lv_label_create 都可能返回 NULL，必须逐个判。
+    //
+    // LVGL 的分配器是 lv_mem_port.h 里那个：优先 PSRAM，失败**回落 malloc**（内部
+    // DRAM）。而内部 DRAM 正是最紧张的那块 —— BLE 协议栈、ArduinoJson、帧缓冲、
+    // 任务栈全挤在这 327KB 里。所以"分配失败"不是理论风险，是这个项目历史上
+    // 最主要的重启原因之一（见 lv_mem_port.h 顶部那段）。
+    //
+    // 一旦 scr_hud 是 NULL，下面那句 lv_obj_set_size(scr_hud, ...) 就会解引用空
+    // 指针 → panic。**少一个 HUD 只是少一次提示，崩了是整机重启** ——
+    // 这个代价对比决定了这里必须判。返回即可，hud.active 已经在 triggerHud 里
+    // 置过，loop 里照常会把它超时收掉。
     scr_hud = lv_obj_create(lv_layer_top());
+    if (scr_hud == nullptr) return;
     lv_obj_set_size(scr_hud, 216, HUD_H);
     lv_obj_align(scr_hud, LV_ALIGN_CENTER, 0, 30);
     mkCard(scr_hud, 0x000000, 12);
@@ -4638,31 +4677,37 @@ static void build_hud(void) {
 
     // 左侧语义色竖条：颜色跟着提示语义走，一眼能分辨成功/警告/错误
     lv_obj_t* bar = lv_obj_create(scr_hud);
-    lv_obj_set_size(bar, 5, HUD_H - 12);
-    lv_obj_align(bar, LV_ALIGN_LEFT_MID, 4, 0);
-    lv_obj_set_style_bg_color(bar, hud.color, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    if (bar) {
+        lv_obj_set_size(bar, 5, HUD_H - 12);
+        lv_obj_align(bar, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_set_style_bg_color(bar, hud.color, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     // 标题（小、三级色、居中）
     lv_obj_t* title = lv_label_create(scr_hud);
-    mkLabel(title, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
-    lv_label_set_text(title, hud.title);
-    lv_obj_set_width(title, 184);
-    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 9);
+    if (title) {
+        mkLabel(title, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+        lv_label_set_text(title, hud.title);
+        lv_obj_set_width(title, 184);
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 9);
+    }
 
     // 数值（大、主文字色、居中）—— 卡片主体
     lv_obj_t* value = lv_label_create(scr_hud);
-    mkLabel(value, &lv_font_simsun_16_cjk, CLR_TEXT);
-    lv_label_set_text(value, hud.value);
-    lv_obj_set_width(value, 184);
-    lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(value, LV_ALIGN_BOTTOM_MID, 0, -8);
+    if (value) {
+        mkLabel(value, &lv_font_simsun_16_cjk, CLR_TEXT);
+        lv_label_set_text(value, hud.value);
+        lv_obj_set_width(value, 184);
+        lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(value, LV_ALIGN_BOTTOM_MID, 0, -8);
+    }
 }
 
 static void triggerHud(const char* title, const char* value, lv_color_t color) {
@@ -7686,7 +7731,7 @@ static int cfgStoreRemap(int prof, const RemapRule* rules, int nRules) {
         char buf[32];
         snprintf(buf, sizeof(buf), "只存住 %d/%d 条", verified, remapCounts[prof]);
         ELERR("REMAP", "%s NVS分区可能已满", buf);
-        triggerHud("按键重映射", buf, lv_color_hex(CLR_RED));
+        cfgQueueRemapHud(buf);     // ⚠ 只置位,HUD 交给 cfgPostPump,见上面那段注释
     }
     return verified;
 }
@@ -8463,6 +8508,15 @@ return nChanged + nScheme;
 // 这才是"保存配置不再重启"的真正原因 —— 一次全屏重建独占一轮 loop，
 // 前后都有键盘扫描、LVGL 刷新和 esp_task_wdt_reset()，10 秒看门狗永远饿不着。
 // 一份配置最多摊 4 轮，肉眼看不出延迟。
+// 映射落盘失败 → 把 HUD 正文收好、挂一个位。真正的 HUD 由 cfgPostPump 下一轮 loop
+// 来弹（定义必须放在这里，见前面那个前置声明处的说明）。
+static void cfgQueueRemapHud(const char* msg) {
+    if (msg == nullptr) return;
+    strncpy(cfgRemapHudMsg, msg, sizeof(cfgRemapHudMsg) - 1);
+    cfgRemapHudMsg[sizeof(cfgRemapHudMsg) - 1] = '\0';
+    cfgPend |= CFG_PEND_RMHUD;
+}
+
 static void cfgPostPump(void) {
     if (cfgPend == 0) return;
     btLinkKeepAlive();          // 动手之前先喂一次
@@ -8486,6 +8540,12 @@ static void cfgPostPump(void) {
         unsigned long t0 = millis();
         setScreensaverMode(saverMode);
         ELINFO("CFG", "屏保模式重建用了 %lums", (unsigned long)(millis() - t0));
+    }
+    else if (cfgPend & CFG_PEND_RMHUD) {
+        cfgPend &= ~CFG_PEND_RMHUD;
+        // 放在最后：前三个是"用户改了什么"的反馈，这条是"有东西没存住"的告警，
+        // 优先级最低，但不能丢 —— 它是用户唯一能知道"这次保存其实没生效"的途径。
+        triggerHud("按键重映射", cfgRemapHudMsg, lv_color_hex(CLR_RED));
     }
     btLinkKeepAlive();          // 做完再喂一次
 }
