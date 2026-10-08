@@ -12,6 +12,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+// 为了 btLinkKeepAlive() 里的 ct_alive()。只取那个心跳上报，
+// 本文件不需要 ct_rec / 监测任务那些（它们是 static，不会实例化到这里）。
+#include "crash_trace.h"
+
 // ============================================================ 静态状态
 //
 // ⚠ 全部落在 .bss，不吃栈。loopTask 的栈只有 8KB，而 JPEGDEC 一个对象就
@@ -84,6 +88,21 @@ void btLinkKeepAlive() {
     // sdkconfig 默认开），它只有自己能给自己的看门狗喂食 → 下面所有等待一律
     // 走 delay()（会让出 CPU、idle 跑得起来），本模块里没有一处忙等。
     esp_task_wdt_reset();
+
+    // ⚠⚠ 这一句和上面那句**不是一回事，少了它就会出现"一存配置就重启"。
+    //
+    // esp_task_wdt_reset() 续的是 10 秒的任务看门狗；而 crash_trace.h 里的卡死
+    // 监测任务盯的是 ct_heartbeat，连续 3 次（6 秒）没推进就判死并 esp_restart()。
+    // 这两套是独立的：所有长耗时的地方（cfgStoreRemap 的 NVS 删+写+回读、
+    // cfgApplyDoc 逐键落盘、preferences.end() 提交、分片发包）都靠本函数续命，
+    // 期间主任务**没有**任何一个 ct_mark()，心跳一次都不涨。
+    //
+    // 于是一次"只是慢"而不是"卡死"的操作（NVS 分区越碎写越慢，几秒很正常）
+    // 就能顶满 6 秒，被监测任务当成死循环复位掉 —— 现场表现是连接蓝牙就重启、
+    // 保存映射就重启，而固件日志里什么异常都没有。
+    //
+    // 谁在替主任务续命，谁就该同时报一次活。
+    ct_alive();
 }
 
 void btLinkDelay(unsigned long ms) {

@@ -338,7 +338,13 @@ static void pushLogLine(const char* line);
 #include "crash_trace.h"
 #include "elog.h"
 
+// ct_heartbeat 的**唯一定义**。crash_trace.h 里只有 extern 声明，因为
+// bt_link.cpp 也要靠它报活（见 ct_alive 的注释）—— 放成 static 就废了：
+// 每个 .cpp 会各得一份副本，主任务推进的和监测任务读的就成了两个变量。
+volatile uint32_t ct_heartbeat = 0;
+
 #include <esp_heap_caps.h>
+#include <nvs.h>          // nvs_get_stats：开机报告分区还剩多少槽位
 
 #define LV_LVGL_H_INCLUDE_SIMPLE 1
 #include <lvgl.h>
@@ -7607,8 +7613,31 @@ static int cfgStoreRemap(int prof, const RemapRule* rules, int nRules) {
     if (prof < 0 || prof >= TOTAL_PROFILES) return 0;
     if (nRules > MAX_REMAP_RULES) nRules = MAX_REMAP_RULES;
 
+    // 0. **整份没变就别碰 flash。**
+    //
+    // NVS 是只增不减的日志结构：写一次就是往分区尾巴上追加一条，旧的留着等 GC。
+    // 所以"把 32 个键全删一遍再写一遍"这种做法，哪怕值一模一样，也在每次保存时
+    // 制造几十条垃圾条目 —— 分区就这么被自己写满的（满了之后 put* 静默失败，
+    // 于是"清空方案"看着成功、开机又还是老那两条）。
+    //
+    // 网页每次保存都会把**整份**配置下发过来，remap 这一块多半根本没动。
+    // 先比一遍，没变直接返回，能省掉一次几十条的 NVS 写入和后面那圈回读。
+    if (nRules == remapCounts[prof]) {
+        bool same = true;
+        for (int i = 0; i < nRules; i++) {
+            if (profileRemaps[prof][i].fromKey != rules[i].fromKey ||
+                profileRemaps[prof][i].toKey   != rules[i].toKey) { same = false; break; }
+        }
+        if (same) {
+            ELINFO("REMAP", "方案%d 仍是 %d 条，没变，跳过写入", prof + 1, nRules);
+            return nRules;
+        }
+    }
+
     // 1. 老的全删。⚠ 不能只把条数置 0：那些 rmp_<p>_<i> 键还留在 NVS 里，
     //    换固件/读档时会诈尸，而且再也清不掉。
+    //    （键本来就不存在时 nvs_erase_key 直接返回 NOT_FOUND、不产生写入，
+    //     所以这里按满 32 个删并不会平白写花分区，保留全删是为了能捞干净历史残留。）
     for (int i = 0; i < MAX_REMAP_RULES; i++) {
         char itemKey[20];
         snprintf(itemKey, sizeof(itemKey), "rmp_%d_%d", prof, i);
@@ -8293,12 +8322,21 @@ for (int p = 0; p < TOTAL_PROFILES; p++) {
                 if (!cfgMacroNvsKey(p, k, nk, sizeof(nk), err, errCap)) return -1;
                 JsonVariantConst v = kv.value();
                 const char* val = v.isNull() ? "" : v.as<const char*>();
+                // ⚠⚠ 先读出来比一遍，**没变就一个字节都不写**。
+                //
+                // 这一条不是省时间，是保命：NVS 只增不减，写一次追加一条日志条目。
+                // 网页每次保存都把整份配置下发过来，24 个宏里通常一个都没动 ——
+                // 老代码却每个都 putString() 一遍，单次保存凭空制造 6KB 垃圾，
+                // 几轮就把分区写满，然后 put* 开始静默失败（"保存成功"但重启即丢）。
+                String back = preferences.getString(nk, "");
                 if (val[0] == '\0') {
-                    preferences.remove(nk);
-                    ELINFO("CFG", "宏 %s(%s) 已删", nk, k);
-                } else {
+                    if (back.length() > 0) {
+                        preferences.remove(nk);
+                        ELINFO("CFG", "宏 %s(%s) 已删", nk, k);
+                    }
+                } else if (back != val) {
                     preferences.putString(nk, val);
-                    String back = preferences.getString(nk, "");
+                    back = preferences.getString(nk, "");
                     if (back != val) {
                         // 记失败项（宏，.ino 里放不了新函数，见 CFG_FAIL_ADD）
                         CFG_FAIL_ADD(nk);
@@ -8306,6 +8344,8 @@ for (int p = 0; p < TOTAL_PROFILES; p++) {
                     } else {
                         ELINFO("CFG", "宏 %s(%s) 已写 %u 字节", nk, k, (unsigned)strlen(val));
                     }
+                } else {
+                    ELINFO("CFG", "宏 %s(%s) 没变,跳过", nk, k);
                 }
                 nScheme++;
                 btLinkKeepAlive();
@@ -8327,12 +8367,16 @@ if (!jGkeys.isNull()) {
             JsonVariantConst v = kv.value();
             const char* val = v.isNull() ? "" : v.as<const char*>();
             const String nk = gkeyNvsKey(slot);
+            // 和宏那段同一个道理：没变就别写（见 cfgStoreRemap 上面那条 ⚠⚠）。
+            String back = preferences.getString(nk.c_str(), "");
             if (val[0] == '\0') {
-                preferences.remove(nk.c_str());
-                ELINFO("CFG", "全局键 %s 已删", k);
-            } else {
+                if (back.length() > 0) {
+                    preferences.remove(nk.c_str());
+                    ELINFO("CFG", "全局键 %s 已删", k);
+                }
+            } else if (back != val) {
                 preferences.putString(nk.c_str(), val);
-                String back = preferences.getString(nk.c_str(), "");
+                back = preferences.getString(nk.c_str(), "");
                 if (back != val) {
                     // 记失败项（同上，宏）
                     CFG_FAIL_ADD(k);
@@ -8340,6 +8384,8 @@ if (!jGkeys.isNull()) {
                 } else {
                     ELINFO("CFG", "全局键 %s 已写 %u 字节", k, (unsigned)strlen(val));
                 }
+            } else {
+                ELINFO("CFG", "全局键 %s 没变,跳过", k);
             }
             nScheme++;
         } else if (strcmp(k, "MA_ph") == 0 || strcmp(k, "MB_ph") == 0) {
@@ -10531,6 +10577,23 @@ void setup() {
             // triggerHud() 会去 lv_scr_act() 上建对象，太早调用不安全。
             // 记成 ERR 就够醒目了 —— 菜单第 13 项会挂红色"N 条"角标。
             ELERR("NVS", "分区写不进去 配置可能保存不上");
+        }
+
+        // ⚠ 光有"能不能写"不够：这个探针只答一句话，分区到底还剩多少没人知道。
+        // 而这一整类症状（"保存说成功、重启就没"、"清空方案看着成功、开机还是老那两条"）
+        // 的真因都是分区被写满，且**越满越慢** —— GC 抖动起来一次保存能顶几秒，
+        // 又正好会把 6 秒卡死监测顶爆重启。把数字打出来，以后这类问题一眼可辨。
+        {
+            nvs_stats_t st;
+            if (nvs_get_stats("nvs", &st) == ESP_OK && st.total_entries > 0) {
+                uint32_t freePct = (uint32_t)st.free_entries * 100UL / st.total_entries;
+                ELINFO("NVS", "槽位 %u/%u 已用,剩余 %u%%（越低写入越慢,见 btLinkKeepAlive 注释）",
+                       (unsigned)st.used_entries, (unsigned)st.total_entries,
+                       (unsigned)freePct);
+                if (freePct < 15) {
+                    ELWARN("NVS", "分区快满了:新宏/新映射很可能存不进去,建议清掉一些不用的配置");
+                }
+            }
         }
     }
 

@@ -71,7 +71,12 @@ typedef struct {
 } CrashTrace;
 
 static RTC_DATA_ATTR CrashTrace ct_rec = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0 };
-static volatile uint32_t    ct_heartbeat = 0;
+
+// 心跳计数**不能是 static** —— bt_link.cpp 也 include 这个头文件（那里要在
+// btLinkKeepAlive() 里报活），static 会让每个 .cpp 各得一份自己的副本，
+// 主任务推进的那份和监测任务读的那份就成了两个变量，卡死监测会永远失灵。
+// 唯一的定义放在 lvgl_s3.ino 里，这里只做声明。
+extern volatile uint32_t    ct_heartbeat;
 
 // 上一次运行的现场快照。ct_begin() 会把 ct_rec 清成本次的状态，
 // 所以开机诊断（showBootDiagnostics）要读的是这份快照。
@@ -81,6 +86,23 @@ static CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0 };
 // 顺带推进心跳，监测任务靠它判断 loop() 还活着没有。
 static inline void ct_mark(uint32_t stage) {
     ct_rec.stage = stage;
+    ct_heartbeat++;
+}
+
+// 只报"我还活着"、**不改**阶段号。
+//
+// 为什么需要它：卡死监测看的是心跳，**不是**任务看门狗。bt_link 里所有
+// 长耗时的地方（cfgStoreRemap 的 NVS 删+写+回读、cfgApplyDoc 的宏/全局键
+// 落盘、preferences.end() 提交、分片发包）都靠 btLinkKeepAlive() 续命，
+// 而它原来只调 esp_task_wdt_reset() —— 那管的是 10 秒的任务看门狗，和 6 秒
+// 的卡死监测是两套完全独立的东西。
+//
+// 结果就是：一次正常的、只是慢的配置保存（分区越碎越慢，能到好几秒），
+// 任务看门狗被喂住了、可 6 秒监测看心跳没动，判定"卡死"，直接 esp_restart()。
+// 现场表现正是"一连蓝牙就重启、一存映射就重启"。
+//
+// 这个函数就是给喂狗点用的：谁在替主任务续命，谁就该同时报一次活。
+static inline void ct_alive(void) {
     ct_heartbeat++;
 }
 
