@@ -479,23 +479,26 @@
             </select>
             <div class="hint">切这里的下拉，下面两块（按键映射 / 系统专属宏）会同时跟着切到这个系统。</div>
 
-            <!-- ⚠⚠ 「正在编辑」和「键盘正在跑」是两个不同的东西，这里必须分开显示。
-                 历史 bug：页面上只有这一个下拉，用户选了 macOS 就以为键盘也在跑
-                 macOS，实际上编辑目标从来不改变运行态 —— 于是"配了 mac 映射却
-                 一直按 Windows 规则走"，且页面上完全看不出异常。
-                 现在把运行态显式摆出来，割裂不再隐形。 -->
+            <!-- ⚠⚠ 「正在编辑」是配置，「键盘正在跑」是运行态，两个不同的东西。
+                 这里只**显示**运行态，网页不再提供"切过去"的按钮 —— 运行态由
+                 动作触发（键盘上按 MA/MB，或全局功能键里配的 SW: 动作），
+                 不走配置通道。
+
+                 为什么曾经出过事：curr_prof 原来在固件 CFG_FIELDS 里，和
+                 disp_mode/brightness 一样是"配置项"，网页 cfgDiffPatch()
+                 自然地把它一起求差、一起下发。于是页面上任何一次保存
+                 （改亮度、存映射、存宏）都可能顺手把方案切走 ——
+                 "配了 macOS 映射却一直按 Windows 规则走"，页面上毫无异常。
+                 现在固件已把 curr_prof 摘出配置表，网页只能读、不能写。 -->
             <div style="margin-top: 10px; padding: 8px 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #38bdf8;">
                 <div style="font-size: 13px; color: #94a3b8;">
                     键盘当前正在跑：<b id="runningProfileName" style="color: #4ade80;">—</b>
                     <span id="runningProfileEditHint" style="color: #fbbf24;"></span>
                 </div>
-                <button id="switchRunningProfileBtn" type="button"
-                        style="margin-top: 8px; padding: 6px 14px; background: #0ea5e9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
-                    🔀 把键盘切到「<span id="switchTargetName">Windows</span>」
-                </button>
                 <div class="hint" style="margin-top: 6px;">
-                    映射是<b>按运行态</b>查表的：键盘跑哪个系统，就用哪个系统的那份映射。
-                    所以配完 macOS 的映射后要点这个按钮（或去键盘上按 MA/MB）切过去，否则按键仍然走 Windows 的规则。
+                    映射<b>按运行态</b>查表：键盘跑哪个系统就用哪份映射。改这里的配置
+                    <b>不会</b>切换键盘当前跑的方案 —— 要切，去键盘上按 <b>MA/MB</b>，
+                    或用「全局功能键」里给 M1~M12 配的「切换方案」动作。
                 </div>
             </div>
         </div>
@@ -1750,8 +1753,8 @@
             // ⚠⚠ curr_prof 必须排除,它**不是**"这一项配置",而是"键盘此刻在跑
             //   哪个方案"这个**运行态**。它混在普通标量里求差的后果是:
             //   页面上任何一次保存(改亮度、存映射、存宏)只要发现它和本地
-            //   cfgModel.curr_prof 不一致,就会顺手把它下发,固件那边
-            //   CFG_FIELDS → CFG_PEND_PROF → switchProfile() 立刻切方案。
+            //   cfgModel.curr_prof 不一致,就会顺手把它下发,固件那边立刻
+            //   switchProfile() 切方案。
             //
             //   现场表现(踩过一整轮):
             //     按 MA 切到 macOS → 网页配 mac 映射 → 点保存
@@ -1760,8 +1763,12 @@
             //   尤其没点过「📥 从键盘拉取」时,cfgModel.curr_prof 还是声明
             //   初值 0,于是**每一次**保存都在把方案按回 Windows。
             //
-            //   运行态只有一个合法改法:用户显式点「切到该系统」,见
-            //   cfgPushRunningProfile()。别让隐式求差碰它。
+            //   根因是固件那边 curr_prof 曾经混在 CFG_FIELDS 里(和 disp_mode
+            //   /brightness 同表),配置层和运行态没分家。现已从那张表摘掉,
+            //   网页这边这行是**第二道保险** —— 即使将来配置里又冒出别的东西,
+            //   运行态也不会被隐式求差捎走。
+            //   curr_prof 现在只读不写:切换方案靠键盘上的 MA/MB,或全局功能键
+            //   里配的 SW: 动作(那是动作触发,不是配置)。
             if (k === 'curr_prof') continue;
             const o = oldM[k];
             if (o === v) continue;
@@ -1818,51 +1825,6 @@
         cfgModelToTextbox();
         cfgFillForms();
         await cfgRefreshAllLists();
-    }
-
-    // 显式切换键盘的运行方案（curr_prof）。
-    //
-    // 这是 curr_prof 现在**唯一**的合法改法。cfgDiffPatch() 已经把它排除在
-    // 自动求差之外（见那里的大段注释），所以日常保存不会再碰运行态。
-    // 用户想换方案，就点这个按钮 —— 一次只发这一个键，语义单一，不会
-    // 顺带把别的东西捎上。
-    //
-    // ⚠ 走的是 CFGPATCH 而不是 GSET: 之类的老指令：curr_prof 在固件那边是
-    //   CFG_FIELDS 里的一项（见 lvgl_s3.ino CFG_FIELDS），必须走配置通道
-    //   才会触发 CFG_PEND_PROF → switchProfile() → 刷新顶部条图标。
-    async function cfgPushRunningProfile(prof) {
-        if (!myCharacteristic) { alert("请先连接蓝牙！"); return false; }
-        const p = Number(prof);
-        if (!(p >= 0 && p < CFG_PROFILES.length)) {
-            cfgSetStatus(`方案号 ${prof} 不合法`, "#f87171");
-            return false;
-        }
-        // 已经是当前运行态就别发：NVS 只增不减，白写是在缩短它的寿命。
-        if (cfgModel.curr_prof === p) {
-            cfgSetStatus(`键盘已经在跑 ${CFG_PROFILE_LABEL[CFG_PROFILES[p]]}，没有要切换的`, "#94a3b8");
-            return true;
-        }
-        const payload = JSON.stringify({ curr_prof: p });
-        cfgSetStatus(`正在切换到 ${CFG_PROFILE_LABEL[CFG_PROFILES[p]]}…`, "#38bdf8");
-        if (!await sendBLE("CFGPATCH:" + payload.length)) {
-            cfgSetStatus("CFGPATCH 没发出去，蓝牙可能断了", "#f87171");
-            return false;
-        }
-        await sendBLE("CFGDATA:" + payload);
-        BtLink._lastSendErr = null;
-        const reply = await BtLink.call("CFGSAVE", "CFGPATCHEND", 10000);
-        if (reply === null) {
-            cfgSetStatus("没等到固件回应，方案**可能已经切过去了**（可拉取确认）", "#fbbf24");
-            return false;
-        }
-        if (!reply.startsWith("OK:")) {
-            cfgSetStatus("固件拒绝：" + reply.slice(4), "#f87171");
-            return false;
-        }
-        // 本地模型跟上真实运行态，否则下一次求差又会拿初值 0 去比。
-        cfgModel.curr_prof = p;
-        cfgSetStatus(`已切换到 ${CFG_PROFILE_LABEL[CFG_PROFILES[p]]}`, "#4ade80");
-        return true;
     }
 
     // 改模型 → 发回键盘（单控件走增量补丁，"保存整份 JSON"走全量）→ 成功后刷新
@@ -2263,12 +2225,14 @@
     // 历史 bug 的教训：页面上只有一个下拉，用户选了 macOS 就以为键盘也在跑
     // macOS，实际上编辑目标从不改变运行态 —— 结果"mac 映射配了但按键一直走
     // Windows 规则"，而页面上没有任何异常迹象。
+    //
+    // ⚠ curr_prof 现在是**只读**的：固件把它摘出 CFG_FIELDS，回读时单独补发
+    //   （见固件 cfgBuildJson），但配置通道不再接受它。所以这里只显示、绝不
+    //   下发；切换方案只能去键盘上按 MA/MB 或用全局功能键的 SW: 动作。
     function refreshRunningProfile() {
         const runName = document.getElementById('runningProfileName');
         const editHint = document.getElementById('runningProfileEditHint');
-        const btn = document.getElementById('switchRunningProfileBtn');
-        const target = document.getElementById('switchTargetName');
-        if (!runName || !btn) return;
+        if (!runName) return;
 
         const sel = document.getElementById('activeProfile');
         const editProf = Number(sel ? sel.value : 0);
@@ -2277,16 +2241,14 @@
 
         const valid = runProf >= 0 && runProf < CFG_PROFILES.length;
         runName.textContent = valid ? label(runProf) : '未知（未拉取配置）';
-        target.textContent = label(editProf);
 
         if (valid && runProf !== editProf) {
             // 正在编辑的和正在跑的不是同一个 —— 这正是"配了却不生效"的状态，
             // 必须显眼地提示，否则用户只会怀疑自己配错了。
-            editHint.textContent = `　⚠ 你正在编辑 ${label(editProf)}，但键盘跑的是 ${label(runProf)} —— 改完要点下面的按钮切过去才生效`;
+            editHint.textContent = `　⚠ 你正在编辑 ${label(editProf)}，但键盘跑的是 ${label(runProf)} —— 改完记得去键盘上按 MA/MB 切过去`;
         } else {
             editHint.textContent = '';
         }
-        btn.disabled = false;
     }
 
     // ========== 1. ME 键文本（存盘，按 ME 键才发） ==========
@@ -2515,16 +2477,6 @@
         alert(n
             ? `已从键盘读回方案 ${Number(prof) + 1} 的 ${n} 条映射（整份配置已同步到页面）。`
             : `方案 ${Number(prof) + 1} 在键盘上确实没有任何映射规则。`);
-    });
-
-    // 把键盘切到「正在编辑」的那个系统。
-    //
-    // 这是 curr_prof 唯一的显式入口 —— cfgDiffPatch / 全量保存都已经不再捎带它
-    // （见那两处的注释）。点一下就只发 curr_prof 这一个键，不动别的配置。
-    document.getElementById('switchRunningProfileBtn').addEventListener('click', async () => {
-        const prof = Number(document.getElementById('activeProfile').value);
-        const ok = await cfgPushRunningProfile(prof);
-        if (ok) refreshRunningProfile();
     });
 
     // 切宏键:从 cache 加载该键的宏（切方案的那个监听器在上面，已合并）

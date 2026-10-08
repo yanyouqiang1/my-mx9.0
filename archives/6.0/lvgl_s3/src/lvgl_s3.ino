@@ -264,7 +264,8 @@ static uint32_t epochCache = 0;
 // loop 里，一轮只做一件**，中间让键盘扫描、LVGL、看门狗都轮得到。
 #define CFG_PEND_CLOCK   0x01
 #define CFG_PEND_DISP    0x02
-#define CFG_PEND_PROF    0x04
+// ⚠ 原来还有 CFG_PEND_PROF 0x04。curr_prof 摘出 CFG_FIELDS 之后已经没人
+//   置它了，位也空出来留给下一个。方案切换的 UI 刷新归 switchProfile() 自己管。
 #define CFG_PEND_SAVER   0x08
 static uint8_t cfgPend = 0;
 
@@ -7390,8 +7391,12 @@ enum CfgPost : uint8_t {
     CFG_POST_NONE = 0,
     CFG_POST_DISP,     // 显示风格：主屏要整屏重建
     CFG_POST_SAVER,    // 屏保风格：正在屏保时要拆/建屏
-    CFG_POST_PROF,     // 当前方案：顶部条的序号和图标要跟上
     CFG_POST_CLOCK,    // 时间：立刻 settimeofday
+    // ⚠ 原来这里有 CFG_POST_PROF（"当前方案：顶部条要跟上"）。curr_prof 摘出
+    //   CFG_FIELDS 之后**没有任何字段引用它**了，留着就是一条走不到的死码 ——
+    //   而更糟的是它暗示"配置层能改运行态"，正是这次 bug 的病根。
+    //   方案切换后的 UI 刷新由 switchProfile() 自己负责（它末尾就调
+    //   updateTopBarProfile()），不依赖配置通道。
 };
 
 struct CfgField {
@@ -7407,10 +7412,30 @@ struct CfgField {
 //   today_key / today_y —— 每日按键计数，跟着用键涨，属于运行状态不是设置
 //   boot_cnt / elog_fs / nvs_probe —— 内部记账
 //   set_epoch            —— 含了，但它是"时间"这个**设置**，算
+//
+// ⚠⚠ curr_prof 也**不在**这张表里了（原来在，2026-10 摘掉）。它曾经和
+//   disp_mode / brightness 摆在一起，于是网页 cfgDiffPatch() 把它当普通
+//   配置项一起求差 —— 页面上任何一次保存（改亮度、存映射、存宏）只要
+//   发现它和网页本地值不一致，就顺手把它下发，固件这边 switchProfile()
+//   立刻切方案。现场表现是"配了 macOS 映射，按键却一直走 Windows 规则，
+//   而且怎么切都切不过去"，而页面上看不出任何异常。
+//
+//   摘掉之后，配置层和运行态彻底分家：
+//     · 配置层 = windows/mac 两块 remap + gkeys（MA/MB/M1-M12 的动作定义）
+//       ——纯数据，改它不影响当前跑哪个方案
+//     · 运行态 = currentProfile，只由 switchProfile() 改，而 switchProfile()
+//       只有两个调用方：宏动作（SW: 段，见 executeGlobalKey/executeToggleKey）
+//       和菜单里的「切换配置方案」
+//   两者的唯一交集是 getMappedKey() 读 profileRemaps[currentProfile] ——
+//   那是一次**读**，不是一个写。
+//
+//   运行态仍然要跨重启保留（用户要求），所以它照旧写 NVS 的 curr_prof、
+//   开机照旧从 NVS 恢复（见 setup 里那段钳位）。只是**不再经过配置通道**：
+//   网页整份 JSON 里就算手写了 curr_prof 也不再被应用（见 cfgApplyDoc
+//   对"未知键"那条分支的处理），要切方案请走 MA/MB 或全局功能键。
 static const CfgField CFG_FIELDS[] = {
     { "disp_mode",   CFG_U8,   &currentDispMode,  0, TOTAL_DISP_MODES - 1, "disp_mode",   CFG_POST_DISP  },
     { "saver_mode",  CFG_U8,   &saverMode,        0, TOTAL_SAVER_MODES - 1,"saver_mode",  CFG_POST_SAVER },
-    { "curr_prof",   CFG_U8,   &currentProfile,   0, TOTAL_PROFILES - 1,   "curr_prof",   CFG_POST_PROF  },
     { "light_on",    CFG_BOOL, &lightOn,          0, 1,                    "light_on",    CFG_POST_NONE  },
     { "brightness",  CFG_U8,   &brightness,       0, 255,                  "brightness",  CFG_POST_NONE  },
     { "effect",      CFG_U8,   &currentEffect,    0, MAX_EFFECTS - 1,      "effect",      CFG_POST_NONE  },
@@ -7719,6 +7744,18 @@ static size_t cfgBuildJson(char* out, size_t cap) {
             case CFG_U32:  doc[f.key] = *(uint32_t*)f.var;   break;
         }
     }
+
+    // ---- curr_prof：**只读上报**，不是可写配置 ----
+    //
+    // 它已经从 CFG_FIELDS 里摘掉了（见那张表的注释），但网页仍然需要知道
+    // "键盘此刻在跑哪个方案" —— 否则用户配完 macOS 的映射，看不出还没切
+    // 过去，只会怀疑自己配错了。所以这里单独补一个**只读**字段。
+    //
+    // ⚠ 只出不收：cfgApplyDoc 那边遍历的是 CFG_FIELDS，curr_prof 不在里面，
+    //   所以 JSON 里就算手写 curr_prof 也不会被应用（落进"未知键忽略"那条
+    //   分支）。方向是单向的：固件 → 网页 有，网页 → 固件 无。
+    //   切方案只能靠 MA/MB 或全局功能键的动作（SW: 段）。
+    doc["curr_prof"] = currentProfile;
 
     // ---- 每个方案一个对象：CFG_PROF_NAMES[p] = { "remap": [...], "macros": {...} } ----
     //
@@ -8363,7 +8400,6 @@ for (int i = 0; i < nPend; i++) {
     switch (f->post) {
         case CFG_POST_CLOCK: pendMask |= CFG_PEND_CLOCK; break;
         case CFG_POST_DISP:  pendMask |= CFG_PEND_DISP;  break;
-        case CFG_POST_PROF:  pendMask |= CFG_PEND_PROF;  break;
         case CFG_POST_SAVER: pendMask |= CFG_PEND_SAVER; break;
         case CFG_POST_NONE:
         default: break;
@@ -8398,10 +8434,6 @@ static void cfgPostPump(void) {
         unsigned long t0 = millis();
         applyDispMode(currentDispMode);
         ELINFO("CFG", "显示风格重建用了 %lums", (unsigned long)(millis() - t0));
-    }
-    else if (cfgPend & CFG_PEND_PROF) {
-        cfgPend &= ~CFG_PEND_PROF;
-        switchProfile(currentProfile);
     }
     else if (cfgPend & CFG_PEND_SAVER) {
         cfgPend &= ~CFG_PEND_SAVER;
