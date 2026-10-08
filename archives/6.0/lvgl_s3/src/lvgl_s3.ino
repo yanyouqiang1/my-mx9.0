@@ -572,11 +572,29 @@ static lv_obj_t* scr_notif = nullptr;
 #define NUM_COLS 16
 #define DEBOUNCE_DELAY 20
 static const uint8_t rowPins[NUM_ROWS] = { 1, 2, 42, 41, 40, 39, 38, 47, 21, 12 };
+// keebMatrix = **已确认**的稳定状态（只有消抖通过才写这里）。
 static bool keebMatrix[NUM_ROWS][NUM_COLS] = {0};
+// 消抖用的候选状态 + 它"第一次被读到"的时刻。
+//
+// ⚠ 之前这里是 lastDebounceTime[]，只有一个时间戳，写法是
+//   `状态和稳定态不同 && 距上次认账 > 20ms → 直接认账`。
+//   这**不是消抖，是给状态翻转限速**：它不要求新状态先稳定下来。
+//   于是机械抖动会这样穿透（时间轴在下面 KEYS DEBOUNCE 注释里）：
+//     t=0    按下        → 认账，keeb=true  → 发一次 press（正常）
+//     t=25   抖动断开   → 距上次认账 >20ms → **认账**，keeb=false → 发一次 release
+//     t=30   触点重新闭合，但距上次认账才 5ms → 不认账，keeb 停在 false
+//     t=45   键**还按着**，raw 仍是 true 而 keeb 是 false → 又满足条件 → 再发一次 press
+//   用户物理上只按了一次，主机却收到 press/release/press，表现为"有时打两下"。
+//   空格尤其明显：键帽最大、行程最长、触点面积最大，抖动时间天然比别键久。
+//
+// 现在是标准三态消抖：raw → cand（候选，带起始时刻）→ 稳定态。
+// 候选必须**连续保持满 DEBOUNCE_DELAY** 才提升为稳定态，中途抖回去就重新计时，
+// 于是任何短于 DEBOUNCE_DELAY 的抖动都被整个吃掉，一次按下只可能认账一次。
+static bool debounceCand[NUM_ROWS][NUM_COLS] = {0};
+static unsigned long debounceCandMs[NUM_ROWS][NUM_COLS] = {0};
 // 记录这颗键"按下时是否真的发给过主机"，松键时据此决定要不要补一个 release。
 // 没有它的话，菜单里按 ESC 这类被界面吞掉的键会在松手时给主机发一个无头的 release。
 static bool hostKeyHeld[NUM_ROWS][NUM_COLS] = {0};
-static unsigned long lastDebounceTime[NUM_ROWS][NUM_COLS] = {0};
 static uint32_t totalKeyCount = 0;
 static uint16_t baseMatrix[NUM_ROWS][NUM_COLS] = { 0 };
 static bool fnPressed = false;
@@ -7003,307 +7021,320 @@ static void scanKeyboardMatrix(void) {
 
         for (int r = 0; r < NUM_ROWS; r++) {
             bool currentState = (digitalRead(rowPins[r]) == LOW);
-            if (currentState != keebMatrix[r][c]) {
-                if (millis() - lastDebounceTime[r][c] > DEBOUNCE_DELAY) {
-                    lastDebounceTime[r][c] = millis();
-                    keebMatrix[r][c] = currentState;
 
-                    uint16_t baseKey = baseMatrix[r][c];
-                    if (baseKey == 0) continue;
+            // ---- 三态消抖：raw → cand（带起始时刻）→ 稳定态 keebMatrix ----
+            //
+            // 关键点是"**连续保持**"而不是"距上次认账够久"：
+            //  · 读到和稳定态不同的状态 → 记成候选并盖上时刻（不管它是什么）
+            //  · 候选和稳定态一致 → 用的是上次那个时刻，不会被刷新
+            //    （每拍重新盖时间戳的话就是"每拍都重新等 20ms"，永远认不了账）
+            //  · 候选连续保持满 DEBOUNCE_DELAY → 才提升为稳定态，下面分发只跑一次
+            //
+            // 只有稳定态**真的翻转**时才进分发，所以一次物理按下最多产生一次 press，
+            // 抖动无论多长都进不来（它总是把候选改回去，重置计时）。
+            if (currentState != debounceCand[r][c]) {
+                debounceCand[r][c]   = currentState;
+                debounceCandMs[r][c] = millis();
+            }
+            else if (currentState != keebMatrix[r][c]
+                     && millis() - debounceCandMs[r][c] >= DEBOUNCE_DELAY) {
+                keebMatrix[r][c] = currentState;
 
-                    // 现场记录：记下这一刻的阶段和键码。
-                    // 「按某个键就崩」这类问题靠 panic 回溯很难对上号，
-                    // 但只要开机 HUD 能报出"上次死在 按键分发，键 XXX"，
-                    // 就能直接拿这个键去复现。
-                    ct_mark(CT_S_SCAN_KEY);
-                    ct_key(baseKey);
-                    ct_set_ctx(currentSysMode, currentDispMode);
+                uint16_t baseKey = baseMatrix[r][c];
+                if (baseKey == 0) continue;
 
-                    if (currentState) {
-                        // 按键按下
-                        totalKeyCount++;
-                        lastActivityTime = millis();
+                // 现场记录：记下这一刻的阶段和键码。
+                // 「按某个键就崩」这类问题靠 panic 回溯很难对上号，
+                // 但只要开机 HUD 能报出"上次死在 按键分发，键 XXX"，
+                // 就能直接拿这个键去复现。
+                ct_mark(CT_S_SCAN_KEY);
+                ct_key(baseKey);
+                ct_set_ctx(currentSysMode, currentDispMode);
 
-                        // ---- B-1 仪表盘：累计 KPM（写入环形缓冲当前秒）和 TODAY ----
-                        // KPM：当前秒的落键数 +1。每次落键时都加，最后由 updateKpmRing()
-                        // 推进到下一格（按 wall-clock 自动）。
-                        kpmRing[kpmRingHead]++;
+                if (currentState) {
+                    // 按键按下
+                    totalKeyCount++;
+                    lastActivityTime = millis();
 
-                        // TODAY：按本地时区的"日"判断。首次开机 lastTodayDate=-1 → 直接
-                        // 把当前日数记下来；后续跨日即清零。NTP 校时（设置/启动）会触
-                        // 同样的检查路径。
-                        {
-                            time_t nowT = time(nullptr);
-                            struct tm tmNow;
-                            if (localtime_r(&nowT, &tmNow)) {
-                                int ymd = (tmNow.tm_year + 1900) * 10000
-                                        + (tmNow.tm_mon + 1) * 100
-                                        + tmNow.tm_mday;
-                                if (todayDateYmd < 0) {
-                                    todayDateYmd = ymd;
-                                } else if (ymd != todayDateYmd) {
-                                    todayKeyCount = 0;
-                                    todayDateYmd  = ymd;
-                                    preferences.putUInt("today_key", 0);
-                                    preferences.putUInt("today_y", (uint32_t)ymd);
-                                }
-                                todayKeyCount++;
-                            }
-                        }
+                    // ---- B-1 仪表盘：累计 KPM（写入环形缓冲当前秒）和 TODAY ----
+                    // KPM：当前秒的落键数 +1。每次落键时都加，最后由 updateKpmRing()
+                    // 推进到下一格（按 wall-clock 自动）。
+                    kpmRing[kpmRingHead]++;
 
-                        // 按键灯效：任何键都算，包括界面态里的菜单导航和宏键 ——
-                        // 界面里按方向键也该有反馈，不然会以为没按上。
-                        // 这里只置状态，真正的绘制在 20ms 的灯效节拍里做。
-                        triggerKeyReaction();
-
-                        // 唤醒
-                        if (currentSysMode == SYS_MODE_SLEEP) {
-                            gotoMainScreen();
-                        }
-
-                        // ================= 按键分发 =================
-                        // 顺序必须和 s3.ino 原版一致：界面态（菜单 → 设置 → 录制）
-                        // 先接管，K_MC 放最后。原来 K_MC 排在整条链的最前面，
-                        // 于是"在菜单里再按一次 MC"会命中它 → menuSel 归零 + 重新
-                        // build_menu()，视觉上等于没反应，永远出不去。
-                        // 原版里 K_MC 在界面态的语义是"退出"，只有回到主界面才是"进入菜单"。
-                        const bool inRecMode = (currentSysMode == SYS_MODE_REC_SEQ
-                                                || currentSysMode == SYS_MODE_REC_CMB);
-                        const bool inElogMode = (currentSysMode == SYS_MODE_ELOG);
-                        const bool inUiMode = (currentSysMode == SYS_MODE_MENU)
-                                              || IS_SETTING_MODE(currentSysMode)
-                                              || inRecMode
-                                              || inElogMode;
-
-                        // 宠物页**故意不在** inUiMode 里：那个分支会把按键吃干净、
-                        // 一律不发主机，进去就一个字都打不出来。宠物页要的是
-                        // 矩阵键照常发主机、宠物只作反应。
-                        //
-                        // 但 ESC 得有个说法：不管当前是什么界面，按 ESC 都先
-                        // 回到主屏（这是全键盘通用的逃生出口）。否则宠物页在
-                        // 场时按 ESC 会被当成普通字符发给主机，主机那边收到一个
-                        // 莫名其妙的 ESC —— 而这里又不能简单地"因为不在界面态就
-                        // 照常发"，那和"宠物页是全屏页面"的事实矛盾。
-                        if (currentSysMode == SYS_MODE_PET && baseKey == 0x29 /* ESC */) {
-                            petExitFull();
-                            hostKeyHeld[r][c] = false;   // 这键没发过 press，别补 release
-                            continue;
-                        }
-
-                        if (inUiMode) {
-                            // ---- 界面态：这一整块把按键吃干净，一律不发到主机 ----
-
-                            // 错误日志页：上下翻 / DEL 清空 / ESC 回菜单。
-                            // 必须排在菜单分支**之前**判断吗？不必 —— SYS_MODE_ELOG
-                            // 和 SYS_MODE_MENU 是互斥的 currentSysMode，顺序无所谓，
-                            // 但放在最前面读起来更清楚。
-                            if (inElogMode) {
-                                elogKey(baseKey);
+                    // TODAY：按本地时区的"日"判断。首次开机 lastTodayDate=-1 → 直接
+                    // 把当前日数记下来；后续跨日即清零。NTP 校时（设置/启动）会触
+                    // 同样的检查路径。
+                    {
+                        time_t nowT = time(nullptr);
+                        struct tm tmNow;
+                        if (localtime_r(&nowT, &tmNow)) {
+                            int ymd = (tmNow.tm_year + 1900) * 10000
+                                    + (tmNow.tm_mon + 1) * 100
+                                    + tmNow.tm_mday;
+                            if (todayDateYmd < 0) {
+                                todayDateYmd = ymd;
+                            } else if (ymd != todayDateYmd) {
+                                todayKeyCount = 0;
+                                todayDateYmd  = ymd;
+                                preferences.putUInt("today_key", 0);
+                                preferences.putUInt("today_y", (uint32_t)ymd);
                             }
-                            // 菜单（两级）：方向键移动 / 回车进组或执行 / ESC·MC 逐级退回
-                            // 二级里 ESC 是"回一级"而不是直接退出 —— 两级菜单必须能往回走，
-                            // 否则进了一个组就只能一路 ESC 到底才知道自己在哪。
-                            else if (currentSysMode == SYS_MODE_MENU) {
-                                uint8_t rows = menuInSub ? curMenuGroup()->count : MENU_GROUP_COUNT;
-                                uint8_t& sel = menuInSub ? menuItemSel : menuSel;
-                                if (baseKey == KEY_DOWN_ARROW || baseKey == KEY_RIGHT_ARROW) {
-                                    sel = (uint8_t)((sel + 1) % rows);
-                                    build_menu();
-                                } else if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
-                                    sel = (uint8_t)((sel + rows - 1) % rows);
-                                    build_menu();
-                                } else if (baseKey == KEY_RETURN) {
-                                    handleMenuSelect();
-                                } else if (baseKey == KEY_ESC || baseKey == K_MC) {
-                                    if (menuInSub) {
-                                        menuInSub = false;   // 二级 → 回一级
-                                        menuScrollOffset = 0;
-                                        build_menu();
-                                    } else {
-                                        gotoMainScreen();
-                                    }
-                                }
-                            }
-                            // 设置子界面：左右切字段 / 上下调值 / 回车保存 / ESC·MC 取消
-                            else if (IS_SETTING_MODE(currentSysMode)) {
-                                if (baseKey == KEY_LEFT_ARROW) moveSettingField(-1);
-                                else if (baseKey == KEY_RIGHT_ARROW) moveSettingField(1);
-                                else if (baseKey == KEY_UP_ARROW) adjustSettingField(1);
-                                else if (baseKey == KEY_DOWN_ARROW) adjustSettingField(-1);
-                                else if (baseKey == KEY_RETURN) {
-                                    // 倒计时那一屏的回车是"启停"，不是"保存" ——
-                                    // 页面上那颗开始/停止按钮就是这么标的（见
-                                    // toggleCountdownFromKeyboard 的注释）
-                                    if (currentSysMode == SYS_MODE_SET_TIMER) toggleCountdownFromKeyboard();
-                                    else saveSettingScreen();
-                                }
-                                else if (baseKey == KEY_ESC || baseKey == K_MC) cancelSettingScreen();
-                            }
-                            // 宏录制：M1-M12 保存 / MR 走三段 / ESC·MC 取消 / 其余记进键流
-                            else {
-                                if (baseKey == K_MC || baseKey == KEY_ESC) {
-                                    cancelRecording();
-                                } else if (baseKey >= K_M1 && baseKey <= K_M12) {
-                                    finishMacroRecording(getMacroNameByCode(baseKey));
-                                } else if (baseKey == K_MR) {
-                                    // 三段：连续输入 → 组合键 → 取消
-                                    advanceRecordingStage();
-                                } else if (baseKey == K_FN) {
-                                    fnPressed = true;   // 录制中也得能识别 Fn 修饰
-                                } else if (baseKey < MACRO_BASE
-                                           && baseKey != K_MA && baseKey != K_MB
-                                           && baseKey != K_ME) {
-                                    if (recKeyCount < MAX_REC_KEYS) {
-                                        recKeyBuffer[recKeyCount++] = baseKey;
-                                        update_recording_display();
-                                    }
-                                }
-                            }
-                        }
-                        // ---- 主界面：普通键盘 + 功能键 ----
-                        else {
-                            // Fn 键
-                            if (baseKey == K_FN) {
-                                fnPressed = true;
-                            }
-                            // MC 进入菜单
-                            else if (baseKey == K_MC) {
-                                currentSysMode = SYS_MODE_MENU;
-                                // 每次进来都从一级大类列表开始。上一轮如果停在二级
-                                // （menuInSub=true），不重置的话 build_menu() 会照着
-                                // 那个层级渲染，用户按 MC 想"回到主菜单再进来"，
-                                // 结果直接落在某个具体项上，看着像按了没反应。
-                                menuSel = 0;
-                                menuItemSel = 0;
-                                menuInSub = false;
-                                menuScrollOffset = 0;
-                                menuNeedsRebuild = true;
-                                // 不再弹"系统菜单/请选择功能"HUD：菜单本身就是提示，
-                                // 每次进菜单都闪一次只是噪音，还压住菜单第一屏。
-
-                            }
-                            // MA / MB 全局键(双状态切换版本):
-                            // 每次按下在「状态 A ↔ 状态 B」之间翻,执行对应那套。
-                            // 配过任意一套就走新路径;两套都没配才走老的单套兜底(见 executeToggleKey)。
-                            else if (baseKey == K_MA) {
-                                executeToggleKey("MA");
-                            }
-                            else if (baseKey == K_MB) {
-                                executeToggleKey("MB");
-                            }
-                            // MR 键：第一次按 = 进入"连续输入"录制（必须排在 >= MACRO_BASE 之前）
-                            else if (baseKey == K_MR) {
-                                enterRecording();
-                            }
-                            // 宏按键
-                            // 小键盘整片（0xDB~0xEB，含 0xE2=小键盘 2）都不在这里拦，
-                            // 全部落到最后的"普通键盘"分支走 kbPress —— 这是对的。
-                            // 静音键在 C3 上（BTN:MUTE），别在这儿加分支。
-                            else if (baseKey >= MACRO_BASE) {
-                                if (baseKey == K_LOGO) {
-                                    // LOGO 现在要区分长按（进/退宠物页）和短按
-                                    // （切主屏风格），所以动作**从按下挪到松手**。
-                                    // 按下只记时刻；松手时没触发过长按才算短按。
-                                    // ⚠️ Fn+LOGO 的重启保持"按下即执行"，不受影响 ——
-                                    //    它是唯一一个要求"按下就有反应"的组合键。
-                                    if (fnPressed) {
-                                        triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
-                                        pendingRestartMs = millis() + 600;
-                                    } else {
-                                        logoIsDown = true;
-                                        logoDownMs = millis();
-                                        logoHoldFired = false;
-                                    }
-                                } else if (baseKey == K_PLAY) {
-                                    if (fnPressed) {
-                                        SystemControl.press(SYSTEM_CONTROL_STANDBY);
-                                        SystemControl.release();
-                                    } else {
-                                        ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
-                                        mediaPlaying = !mediaPlaying;
-                                        triggerHud("媒体播放", mediaPlaying ? "播放" : "暂停",
-                                            lv_color_hex(CLR_GREEN));
-                                    }
-                                } else if (baseKey == K_NEXT) {
-                                    if (!fnPressed) {
-                                        ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
-                                        mediaPlaying = true;
-                                        triggerHud("媒体播放", "下一曲", lv_color_hex(CLR_ACCENT));
-                                    }
-                                } else if (baseKey == K_PREV) {
-                                    if (!fnPressed) {
-                                        ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
-                                        mediaPlaying = true;
-                                        triggerHud("媒体播放", "上一曲", lv_color_hex(CLR_ACCENT));
-                                    }
-                                } else {
-                                    String macroName = getMacroNameByCode(baseKey);
-                                    if (baseKey >= K_M1 && baseKey <= K_M12) {
-                                        executeGlobalKey(macroName);
-                                    }
-                                    executeMacro(macroName);
-                                }
-                            }
-                            else {
-                                uint16_t mappedKey = getMappedKey(baseKey);
-                                // 最近按键显示：走 getKeyName，空格显示 "Space" 而不是 "20"
-                                snprintf(lastKeyPressed, sizeof(lastKeyPressed), "%s", getKeyName(baseKey));
-                                // 触发律动效果：峰值柱 + 两侧余晖（pulseRhythm 里定义波形的形状）
-                                pulseRhythm();
-                                hostKeyHeld[r][c] = true;
-                                // Caps Lock 本地兜底：USB HID LED 事件（ARDUINO_USB_HID_KEYBOARD_LED_EVENT）
-                                // 在某些主机 / 复合 HID 接口下根本不来，靠它就完全无反应。
-                                // 按下 KEY_CAPS_LOCK 这一刻我们已经知道"用户想翻转大写"，
-                                // 本地先翻一次让屏/灯立刻跟上，host 那边返回的 LED 报告就算延迟、
-                                // 不来、或者延后很多帧，最终也是同一个值，不会冲突。
-                                // Num/Scroll 没有物理按键，仍只能等 LED 报告。
-                                if (baseKey == KEY_CAPS_LOCK) {
-                                    capsLock = !capsLock;
-                                    lockStateDirty = true;
-                                }
-                                // [DEBUG a→9] 临时诊断:确认 baseKey 和 remap 后实际送 kbPress 的码点
-                            LOG_PORT.printf("[KB] base=0x%04X mapped=0x%04X cnt=%d\n",
-                                baseKey, mappedKey, remapCounts[currentProfile]);
-                            // 强制重置节流,确保 kbPress 里那条 [KB] press code=... 不会被吞掉。
-                            // 按键两条日志挨着(<1ms),正常 100ms 节流会把第二条丢了,
-                            // 那样就看不到 kbPress 走哪个分支,定位就缺一半证据。
-                            btLinkStreamResetThrottle();
-                            kbPress((uint8_t)mappedKey);
-                            }
-                        }
-                    } else {
-                        // 按键释放
-                        if (baseKey == K_FN) {
-                            fnPressed = false;
-                        }
-                        else if (baseKey >= MACRO_BASE) {
-                            // 消费级键松开才发 release。
-                            // LOGO 的短按动作在"松手"时补做（因为要区分长按）；
-                            // 长按已经由 scanKeyboardMatrix 开头的判定处理过了。
-                            if (baseKey == K_LOGO) {
-                                logoIsDown = false;
-                                if (!logoHoldFired) {
-                                    if (petScene == SCENE_FULL) petExitFull();
-                                    else if (petScene == SCENE_PEEK) { /* 吞掉：不切风格 */ }
-                                    else cycleDisplayStyle();
-                                }
-                                logoHoldFired = false;
-                            }
-                            // PLAY/NEXT/PREV 的 Consumer 松键照旧
-                            if (baseKey == K_PLAY || baseKey == K_NEXT || baseKey == K_PREV) {
-                                ConsumerControl.release();
-                            }
-                        }
-                        else if (hostKeyHeld[r][c]) {
-                            // 只有"按下时确实发给过主机"的键才需要补一个松键。
-                            // 界面态里被吞掉的键（菜单导航、ESC、设置字段…）按下时没发过
-                            // press，这里再发 release 就会给主机一个无头的松键事件。
-                            hostKeyHeld[r][c] = false;
-                            uint16_t mappedKey = getMappedKey(baseKey);
-                            kbRelease((uint8_t)mappedKey);
+                            todayKeyCount++;
                         }
                     }
-                }
+
+                    // 按键灯效：任何键都算，包括界面态里的菜单导航和宏键 ——
+                    // 界面里按方向键也该有反馈，不然会以为没按上。
+                    // 这里只置状态，真正的绘制在 20ms 的灯效节拍里做。
+                    triggerKeyReaction();
+
+                    // 唤醒
+                    if (currentSysMode == SYS_MODE_SLEEP) {
+                        gotoMainScreen();
+                    }
+
+                    // ================= 按键分发 =================
+                    // 顺序必须和 s3.ino 原版一致：界面态（菜单 → 设置 → 录制）
+                    // 先接管，K_MC 放最后。原来 K_MC 排在整条链的最前面，
+                    // 于是"在菜单里再按一次 MC"会命中它 → menuSel 归零 + 重新
+                    // build_menu()，视觉上等于没反应，永远出不去。
+                    // 原版里 K_MC 在界面态的语义是"退出"，只有回到主界面才是"进入菜单"。
+                    const bool inRecMode = (currentSysMode == SYS_MODE_REC_SEQ
+                                            || currentSysMode == SYS_MODE_REC_CMB);
+                    const bool inElogMode = (currentSysMode == SYS_MODE_ELOG);
+                    const bool inUiMode = (currentSysMode == SYS_MODE_MENU)
+                                          || IS_SETTING_MODE(currentSysMode)
+                                          || inRecMode
+                                          || inElogMode;
+
+                    // 宠物页**故意不在** inUiMode 里：那个分支会把按键吃干净、
+                    // 一律不发主机，进去就一个字都打不出来。宠物页要的是
+                    // 矩阵键照常发主机、宠物只作反应。
+                    //
+                    // 但 ESC 得有个说法：不管当前是什么界面，按 ESC 都先
+                    // 回到主屏（这是全键盘通用的逃生出口）。否则宠物页在
+                    // 场时按 ESC 会被当成普通字符发给主机，主机那边收到一个
+                    // 莫名其妙的 ESC —— 而这里又不能简单地"因为不在界面态就
+                    // 照常发"，那和"宠物页是全屏页面"的事实矛盾。
+                    if (currentSysMode == SYS_MODE_PET && baseKey == 0x29 /* ESC */) {
+                        petExitFull();
+                        hostKeyHeld[r][c] = false;   // 这键没发过 press，别补 release
+                        continue;
+                    }
+
+                    if (inUiMode) {
+                        // ---- 界面态：这一整块把按键吃干净，一律不发到主机 ----
+
+                        // 错误日志页：上下翻 / DEL 清空 / ESC 回菜单。
+                        // 必须排在菜单分支**之前**判断吗？不必 —— SYS_MODE_ELOG
+                        // 和 SYS_MODE_MENU 是互斥的 currentSysMode，顺序无所谓，
+                        // 但放在最前面读起来更清楚。
+                        if (inElogMode) {
+                            elogKey(baseKey);
+                        }
+                        // 菜单（两级）：方向键移动 / 回车进组或执行 / ESC·MC 逐级退回
+                        // 二级里 ESC 是"回一级"而不是直接退出 —— 两级菜单必须能往回走，
+                        // 否则进了一个组就只能一路 ESC 到底才知道自己在哪。
+                        else if (currentSysMode == SYS_MODE_MENU) {
+                            uint8_t rows = menuInSub ? curMenuGroup()->count : MENU_GROUP_COUNT;
+                            uint8_t& sel = menuInSub ? menuItemSel : menuSel;
+                            if (baseKey == KEY_DOWN_ARROW || baseKey == KEY_RIGHT_ARROW) {
+                                sel = (uint8_t)((sel + 1) % rows);
+                                build_menu();
+                            } else if (baseKey == KEY_UP_ARROW || baseKey == KEY_LEFT_ARROW) {
+                                sel = (uint8_t)((sel + rows - 1) % rows);
+                                build_menu();
+                            } else if (baseKey == KEY_RETURN) {
+                                handleMenuSelect();
+                            } else if (baseKey == KEY_ESC || baseKey == K_MC) {
+                                if (menuInSub) {
+                                    menuInSub = false;   // 二级 → 回一级
+                                    menuScrollOffset = 0;
+                                    build_menu();
+                                } else {
+                                    gotoMainScreen();
+                                }
+                            }
+                        }
+                        // 设置子界面：左右切字段 / 上下调值 / 回车保存 / ESC·MC 取消
+                        else if (IS_SETTING_MODE(currentSysMode)) {
+                            if (baseKey == KEY_LEFT_ARROW) moveSettingField(-1);
+                            else if (baseKey == KEY_RIGHT_ARROW) moveSettingField(1);
+                            else if (baseKey == KEY_UP_ARROW) adjustSettingField(1);
+                            else if (baseKey == KEY_DOWN_ARROW) adjustSettingField(-1);
+                            else if (baseKey == KEY_RETURN) {
+                                // 倒计时那一屏的回车是"启停"，不是"保存" ——
+                                // 页面上那颗开始/停止按钮就是这么标的（见
+                                // toggleCountdownFromKeyboard 的注释）
+                                if (currentSysMode == SYS_MODE_SET_TIMER) toggleCountdownFromKeyboard();
+                                else saveSettingScreen();
+                            }
+                            else if (baseKey == KEY_ESC || baseKey == K_MC) cancelSettingScreen();
+                        }
+                        // 宏录制：M1-M12 保存 / MR 走三段 / ESC·MC 取消 / 其余记进键流
+                        else {
+                            if (baseKey == K_MC || baseKey == KEY_ESC) {
+                                cancelRecording();
+                            } else if (baseKey >= K_M1 && baseKey <= K_M12) {
+                                finishMacroRecording(getMacroNameByCode(baseKey));
+                            } else if (baseKey == K_MR) {
+                                // 三段：连续输入 → 组合键 → 取消
+                                advanceRecordingStage();
+                            } else if (baseKey == K_FN) {
+                                fnPressed = true;   // 录制中也得能识别 Fn 修饰
+                            } else if (baseKey < MACRO_BASE
+                                       && baseKey != K_MA && baseKey != K_MB
+                                       && baseKey != K_ME) {
+                                if (recKeyCount < MAX_REC_KEYS) {
+                                    recKeyBuffer[recKeyCount++] = baseKey;
+                                    update_recording_display();
+                                }
+                            }
+                        }
+                    }
+                    // ---- 主界面：普通键盘 + 功能键 ----
+                    else {
+                        // Fn 键
+                        if (baseKey == K_FN) {
+                            fnPressed = true;
+                        }
+                        // MC 进入菜单
+                        else if (baseKey == K_MC) {
+                            currentSysMode = SYS_MODE_MENU;
+                            // 每次进来都从一级大类列表开始。上一轮如果停在二级
+                            // （menuInSub=true），不重置的话 build_menu() 会照着
+                            // 那个层级渲染，用户按 MC 想"回到主菜单再进来"，
+                            // 结果直接落在某个具体项上，看着像按了没反应。
+                            menuSel = 0;
+                            menuItemSel = 0;
+                            menuInSub = false;
+                            menuScrollOffset = 0;
+                            menuNeedsRebuild = true;
+                            // 不再弹"系统菜单/请选择功能"HUD：菜单本身就是提示，
+                            // 每次进菜单都闪一次只是噪音，还压住菜单第一屏。
+
+                        }
+                        // MA / MB 全局键(双状态切换版本):
+                        // 每次按下在「状态 A ↔ 状态 B」之间翻,执行对应那套。
+                        // 配过任意一套就走新路径;两套都没配才走老的单套兜底(见 executeToggleKey)。
+                        else if (baseKey == K_MA) {
+                            executeToggleKey("MA");
+                        }
+                        else if (baseKey == K_MB) {
+                            executeToggleKey("MB");
+                        }
+                        // MR 键：第一次按 = 进入"连续输入"录制（必须排在 >= MACRO_BASE 之前）
+                        else if (baseKey == K_MR) {
+                            enterRecording();
+                        }
+                        // 宏按键
+                        // 小键盘整片（0xDB~0xEB，含 0xE2=小键盘 2）都不在这里拦，
+                        // 全部落到最后的"普通键盘"分支走 kbPress —— 这是对的。
+                        // 静音键在 C3 上（BTN:MUTE），别在这儿加分支。
+                        else if (baseKey >= MACRO_BASE) {
+                            if (baseKey == K_LOGO) {
+                                // LOGO 现在要区分长按（进/退宠物页）和短按
+                                // （切主屏风格），所以动作**从按下挪到松手**。
+                                // 按下只记时刻；松手时没触发过长按才算短按。
+                                // ⚠️ Fn+LOGO 的重启保持"按下即执行"，不受影响 ——
+                                //    它是唯一一个要求"按下就有反应"的组合键。
+                                if (fnPressed) {
+                                    triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
+                                    pendingRestartMs = millis() + 600;
+                                } else {
+                                    logoIsDown = true;
+                                    logoDownMs = millis();
+                                    logoHoldFired = false;
+                                }
+                            } else if (baseKey == K_PLAY) {
+                                if (fnPressed) {
+                                    SystemControl.press(SYSTEM_CONTROL_STANDBY);
+                                    SystemControl.release();
+                                } else {
+                                    ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
+                                    mediaPlaying = !mediaPlaying;
+                                    triggerHud("媒体播放", mediaPlaying ? "播放" : "暂停",
+                                        lv_color_hex(CLR_GREEN));
+                                }
+                            } else if (baseKey == K_NEXT) {
+                                if (!fnPressed) {
+                                    ConsumerControl.press(CONSUMER_CONTROL_SCAN_NEXT);
+                                    mediaPlaying = true;
+                                    triggerHud("媒体播放", "下一曲", lv_color_hex(CLR_ACCENT));
+                                }
+                            } else if (baseKey == K_PREV) {
+                                if (!fnPressed) {
+                                    ConsumerControl.press(CONSUMER_CONTROL_SCAN_PREVIOUS);
+                                    mediaPlaying = true;
+                                    triggerHud("媒体播放", "上一曲", lv_color_hex(CLR_ACCENT));
+                                }
+                            } else {
+                                String macroName = getMacroNameByCode(baseKey);
+                                if (baseKey >= K_M1 && baseKey <= K_M12) {
+                                    executeGlobalKey(macroName);
+                                }
+                                executeMacro(macroName);
+                            }
+                        }
+                        else {
+                            uint16_t mappedKey = getMappedKey(baseKey);
+                            // 最近按键显示：走 getKeyName，空格显示 "Space" 而不是 "20"
+                            snprintf(lastKeyPressed, sizeof(lastKeyPressed), "%s", getKeyName(baseKey));
+                            // 触发律动效果：峰值柱 + 两侧余晖（pulseRhythm 里定义波形的形状）
+                            pulseRhythm();
+                            hostKeyHeld[r][c] = true;
+                            // Caps Lock 本地兜底：USB HID LED 事件（ARDUINO_USB_HID_KEYBOARD_LED_EVENT）
+                            // 在某些主机 / 复合 HID 接口下根本不来，靠它就完全无反应。
+                            // 按下 KEY_CAPS_LOCK 这一刻我们已经知道"用户想翻转大写"，
+                            // 本地先翻一次让屏/灯立刻跟上，host 那边返回的 LED 报告就算延迟、
+                            // 不来、或者延后很多帧，最终也是同一个值，不会冲突。
+                            // Num/Scroll 没有物理按键，仍只能等 LED 报告。
+                            if (baseKey == KEY_CAPS_LOCK) {
+                                capsLock = !capsLock;
+                                lockStateDirty = true;
+                            }
+                            // [DEBUG a→9] 临时诊断:确认 baseKey 和 remap 后实际送 kbPress 的码点
+                        LOG_PORT.printf("[KB] base=0x%04X mapped=0x%04X cnt=%d\n",
+                            baseKey, mappedKey, remapCounts[currentProfile]);
+                        // 强制重置节流,确保 kbPress 里那条 [KB] press code=... 不会被吞掉。
+                        // 按键两条日志挨着(<1ms),正常 100ms 节流会把第二条丢了,
+                        // 那样就看不到 kbPress 走哪个分支,定位就缺一半证据。
+                        btLinkStreamResetThrottle();
+                        kbPress((uint8_t)mappedKey);
+                        }
+                    }
+                } else {
+                    // 按键释放
+                    if (baseKey == K_FN) {
+                        fnPressed = false;
+                    }
+                    else if (baseKey >= MACRO_BASE) {
+                        // 消费级键松开才发 release。
+                        // LOGO 的短按动作在"松手"时补做（因为要区分长按）；
+                        // 长按已经由 scanKeyboardMatrix 开头的判定处理过了。
+                        if (baseKey == K_LOGO) {
+                            logoIsDown = false;
+                            if (!logoHoldFired) {
+                                if (petScene == SCENE_FULL) petExitFull();
+                                else if (petScene == SCENE_PEEK) { /* 吞掉：不切风格 */ }
+                                else cycleDisplayStyle();
+                            }
+                            logoHoldFired = false;
+                        }
+                        // PLAY/NEXT/PREV 的 Consumer 松键照旧
+                        if (baseKey == K_PLAY || baseKey == K_NEXT || baseKey == K_PREV) {
+                            ConsumerControl.release();
+                        }
+                    }
+                    else if (hostKeyHeld[r][c]) {
+                        // 只有"按下时确实发给过主机"的键才需要补一个松键。
+                        // 界面态里被吞掉的键（菜单导航、ESC、设置字段…）按下时没发过
+                        // press，这里再发 release 就会给主机一个无头的松键事件。
+                        hostKeyHeld[r][c] = false;
+                        uint16_t mappedKey = getMappedKey(baseKey);
+                        kbRelease((uint8_t)mappedKey);
+                        }
+                    }
             }
         }
         // 全部列恢复空闲高电平（同时保住"下一轮开始时两个端口都是 0xFF"这个前提）
