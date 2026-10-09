@@ -501,6 +501,18 @@
                     或用「全局功能键」里给 M1~M12 配的「切换方案」动作。
                 </div>
             </div>
+
+            <!-- ⚠ 方案诊断：一次说清"到底哪儿出的问题"，不用来回试。
+                 见下面 cfgProfileDiag() 的注释——它存在的理由是"两个方案不区分"
+                 这类症状有三种完全不同的成因，光看界面永远分不出来。 -->
+            <div style="margin-top: 10px; padding: 8px 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #a78bfa;">
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button id="profDiagBtn" style="padding: 6px 12px;">🔍 方案诊断</button>
+                    <button id="profDiagCopyBtn" style="padding: 6px 12px; display:none;">📋 复制结果</button>
+                    <span class="hint" style="margin:0;">读一次键盘的真实配置，直接告诉你：跑的是哪个方案、两块数据是否雷同、按 MA 会不会切方案。</span>
+                </div>
+                <pre id="profDiagOut" style="margin-top: 8px; max-height: 320px; overflow:auto; white-space: pre-wrap; font-size: 12px; color:#cbd5e1; background:#0f172a; padding:8px; border-radius:6px; display:none;"></pre>
+            </div>
         </div>
 
         <!-- 4. 方案专属宏 M1-M12 -->
@@ -2250,6 +2262,116 @@
             editHint.textContent = '';
         }
     }
+
+    // ========== 方案诊断 ==========
+    //
+    // 为什么需要它：「两个方案不生效 / 不区分」这个症状，代码上可能有三种完全
+    // 不同的成因，而它们的**界面表现一模一样**，光靠"再配一次看看"永远分不出：
+    //
+    //   A. 键盘压根没切方案 —— 按 MA 什么反应都没有（MA 没配 SW: 动作），
+    //      curr_prof 一直是 0。这时候"在 mac 下配的东西不生效"其实是
+    //      **根本没跑到 mac 那份表**，跟写入路径没关系。
+    //   B. 写入串了 —— 网页改 mac，固件却写进了 windows 那块（NVS 键的下标、
+    //      JSON 块名、或页面的 cfgProfName() 翻译错位）。表现同样是"mac 不生效"，
+    //      但修的地方完全不是一处。
+    //   C. 两块本来就存成了同一份 —— 早先某次整份下发把同一批规则写进了两块，
+    //      于是切哪个方案结果都一样，看上去"没有区分"。
+    //
+    // 三者只能靠"把键盘此刻的真实状态原样读出来"区分。这个函数**只读不写**：
+    // 它直接发一条 CFGGET 拿原始 JSON，不碰 cfgModel、不碰任何缓存，
+    // 所以点了不会像普通拉取那样顺手改掉页面上正在编辑的东西。
+    async function cfgProfileDiag() {
+        const out = document.getElementById('profDiagOut');
+        const btn = document.getElementById('profDiagBtn');
+        if (!myCharacteristic) { alert("请先连接蓝牙！"); return; }
+        out.style.display = 'block';
+        out.textContent = '正在读键盘…';
+        btn.disabled = true;
+        let body;
+        try {
+            body = await BtLink.call("CFGDUMP", "CFGGET", 30000);
+        } finally {
+            btn.disabled = false;
+        }
+        if (body === null) { out.textContent = '❌ 键盘没回话（CFGGET 超时）。'; return; }
+        let obj;
+        try {
+            obj = JSON.parse(body);
+        } catch (e) {
+            out.textContent = '❌ 回来的不是合法 JSON：' + e.message + '\n\n' + body.slice(0, 400);
+            return;
+        }
+
+        const L = [];
+        const label = p => CFG_PROFILE_LABEL[CFG_PROFILES[p]] || ('方案' + (p + 1));
+        const editProf = Number(document.getElementById('activeProfile').value);
+        const runProf = Number(obj.curr_prof);
+
+        L.push('【一】运行态（键盘此刻在跑哪个方案）');
+        L.push(`  curr_prof = ${isNaN(runProf) ? '（没有这个字段！）' : runProf}  →  ${isNaN(runProf) ? '?' : label(runProf)}`);
+        L.push(`  页面正在编辑 = ${label(editProf)}`);
+        if (!isNaN(runProf)) {
+            L.push(runProf === editProf
+                ? '  ✓ 编辑目标和运行态一致，此刻按键走的就是你正在编辑的那份表'
+                : `  ✗ 不一致！此刻按键走的是「${label(runProf)}」的表，你改的是「${label(editProf)}」的表`);
+        }
+        L.push('');
+
+        L.push('【二】两个方案在键盘上的真实内容');
+        const snaps = {};
+        for (let p = 0; p < CFG_PROFILES.length; p++) {
+            const name = CFG_PROFILES[p];
+            const blk = obj[name] || {};
+            const rm = Array.isArray(blk.remap) ? blk.remap : [];
+            const macs = (blk.macros && typeof blk.macros === 'object') ? blk.macros : {};
+            snaps[name] = JSON.stringify({ r: rm, m: macs });
+            L.push(`  [${name}] 映射 ${rm.length} 条 ／ 宏 ${Object.keys(macs).length} 个`);
+            rm.slice(0, 12).forEach((r, i) => L.push(`      ${i + 1}. ${r.from} → ${r.to}`));
+            if (rm.length > 12) L.push(`      …还有 ${rm.length - 12} 条`);
+            const mk = Object.keys(macs);
+            if (mk.length) L.push(`      宏键：${mk.join(', ')}`);
+        }
+        L.push('');
+
+        L.push('【三】判定');
+        L.push(`  两块内容是否完全一样：${snaps.windows === snaps.mac ? '⚠ 完全一样（等于没分方案）' : '✓ 不一样'}`);
+        const gk = obj.gkeys || {};
+        const gdesc = k => (gk[k] === undefined || gk[k] === '' ? '未设置' : gk[k]);
+        L.push('  全局功能键（决定按 MA/MB 会不会切方案）：');
+        for (const k of ['MAa', 'MAb', 'MBa', 'MBb']) L.push(`      ${k} = ${gdesc(k)}`);
+        const swAny = ['MAa', 'MAb', 'MBa', 'MBb'].some(k => typeof gk[k] === 'string' && gk[k].includes('SW:'));
+        if (!swAny) {
+            L.push('      ⚠ 四个全局键里一个 SW: 动作都没有 → 按 MA/MB 不会切方案，');
+            L.push('        键盘会一直停在方案 1（Windows），这就是"mac 配了不生效"。');
+        }
+        if (obj.timer) L.push(`  timer = ${JSON.stringify(obj.timer)}`);
+        L.push('');
+        L.push('【四】原始 JSON（截断 3000 字节）');
+        L.push(JSON.stringify(obj).slice(0, 3000));
+
+        const text = L.join('\n');
+        out.textContent = text;
+        out.dataset.diag = text;
+        document.getElementById('profDiagCopyBtn').style.display = 'inline-block';
+        LOG_PORT_UI(`[DIAG] ${L.length} 行`);
+    }
+
+    document.getElementById('profDiagBtn').addEventListener('click', cfgProfileDiag);
+    document.getElementById('profDiagCopyBtn').addEventListener('click', async () => {
+        const out = document.getElementById('profDiagOut');
+        const text = out.dataset.diag || out.textContent;
+        try {
+            await navigator.clipboard.writeText(text);
+            alert('已复制，粘给我就行。');
+        } catch (e) {
+            // 剪贴板不可用（http 页面常见）：全选让用户自己复制
+            const r = document.createRange();
+            r.selectNodeContents(out);
+            const sel = getSelection();
+            sel.removeAllRanges(); sel.addRange(r);
+            alert('自动复制被浏览器拦了，已全选，请手动复制（⌘C）。');
+        }
+    });
 
     // ========== 1. ME 键文本（存盘，按 ME 键才发） ==========
     function insertMeTag(tag) {
