@@ -634,6 +634,24 @@ static unsigned long debounceCandMs[NUM_ROWS][NUM_COLS] = {0};
 // 记录这颗键"按下时是否真的发给过主机"，松键时据此决定要不要补一个 release。
 // 没有它的话，菜单里按 ESC 这类被界面吞掉的键会在松手时给主机发一个无头的 release。
 static bool hostKeyHeld[NUM_ROWS][NUM_COLS] = {0};
+
+// ⚠⚠ 记录"按下时**实际发出去的那个码点**"，松键时必须原样松掉它，不能重查映射表。
+//
+//   松键以前是 `getMappedKey(baseKey)` 重查一遍。那次查表用的是**松手那一刻**的
+//   currentProfile —— 只要按住某键期间方案变了（按一下 MA/MB，或 M1 上配了
+//   SW:NEXT 之后每按一次都翻），两次查表就会落到**不同的表**、给出不同的码点。
+//
+//   现场就是这样变成"方案不区分"的：macOS 方案里配了 ctrl->win、win->ctrl，
+//   按住 Ctrl → 发出的是 Win(0xE3)；还没松手时按 M1 翻了方案；松手时新表是空的，
+//   getMappedKey 原样返回 128 → 松掉的是 Ctrl(0xE0)。**Win 从此再也松不掉**，
+//   主机那边从此所有组合键都像按着 Cmd —— 用户看到的就是"切到另一个方案后，
+//   另一个方案的映射反而生效了、两个方案都生效"，而配置页读回来的两边数据
+//   其实完全正确。
+//
+//   所以这里存"发出去什么就松什么"，让松键和按键严格成对。代价是每个矩阵位多
+//   一个字节，换来的是任何方案切换时机下都不会漏松。
+static uint8_t hostKeySent[NUM_ROWS][NUM_COLS] = {0};
+
 static uint32_t totalKeyCount = 0;
 static uint16_t baseMatrix[NUM_ROWS][NUM_COLS] = { 0 };
 static bool fnPressed = false;
@@ -6655,10 +6673,30 @@ static String getMacroNameByCode(uint16_t code) {
     return "";
 }
 
+// ---- 最近一次普通按键的查表现场（只读诊断，回拉配置时带给网页）----
+//
+//   "配置明明对、按键行为却不对"这类问题，光看两边数据永远不够 —— 必须知道
+//   **这一次按键到底查的是哪张表、查到没有**。这里把最近一次 getMappedKey 的
+//   输入输出和当时用的方案记下来，随 cfgBuildJson 一起发出去，网页的「方案诊断」
+//   直接显示。方案下标标成 0xFFFFFFFF 表示"还没按过任何普通键"。
+static uint32_t lmProf   = 0xFFFFFFFFu;
+static uint32_t lmCount  = 0;
+static uint16_t lmFrom   = 0;
+static uint16_t lmTo     = 0;
+static uint32_t lmHits   = 0;
+
 static uint16_t getMappedKey(uint16_t originalKey) {
+    lmProf  = currentProfile;
+    lmCount = (uint32_t)remapCounts[currentProfile];
+    lmFrom  = originalKey;
+    lmTo    = originalKey;
+    // ⚠ 只在"确实发出去了"的那一次调用里记（松键走 hostKeySent，不再调本函数），
+    //   所以这里记下的就是主机真正收到的那颗键。
     for (int i = 0; i < remapCounts[currentProfile]; i++) {
         if (profileRemaps[currentProfile][i].fromKey == originalKey) {
-            return profileRemaps[currentProfile][i].toKey;
+            lmTo = profileRemaps[currentProfile][i].toKey;
+            lmHits++;
+            return lmTo;
         }
     }
     return originalKey;
@@ -7369,6 +7407,9 @@ static void scanKeyboardMatrix(void) {
                         // 按键两条日志挨着(<1ms),正常 100ms 节流会把第二条丢了,
                         // 那样就看不到 kbPress 走哪个分支,定位就缺一半证据。
                         btLinkStreamResetThrottle();
+                        // ⚠ 记下"这一次真正发出去的码点"，松键时原样松掉它 ——
+                        //   松键不能重查映射表，理由见 hostKeySent 那段注释。
+                        hostKeySent[r][c] = (uint8_t)mappedKey;
                         kbPress((uint8_t)mappedKey);
                         }
                     }
@@ -7400,8 +7441,13 @@ static void scanKeyboardMatrix(void) {
                         // 界面态里被吞掉的键（菜单导航、ESC、设置字段…）按下时没发过
                         // press，这里再发 release 就会给主机一个无头的松键事件。
                         hostKeyHeld[r][c] = false;
-                        uint16_t mappedKey = getMappedKey(baseKey);
-                        kbRelease((uint8_t)mappedKey);
+                        // ⚠⚠ 松的是**按下时发出去的那个码点**，不是重新查一遍表。
+                        //   重查会拿到"松手这一刻"的方案映射，和按下时发出的可能
+                        //   不是同一颗键 —— 修饰键一旦对不上就再也松不掉，主机那边
+                        //   从此所有组合键都像按着 Cmd/Win。切方案的动作（MA/MB、
+                        //   配了 SW: 的 M1~M12）随时可能发生在一次按住的期间，
+                        //   所以这里必须用 hostKeySent，绝不重查。
+                        kbRelease(hostKeySent[r][c]);
                         }
                     }
             }
@@ -7849,6 +7895,29 @@ static size_t cfgBuildJson(char* out, size_t cap) {
     //   分支）。方向是单向的：固件 → 网页 有，网页 → 固件 无。
     //   切方案只能靠 MA/MB 或全局功能键的动作（SW: 段）。
     doc["curr_prof"] = currentProfile;
+
+    // ---- last_map：最近一次普通按键的查表现场（只读）----
+    //
+    // 它回答的是"配置看着没问题，为什么按键行为不对"里唯一缺的那块证据：
+    // 这一颗键**到底查了哪张表**、那张表当时有几条规则、命中没有。
+    // 六个字段全是只读，cfgApplyDoc 那边不认这个键（落进"未知键忽略"分支）。
+    {
+        JsonObject lm = doc["last_map"].to<JsonObject>();
+        if (lmProf == 0xFFFFFFFFu) {
+            lm["prof"] = -1;   // 还没按过任何普通键
+            lm["cnt"]  = 0;
+            lm["from"] = 0;
+            lm["to"]   = 0;
+            lm["hit"]  = 0;
+        } else {
+            lm["prof"] = (int)lmProf;
+            lm["cnt"]  = (int)lmCount;
+            lm["from"] = lmFrom;
+            lm["to"]   = lmTo;
+            lm["hit"]  = (lmTo != lmFrom) ? 1 : 0;
+        }
+        lm["hits"] = (int)lmHits;   // 开机以来累计命中次数
+    }
 
     // ---- 每个方案一个对象：CFG_PROF_NAMES[p] = { "remap": [...], "macros": {...} } ----
     //

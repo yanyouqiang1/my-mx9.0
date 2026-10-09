@@ -1491,6 +1491,9 @@
         // 倒计时：**只读**。固件每次拉取时现报运行时状态，保存时被原样忽略。
         // 它不是配置，是"键盘此刻正在跑什么"的一个快照。
         timer: { run: false, remain: 0, total: 0 },
+        // 最近一次普通按键的查表现场，**只读**：哪张表、几条规则、命中没有。
+        // 有了它，"配置看着对但按键行为不对"就不必再靠猜。
+        last_map: null,
     };
 
     let cfgLoaded = false;   // 有没有成功拉过一次（没拉过就别让用户往空模型上改）
@@ -2384,7 +2387,29 @@
         }
         if (obj.timer) L.push(`  timer = ${JSON.stringify(obj.timer)}`);
         L.push('');
-        L.push('【四】原始 JSON（截断 3000 字节）');
+
+        // ---- 最近一次普通按键的查表现场 ----
+        // 这是"配置看着对、按键行为却不对"唯一缺的那块证据：这一颗键到底查了
+        // 哪张表、那张表当时有几条规则、命中没有。固件只读上报，点了诊断本身
+        // 不改变任何状态。
+        L.push('【四】最近一次普通按键的查表现场（按下任意普通键后再点一次诊断）');
+        const lm = obj.last_map;
+        if (!lm) {
+            L.push('  （固件没上报这个字段，说明烧的是旧固件）');
+        } else if (lm.prof < 0) {
+            L.push('  还没按过任何普通键');
+        } else {
+            const lp = lm.prof >= 0 && lm.prof < CFG_PROFILES.length ? label(lm.prof) : ('?' + lm.prof);
+            L.push(`  这一颗键查的是：${lp} 的表（下标 ${lm.prof}），该表当时有 ${lm.cnt} 条规则`);
+            L.push(`  原始键 ${lm.from} → 实际发出 ${lm.to}　${lm.hit ? '★命中了映射' : '没命中（原样发出）'}`);
+            L.push(`  开机以来累计命中：${lm.hits} 次`);
+            const rp = Number(obj.curr_prof);
+            if (!isNaN(rp) && rp !== lm.prof) {
+                L.push(`  ⚠ 按下这一颗键时查的是「${lp}」，而现在键盘跑的是「${label(rp)}」 —— 按键期间方案被改过`);
+            }
+        }
+        L.push('');
+        L.push('【五】原始 JSON（截断 3000 字节）');
         L.push(JSON.stringify(obj).slice(0, 3000));
 
         const text = L.join('\n');
