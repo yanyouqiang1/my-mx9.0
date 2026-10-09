@@ -463,6 +463,29 @@
             </div>
         </div>
 
+        <!-- ⚠⚠ M1-M12 的全局动作。固件 GKEY_SLOT[] 一共 18 个槽（MA/MB + M1~M12），
+             键处理里对 M1~M12 是「先跑全局动作，再播当前方案的宏」。但这一段 UI
+             以前只有 MA/MB 四张卡片 —— 于是 M1~M12 的全局动作成了**能生效、
+             却既看不见也删不掉**的暗配置。现场就是这样撞上的：g_M1 被写成
+             "SW:NEXT"，于是每按一次 M1 键盘就翻一次方案，测什么都像"两个方案
+             同时生效、没有区分"。这里把它摆到台面上，能看、能改、能清。 -->
+        <div class="card">
+            <h2>⚙️ M1 ~ M12 的全局动作（进阶）</h2>
+            <div class="hint">
+                按 M1~M12 时，键盘<b>先</b>跑这里配的全局动作，<b>再</b>播当前方案的宏。留空 = 只播宏。
+                <br>
+                <b style="color:#f87171;">⚠ 这里的「切换配置方案」会改掉键盘当前跑的方案。</b>
+                切方案请用 <b>MA / MB</b>。把 M1 设成「循环切换」的话，每按一次 M1 方案就翻一次 ——
+                现场表现就是"配哪个方案都不对劲、像是没区分"。
+            </div>
+            <div id="macroGkeyList" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:8px; margin-top:10px;"></div>
+            <div style="display:flex; gap:6px; margin-top:10px;">
+                <button class="btn btn-green" id="macroGkeySaveBtn" style="flex:1;">💾 保存 M1~M12 全局动作</button>
+                <button class="btn btn-red" id="macroGkeyClearBtn">🗑 全部清除</button>
+            </div>
+            <div class="hint" id="macroGkeyWarn" style="margin-top:8px;"></div>
+        </div>
+
         <!-- ===== 二、方案配置（先选系统，下面的映射和宏都归它）===== -->
         <div class="group-title pf-title-prof">二、方案配置 <span class="sub">先选系统，下面的「映射」和「系统专属宏」都编辑这个系统</span></div>
 
@@ -1734,6 +1757,9 @@
         await loadGlobalkFromCache();
         await loadRemapFromCache();
         await loadToggleFromCache();
+        // M1~M12 的全局动作也得跟着刷新：它同样是 gkeys 的一部分，而固件会
+        // 在按 M1~M12 时先执行它（见那段 ⚠ 说明）。不刷的话这块永远是上一轮的。
+        renderMacroGkeyList();
         // 运行态只能从键盘上报的 curr_prof 得知，每次拉完都要刷一次。
         // （拉取之前 cfgModel.curr_prof 是声明初值 0，那时显示"未知"更诚实。）
         refreshRunningProfile();
@@ -2251,10 +2277,22 @@
         const runProf = Number(cfgModel.curr_prof);
         const label = p => CFG_PROFILE_LABEL[CFG_PROFILES[p]] || `方案${p + 1}`;
 
-        const valid = runProf >= 0 && runProf < CFG_PROFILES.length;
-        runName.textContent = valid ? label(runProf) : '未知（未拉取配置）';
+        // ⚠⚠ 没拉取过就必须说"未知"，不能显示 curr_prof 的声明初值 0。
+        //
+        //   cfgModel.curr_prof 的初值是 0，而 0 恰好是一个**合法且最容易被误解**
+        //   答案 —— "Windows"。于是刚连上蓝牙、还没拉取的这一段时间里，页面
+        //   一本正经地显示"键盘当前正在跑：Windows"，而键盘其实在跑 macOS。
+        //   用户据此判断"我明明切过方案了"，于是在错误的方案下配了一轮映射，
+        //   现场表现就是"配了不生效 / 两个方案都生效"。
+        //
+        //   （下面 cfgRefreshAllLists 的注释写着"拉取之前显示'未知'更诚实"，
+        //    这里以前没照做 —— 注释是对的，代码是错的。）
+        const valid = cfgLoaded && runProf >= 0 && runProf < CFG_PROFILES.length;
+        runName.textContent = valid ? label(runProf) : '未知（还没从键盘拉取）';
 
-        if (valid && runProf !== editProf) {
+        if (!cfgLoaded) {
+            editHint.textContent = '　⚠ 先点「📥 从键盘拉取」确认键盘此刻在跑哪个方案，否则下面配的东西很可能白配';
+        } else if (valid && runProf !== editProf) {
             // 正在编辑的和正在跑的不是同一个 —— 这正是"配了却不生效"的状态，
             // 必须显眼地提示，否则用户只会怀疑自己配错了。
             editHint.textContent = `　⚠ 你正在编辑 ${label(editProf)}，但键盘跑的是 ${label(runProf)} —— 改完记得去键盘上按 MA/MB 切过去`;
@@ -2371,6 +2409,87 @@
             sel.removeAllRanges(); sel.addRange(r);
             alert('自动复制被浏览器拦了，已全选，请手动复制（⌘C）。');
         }
+    });
+
+    // ========== M1~M12 的全局动作（gkeys 里的 M1~M12 槽）==========
+    //
+    // ⚠ 这段以前**根本没有 UI**：固件 GKEY_SLOT[] 有 18 个槽，键处理里 M1~M12
+    //   一律「先跑全局动作，再播宏」，而页面只做了 MA/MB 四张卡片。于是
+    //   M1~M12 的全局动作成了能生效、却看不见也删不掉的暗配置 —— 现场就是
+    //   g_M1 = "SW:NEXT"，每按一次 M1 方案翻一次，测什么都像"没区分方案"。
+    //
+    // 这里只编辑 payload 的 SW: 段。已有值里若还带着 CMB:/SEQ: 段，界面如实
+    // 标出来 —— 改动这里会把它覆盖成纯 SW 动作，所以先说清楚，不静悄悄地
+    // 吃掉用户原来配的东西。
+    const MK_GKEYS = Array.from({ length: 12 }, (_, i) => `M${i + 1}`);
+    const MK_SW_OPTS = [
+        ['', '（不切方案 · 只播宏）'],
+        ['0', '切到 Windows'],
+        ['1', '切到 macOS'],
+        ['NEXT', '循环切换到下一个方案'],
+    ];
+
+    function mkGkeySwOf(v) {
+        if (typeof v !== 'string' || !v) return null;
+        const p = v.split('+').find(s => s.startsWith('SW:'));
+        return p ? p.substring(3) : null;
+    }
+
+    function renderMacroGkeyList() {
+        const box = document.getElementById('macroGkeyList');
+        if (!box) return;
+        const gk = (cfgModel && cfgModel.gkeys) || {};
+        const warn = document.getElementById('macroGkeyWarn');
+        const extra = [];
+        box.innerHTML = '';
+        for (const k of MK_GKEYS) {
+            const raw = gk[k];
+            const sw = mkGkeySwOf(raw);
+            if (typeof raw === 'string' && raw) {
+                if (sw === null) extra.push(`${k} 配的不是切换动作：${raw.slice(0, 28)}`);
+                else if (raw.includes('+')) extra.push(`${k} 还带额外动作：${raw.slice(0, 28)}（在这里改会覆盖成纯 SW 动作）`);
+            }
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:flex;gap:6px;align-items:center;background:#1e293b;padding:6px 8px;border-radius:6px;';
+            const lb = document.createElement('b');
+            lb.textContent = k;
+            lb.style.cssText = 'color:#38bdf8;min-width:30px;';
+            const sel = document.createElement('select');
+            sel.id = `mkSw_${k}`;
+            sel.style.flex = '1';
+            for (const [v, t] of MK_SW_OPTS) {
+                const o = document.createElement('option');
+                o.value = v; o.textContent = t;
+                sel.appendChild(o);
+            }
+            sel.value = (sw && MK_SW_OPTS.some(o => o[0] === sw)) ? sw : '';
+            wrap.appendChild(lb); wrap.appendChild(sel);
+            box.appendChild(wrap);
+        }
+        if (warn) {
+            const setSw = MK_GKEYS.filter(k => mkGkeySwOf(gk[k]) !== null);
+            const lines = [];
+            if (setSw.length) lines.push(`⚠ ${setSw.join('、')} 配了「切换方案」：按这些键会改掉键盘当前跑的方案。`);
+            lines.push(...extra);
+            warn.textContent = lines.join('\n');
+            warn.style.whiteSpace = 'pre-line';
+            warn.style.color = (setSw.length || extra.length) ? '#f87171' : '#64748b';
+        }
+    }
+
+    document.getElementById('macroGkeySaveBtn').addEventListener('click', async () => {
+        await cfgPush(m => {
+            for (const k of MK_GKEYS) {
+                const v = document.getElementById(`mkSw_${k}`).value;
+                if (v) m.gkeys[k] = `SW:${v}`;
+                else delete m.gkeys[k];      // 差分里"键消失" = 下发 null = 固件删掉
+            }
+        }, 'M1~M12 的全局动作已保存。');
+    });
+
+    document.getElementById('macroGkeyClearBtn').addEventListener('click', async () => {
+        if (!confirm('确定要清除 M1~M12 的全部全局动作？\n\n宏本身不受影响，只是按 M1~M12 不再切方案。')) return;
+        await cfgPush(m => { for (const k of MK_GKEYS) delete m.gkeys[k]; }, 'M1~M12 的全局动作已全部清除。');
     });
 
     // ========== 1. ME 键文本（存盘，按 ME 键才发） ==========
