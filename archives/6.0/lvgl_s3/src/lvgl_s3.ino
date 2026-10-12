@@ -1682,6 +1682,10 @@ static void gotoMainScreen(void) {
 static void handleCommand(const String& cmd);
 static void scanKeyboardMatrix(void);
 static bool recoverI2CBus(void);
+static bool mcpColumnStrobeOk(void);
+static void i2cStrobe(int pulses, uint16_t halfUs);
+static void mcpApplyColumnConfig(void);
+static void mcpResetMatrixState(void);
 void bootDetailTick(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
@@ -7070,21 +7074,31 @@ static void initBaseMatrix(void) {
 }
 
 static void scanKeyboardMatrix(void) {
-    // I2C 健康检查：原版 s3.ino:3484-3491 每 500ms 探测一次 MCP23017，
+    // I2C 健康检查：原版 s3.ino:3484-3491 每 500ms 检查一次 MCP23017，
     // 失败就 recoverI2CBus() 重新初始化整条总线。LVGL 版把这一段整个丢了，
     // 后果是 I2C 一旦被干扰（干扰按键灯/插拔 USB/BLE 突发），键盘就永久失灵，
     // 只能断电重启才恢复。补回来。
+    //
+    // ⚠ 检查项后来换过一次：原来探的是"I2C 地址有没有应答"，现在探的是
+    // "列选信号发不发得出去"。区别和原因见下面那段注释。
     static unsigned long lastI2CCheck = 0;
     if (millis() - lastI2CCheck > 500) {
         lastI2CCheck = millis();
         ct_mark(CT_S_SCAN_I2C);
-        Wire.beginTransmission(MCP23017_ADDR);
-        if (Wire.endTransmission() != 0) {
+        //
+        // ⚠ 这里检的是"列选信号发不发得出去"，**不是**"地址有没有应答"。
+        //
+        // 原来只探地址（Wire.endTransmission()），那是最弱的一种存活信号：
+        // MCP23017 就算 GPIO 全跑回输入态、16 个列脚一个都驱动不了，I2C 侧
+        // 也照样完全健康、地址照答不误。那种情况下恢复**一次都不会被触发**，
+        // 于是键盘全哑、屏幕和 C3 键却都好好的（列脚不拉低 → 行脚只读得到
+        // 上拉高电平 → 一个键都扫不出来），只能断电重来。
+        //
+        // 现在改成真写一列再读回来核对：写进去的图案读不出来，就是芯片没法用了。
+        // 每 500ms 一次，只多 3 个 I2C 事务，代价可以忽略。
+        if (!mcpColumnStrobeOk()) {
             ct_mark(CT_S_SCAN_RECOVER);
-            // 探测失败先记一条（"总线失联"），恢复结果由 recoverI2CBus()
-            // 自己在失败时再记一条"恢复失败"。两条分开的意义是：
-            // 光看"恢复失败"不知道是偶发还是持续，光看"失联"不知道有没有救回来。
-            ELWARN("I2C", "芯片无响应 正在恢复总线");
+            ELWARN("I2C", "列选异常 正在恢复总线");
             if (!recoverI2CBus()) {
                 return;   // 没救回来，这一轮扫描直接跳过（下面读到的全是垃圾）
             }
@@ -7459,7 +7473,7 @@ static void scanKeyboardMatrix(void) {
 }
 
 // ===========================
-// I2C 恢复
+// I2C 恢复：逐级加码
 // ===========================
 // 返回 true = 总线和 MCP23017 都救回来了。
 //
@@ -7467,23 +7481,142 @@ static void scanKeyboardMatrix(void) {
 // 于是"键盘突然失灵"这件事在日志里一个字都没有 —— 而它恰恰是
 // 最需要留证的一类故障（总线受干扰 / 接触不良 / 上电时序没满足）。
 // 现在失败会直接进错误日志，菜单里能翻到"总线恢复失败 x N 次"。
-static bool recoverI2CBus(void) {
-    Wire.end();
-    delay(10);
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);
-    Wire.setTimeOut(25);
-    if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
-        // 去重会把反复的同类失败合并成一条并累加次数，
-        // 所以这里可以放心每次都记。
-        ELERR("I2C", "总线恢复失败 键盘可能失灵");
-        return false;
+//
+// ⚠⚠ 为什么原来那一版救不回来
+//
+// 原来是 `Wire.end()` + `Wire.begin()` 就完事。这一步**治不了总线卡死**：
+// 它只把主控自己的引脚浮空，管不到**从机正在驱动的那条线**。当 MCP23017
+// 卡在半个字节中间、拉着 SDA 不放的时候，这个操作对它毫无作用，下一句
+// mcp.begin_I2C() 必然失败。于是每 500ms 重试一次、每次都失败，键盘一直
+// 哑到断电为止 —— **S3 软重启也救不了**，因为重启并不会让 3.3V 掉下去，
+// 芯片还是那个卡住的芯片，只有彻底断电才能让它松开 SDA。
+//
+// 真正能让从机松手的只有一件事：**把 SCL 敲够 9 拍**，让它把手里那个字节
+// 走完再放线。这是 i2c 总线救援的标准动作，纯软件、零硬件。
+//
+// 所以现在分三级，从最便宜的试起：
+//   0 级  总线还通，只是芯片丢了寄存器配置 → 重刷方向和电平就行
+//   1 级  9 拍救援 + 重建外设（内含芯片软复位）
+//   2 级  40 拍、慢 12 倍，给半死不活的从机最后机会
+
+// 把 SCL 敲 pulses 下，最后补一个 STOP。
+//
+// ⚠ 只敲 SCL 不够：敲完总线停在 START 之后的状态，从机还是不认。必须再补
+// 一次"SCL 为高时 SDA 由低走高"才是 STOP，总线才真正回到空闲态。
+// 拍数取 12 而不是刚好 9：9 是走完一个字节的下限，做多几个留余量。
+static void i2cStrobe(int pulses, uint16_t halfUs) {
+    pinMode(I2C_SDA, INPUT_PULLUP);
+    pinMode(I2C_SCL, INPUT_PULLUP);
+    delayMicroseconds(10);
+    for (int i = 0; i < pulses; i++) {
+        pinMode(I2C_SCL, OUTPUT);
+        digitalWrite(I2C_SCL, LOW);
+        delayMicroseconds(halfUs);
+        pinMode(I2C_SCL, INPUT_PULLUP);   // 交回上拉 = 时钟走高的半拍
+        delayMicroseconds(halfUs);
     }
+    // STOP：SDA 先拉低 → SCL 拉高 → 放开 SDA（SDA 低->高）
+    pinMode(I2C_SDA, OUTPUT);
+    digitalWrite(I2C_SDA, LOW);
+    delayMicroseconds(halfUs);
+    pinMode(I2C_SCL, OUTPUT);
+    digitalWrite(I2C_SCL, HIGH);
+    delayMicroseconds(halfUs);
+    pinMode(I2C_SDA, INPUT_PULLUP);
+    delayMicroseconds(halfUs);
+}
+
+// 列脚的方向 + 空闲电平。
+//
+// ⚠ 顺序是反直觉的：**先电平、后方向**。
+//   先 pinMode 的话，从"全是输入"切到"全是输出"那一瞬间，输出锁存器还是
+//   上电默认的 0，等于 16 个列脚同时被拉低 —— 行脚会读到"10 个键全按着"。
+//   先写电平的话那时引脚还是输入，OLAT 只是写进去了没人驱动，随后的
+//   pinMode 一上手就是高电平，没有那一瞬。
+static void mcpApplyColumnConfig(void) {
+    mcp.writeGPIOA(0xFF);
+    mcp.writeGPIOB(0xFF);
     for (int c = 0; c < NUM_COLS; c++) {
         mcp.pinMode(c, OUTPUT);
-        mcp.digitalWrite(c, HIGH);
     }
-    return true;
+}
+
+// 列选通路自检：写一个"只有第 0 列为低"的图案，再把 IN 寄存器读回来核对。
+//
+// 为什么探地址不够：MCP23017 就算掉回全输入态，I2C 侧也是完全健康的，
+// 地址照答不误。地址能应答只证明"这颗芯片挂在总线上"，一点都证明不了
+// "它还能不能驱动列脚"—— 而键盘能不能用，恰恰只看后者。
+//
+// 为什么读回值能判：输出脚在 MCP23017 上 IN 位反映的就是引脚实际电平。
+// 芯片正常 → 第 0 位是 0；掉回全输入 → 只有内部 100k 弱上拉 → 读回 0xFF。
+//
+// 每 500ms 调一次，会有一瞬（约 250µs）把第 0 列拉低。三态消抖天然吃掉它：
+// 候选位翻过去不到 1ms 就翻回来，凑不满 DEBOUNCE_DELAY(20ms)，升不成稳定态，
+// 不会产生任何假按键。
+static bool mcpColumnStrobeOk(void) {
+    mcp.writeGPIOA(0xFE);          // 只有第 0 列为低
+    uint8_t a = mcp.readGPIOA();
+    mcp.writeGPIOA(0xFF);
+    mcp.writeGPIOB(0xFF);          // 同时回到"每轮扫描开始时两个端口都是 0xFF"
+    return (a == 0xFE);
+}
+
+// 恢复成功后清干净消抖和"按下"状态。
+//
+// 总线拖死的时候很可能正卡在一次按下的中间，keebMatrix 里会留下一个永远
+// 松不开的"按下"。不清的话：一来幽灵按键会继续触发界面动作；二来
+// hostKeyHeld 里的键再也不会走正常松键分支，主机那边就永远按着它 ——
+// 症状是"所有组合键都像按着 Cmd"，比键盘全哑更难查。
+static void mcpResetMatrixState(void) {
+    for (int r = 0; r < NUM_ROWS; r++) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            if (hostKeyHeld[r][c]) {
+                kbRelease(hostKeySent[r][c]);   // 原样松掉发出去的那个码点，绝不重查
+            }
+            hostKeyHeld[r][c] = false;
+        }
+    }
+    memset(keebMatrix,     0, sizeof(keebMatrix));
+    memset(debounceCand,   0, sizeof(debounceCand));
+    memset(debounceCandMs, 0, sizeof(debounceCandMs));
+}
+
+static bool recoverI2CBus(void) {
+    // ---- 第 0 级：总线还通，只是芯片丢了寄存器配置 ----
+    // 最常见也最便宜，一次 I2C 外设都不用重建。覆盖 IODIRA/IODIRB 被复位
+    // 回 0xFF（全输入）那种情况 —— 那时地址探得好好的，只有真去写一列再读
+    // 回来才看得出来。
+    Wire.beginTransmission(MCP23017_ADDR);
+    if (Wire.endTransmission() == 0) {
+        mcpApplyColumnConfig();
+        if (mcpColumnStrobeOk()) {
+            mcpResetMatrixState();
+            return true;
+        }
+    }
+
+    // ---- 第 1 / 2 级：芯片或总线本身死了 ----
+    for (int stage = 1; stage <= 2; stage++) {
+        Wire.end();
+        delay(5);
+        i2cStrobe(stage == 1 ? 12 : 40, stage == 1 ? 5 : 60);
+        delay(10);
+        Wire.begin(I2C_SDA, I2C_SCL);
+        Wire.setClock(400000);
+        Wire.setTimeOut(25);
+        // begin_I2C() 内部会写 IOCLR=0x05 做**软件复位**（bit2 就是软件复位
+        // 位，效果等同拉 RESET 脚）。所以这一级顺手把"寄存器被清空"也修了。
+        if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) continue;   // 失败就升一级
+        mcpApplyColumnConfig();
+        if (mcpColumnStrobeOk()) {
+            mcpResetMatrixState();
+            return true;
+        }
+    }
+
+    // 去重会把反复的同类失败合并成一条并累加次数，所以这里可以放心每次都记。
+    ELERR("I2C", "总线恢复失败 键盘可能失灵");
+    return false;
 }
 
 // ===========================
@@ -10869,6 +11002,11 @@ void setup() {
     // I2C / MCP23017
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000);
+    // ⚠ 这个超时以前只有 recoverI2CBus() 里有，主路径一直吃 Arduino 默认的
+    // 50ms。总线一旦半死不活（从机拉着 SDA 不放），一轮扫描 18 次写每笔都拖
+    // 满 50ms ≈ 0.9s，主循环直接卡死。这里必须从一开始就 armed —— 平时总线
+    // 正常时它一次都不触发，完全不影响扫描速度。
+    Wire.setTimeOut(25);
     if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
         LOG_PORT.println("[MCP23017] Init failed, recovering...");
         ELERR("I2C", "开机初始化失败 正在恢复");
@@ -10983,10 +11121,7 @@ void setup() {
     // 键盘矩阵
     initBaseMatrix();
     loadRemapsFromStorage();
-    for (int c = 0; c < NUM_COLS; c++) {
-        mcp.pinMode(c, OUTPUT);
-        mcp.digitalWrite(c, HIGH);
-    }
+    mcpApplyColumnConfig();          // 顺序/理由见该函数注释（先电平后方向）
     for (int r = 0; r < NUM_ROWS; r++) {
         pinMode(rowPins[r], INPUT_PULLUP);
     }
