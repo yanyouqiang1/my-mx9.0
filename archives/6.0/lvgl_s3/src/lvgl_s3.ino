@@ -3708,7 +3708,7 @@ static void build_menu(void) {
 // 调参都在这儿，改完直接看效果
 #define PET_PEEK_IDLE_MIN_MS   25000UL   // 闲置多久才进探头候选池
 #define PET_PEEK_GAP_MIN_MS    20000UL   // 两次判定的最小间隔
-#define PET_PEEK_GAP_JIT_MS    20000UL   // 判��间隔的随机抖动上限
+#define PET_PEEK_GAP_JIT_MS    20000UL   // 判定间隔的随机抖动上限
 #define PET_PEEK_CHANCE         30       // 每次判定的触发概率（%）
 #define PET_PEEK_DAILY_MAX       8       // 每日探头上限
 #define PET_PEEK_HOLD_MS       8000UL    // 探头停留时长
