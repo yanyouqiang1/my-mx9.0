@@ -652,6 +652,18 @@ static bool hostKeyHeld[NUM_ROWS][NUM_COLS] = {0};
 //   一个字节，换来的是任何方案切换时机下都不会漏松。
 static uint8_t hostKeySent[NUM_ROWS][NUM_COLS] = {0};
 
+// 列选通路上一次自检的结果（每 500ms 更新一次，见 scanKeyboardMatrix 里的检查）。
+//
+// 为什么扫描要受它管：总线半死不活的时候，列选信号是断断续续的 —— 有几次
+// 写进去了、列脚确实拉低了，行脚就读到"按着"；后几次没写进去，列脚还是高，
+// 行脚读回"松开"。每一次切换都稳定超过 DEBOUNCE_DELAY(20ms) 的话，三态消抖
+// 就会认它一次账 —— 于是**按一个键连发六七次**，然后总线彻底死掉。
+// 现场看到的就是这个顺序：先乱码式连发，再全哑。
+//
+// 所以自检一旦判死就一直跳过扫描，直到自检通过为止：不盲扫就不会产生
+// 幽灵按键。反正这时候本来一个键也扫不出来。
+static bool mcpHealthy = true;
+
 static uint32_t totalKeyCount = 0;
 static uint16_t baseMatrix[NUM_ROWS][NUM_COLS] = { 0 };
 static bool fnPressed = false;
@@ -1683,6 +1695,7 @@ static void handleCommand(const String& cmd);
 static void scanKeyboardMatrix(void);
 static bool recoverI2CBus(void);
 static bool mcpColumnStrobeOk(void);
+static uint8_t mcpReadIODIR(void);
 static void i2cStrobe(int pulses, uint16_t halfUs);
 static void mcpApplyColumnConfig(void);
 static void mcpResetMatrixState(void);
@@ -7099,12 +7112,16 @@ static void scanKeyboardMatrix(void) {
         if (!mcpColumnStrobeOk()) {
             ct_mark(CT_S_SCAN_RECOVER);
             ELWARN("I2C", "列选异常 正在恢复总线");
+            mcpHealthy = false;
             if (!recoverI2CBus()) {
                 return;   // 没救回来，这一轮扫描直接跳过（下面读到的全是垃圾）
             }
             ELINFO("I2C", "总线已恢复");
         }
+        mcpHealthy = true;
     }
+    // 自检判死之后不再盲扫 —— 理由和"连发"那个现象写在 mcpHealthy 的声明处。
+    if (!mcpHealthy) return;
 
     // LOGO 长按判定。矩阵键本来**没有**长按检测（工程里所有 _HOLD 都来自
     // C3 小 MCU 的 Serial1 上报），这里按"按下时记时刻 + 每拍看一次还按着没有"
@@ -7550,15 +7567,36 @@ static void mcpApplyColumnConfig(void) {
 // 为什么读回值能判：输出脚在 MCP23017 上 IN 位反映的就是引脚实际电平。
 // 芯片正常 → 第 0 位是 0；掉回全输入 → 只有内部 100k 弱上拉 → 读回 0xFF。
 //
-// 每 500ms 调一次，会有一瞬（约 250µs）把第 0 列拉低。三态消抖天然吃掉它：
-// 候选位翻过去不到 1ms 就翻回来，凑不满 DEBOUNCE_DELAY(20ms)，升不成稳定态，
-// 不会产生任何假按键。
+// ⚠ A、B 两个端口**都要测**。列 0~7 在 GPIOA、列 8~15 在 GPIOB，
+//   只测 A 的话，B 侧写坏了自检照样返回"正常"，8~15 列全哑却永远没人
+//   去恢复它 —— 半把键盘失灵会比全哑更难被发现。
+//
+// 每 500ms 调一次，会有一瞬（约 250µs）把两边的第 0 列拉低。三态消抖天然
+// 吃掉它：候选位翻过去不到 1ms 就翻回来，凑不满 DEBOUNCE_DELAY(20ms)，
+// 升不成稳定态，不会产生任何假按键。
 static bool mcpColumnStrobeOk(void) {
-    mcp.writeGPIOA(0xFE);          // 只有第 0 列为低
+    mcp.writeGPIOA(0xFE);          // A 侧只有第 0 列为低
     uint8_t a = mcp.readGPIOA();
     mcp.writeGPIOA(0xFF);
+    mcp.writeGPIOB(0xFE);          // B 侧同样挑第 0 列（即全局第 8 列）
+    uint8_t b = mcp.readGPIOB();
     mcp.writeGPIOB(0xFF);          // 同时回到"每轮扫描开始时两个端口都是 0xFF"
-    return (a == 0xFE);
+    return (a == 0xFE) && (b == 0xFE);
+}
+
+// 直读方向寄存器 IODIRA(0x00)。Adafruit 库没暴露读方向的接口，走原始 Wire。
+//
+// 这是故障现场最关键的一个数，因为它的两个取值直接指向两种不同的病根：
+//   0xFF = 芯片被复位过 / 配置丢了（复位默认值就是全输入）
+//   0x00 = 配置还在 → 那问题在总线或写入上，跟复位无关
+// 总线本身不通时返回 0xFF 当哨兵 —— 这时"读不到"和"全输入"从外面看一样，
+// 但两者在日志里配合错误文案能分得开。
+static uint8_t mcpReadIODIR(void) {
+    Wire.beginTransmission(MCP23017_ADDR);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) return 0xFF;
+    if (Wire.requestFrom(MCP23017_ADDR, 1) != 1) return 0xFF;
+    return (uint8_t)Wire.read();
 }
 
 // 恢复成功后清干净消抖和"按下"状态。
@@ -7615,7 +7653,11 @@ static bool recoverI2CBus(void) {
     }
 
     // 去重会把反复的同类失败合并成一条并累加次数，所以这里可以放心每次都记。
-    ELERR("I2C", "总线恢复失败 键盘可能失灵");
+    //
+    // 把 IODIRA 一起带上：0xFF 说明芯片是被复位过 / 配置丢了，0x00 说明配置
+    // 还在、问题在总线或写入上 —— 两者修法完全不同，光看"恢复失败"四个字
+    // 分不出来，下次再犯还是只能猜。
+    ELERR("I2C", "总线恢复失败 IODIRA=%02X", mcpReadIODIR());
     return false;
 }
 
