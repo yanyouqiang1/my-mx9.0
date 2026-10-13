@@ -403,6 +403,30 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 #define SHT31_ADDR 0x44
 
 #define MCP23017_ADDR 0x20
+
+// MCP23017 的**硬件复位脚**：SOIC/TSSOP-18 封装是 18 脚，QFN-28 封装是 14 脚。
+// 低有效，施密特触发输入（数据手册 D031/D041：VIL≤0.2VDD、VIH≥0.8VDD）。
+//
+// 板上接法（三件事，缺一不可）：
+//   1. MCP23017 的 RESET 脚 → S3 的这个 IO
+//   2. RESET 脚 → 10kΩ → 3.3V 上拉      ← 关键，原因见下面「必须有上拉」
+//   3. （可选）RESET 脚 → 100nF → GND 做 RC 抗干扰，不加也能工作
+//
+// 为什么必须接 GPIO：芯片内部状态机卡死时会**一直拉着 SDA 不放**，敲多少个
+// 时钟都松不开 —— 时钟救援只对「还在正常走协议、只是总线停在半个字节中间」
+// 有效。可数据手册 TABLE 1-2 写死了：RESET 拉低后 **1µs 内所有输出脚进入
+// 高阻**（TIOZ ≤ 1µs）。也就是说 RESET 是唯一能让它主动松手的手段，而且
+// **不需要断电**，S3 自己一个 IO 就完成了，等于随时能给芯片重新上一次电。
+//
+// 为什么上拉必须有：S3 自己复位/上电期间这个 IO 是高阻，RESET 就浮空了。
+// 数据手册原文 "Must be externally biased" —— 浮空时芯片会被随机复位，表现
+// 就是键盘毫无征兆地失灵，正是要治的病。另外 RESET 是**低有效**，接 GND 等于
+// 永久按住复位，比接 VCC 严重得多。
+//
+// 改成 -1 就等于「这根线没接」，固件退回纯软件恢复（只敲时钟），行为跟改动前
+// 完全一致，方便分清到底是哪一级起了作用。
+#define MCP_RESET_PIN 43
+
 #define WDT_TIMEOUT  10
 
 SPIClass tftSPI(FSPI);
@@ -1699,6 +1723,7 @@ static uint8_t mcpReadIODIR(void);
 static void i2cStrobe(int pulses, uint16_t halfUs);
 static void mcpApplyColumnConfig(void);
 static void mcpResetMatrixState(void);
+static void mcpHardwareReset(void);
 void bootDetailTick(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
@@ -7508,13 +7533,20 @@ static void scanKeyboardMatrix(void) {
 // 哑到断电为止 —— **S3 软重启也救不了**，因为重启并不会让 3.3V 掉下去，
 // 芯片还是那个卡住的芯片，只有彻底断电才能让它松开 SDA。
 //
-// 真正能让从机松手的只有一件事：**把 SCL 敲够 9 拍**，让它把手里那个字节
-// 走完再放线。这是 i2c 总线救援的标准动作，纯软件、零硬件。
+// 敲 SCL 只对「芯片还在正常走协议、只是总线停在半个字节中间」有效：敲够 9 拍
+// 它就会把手里那个字节走完再放线，这是 i2c 总线救援的标准动作。
 //
-// 所以现在分三级，从最便宜的试起：
+// 但如果芯片内部状态机是**整个死透**的，它已经不是从机状态机了，只剩下一个把
+// SDA 按住的输出级 —— 敲多少拍都松不开，S3 软重启也没用（3.3V 没掉下去，
+// 还是那个卡住的芯片）。这种只有**硬件复位**能救：数据手册 TABLE 1-2 明确
+// RESET 拉低后 1µs 内输出脚全部进入高阻。这是四级阶梯里唯一不靠总线
+// 通信就能生效的一级，也是唯一能真正免断电的一级。
+//
+// 所以现在分四级，从最便宜的试起：
 //   0 级  总线还通，只是芯片丢了寄存器配置 → 重刷方向和电平就行
-//   1 级  9 拍救援 + 重建外设（内含芯片软复位）
-//   2 级  40 拍、慢 12 倍，给半死不活的从机最后机会
+//   1 级  硬复位 MCP23017（只有真接了 RESET 脚的那台机器才有这级）
+//   2 级  12 拍救援 + 重建 I2C 外设
+//   3 级  40 拍、慢 12 倍，给半死不活的从机最后机会
 
 // 把 SCL 敲 pulses 下，最后补一个 STOP。
 //
@@ -7619,6 +7651,28 @@ static void mcpResetMatrixState(void) {
     memset(debounceCandMs, 0, sizeof(debounceCandMs));
 }
 
+// 硬复位 MCP23017：把 RESET 脚拉低几毫秒再放开。
+//
+// 这是整个阶梯里唯一能对付「芯片状态机死透、自己拉着 SDA 不放」的动作，也是
+// 唯一真正免断电的一级 —— 它走的是复位脚，**不经过 I2C 总线**，所以哪怕总线
+// 已经彻底废了照样生效。
+//
+// 时序取得很宽：数据手册 TABLE 1-2 只要求 TRSTL（复位低电平宽度）≥ 1µs、
+// THLD（放开后到工作）= 0ns，这里给 5ms 低电平 + 2ms 恢复余量，对任何一批芯片
+// 都绰绰有余，总代价不到 10ms。
+//
+// ⚠ MCP_RESET_PIN = -1（没接这根线）时整个函数编译成空的，阶梯自动跳过这一级，
+//   行为和改动前一模一样。也就是说光刷固件不会改变还没改硬件的那台机器。
+static void mcpHardwareReset(void) {
+#if MCP_RESET_PIN >= 0
+    pinMode(MCP_RESET_PIN, OUTPUT);
+    digitalWrite(MCP_RESET_PIN, LOW);
+    delay(5);
+    digitalWrite(MCP_RESET_PIN, HIGH);
+    delay(2);
+#endif
+}
+
 static bool recoverI2CBus(void) {
     // ---- 第 0 级：总线还通，只是芯片丢了寄存器配置 ----
     // 最常见也最便宜，一次 I2C 外设都不用重建。覆盖 IODIRA/IODIRB 被复位
@@ -7633,17 +7687,30 @@ static bool recoverI2CBus(void) {
         }
     }
 
-    // ---- 第 1 / 2 级：芯片或总线本身死了 ----
-    for (int stage = 1; stage <= 2; stage++) {
+    // ---- 第 1/2/3 级：芯片或总线本身死了 ----
+    for (int stage = 1; stage <= 3; stage++) {
         Wire.end();
         delay(5);
-        i2cStrobe(stage == 1 ? 12 : 40, stage == 1 ? 5 : 60);
+        // 第 1 级硬复位，后两级敲时钟。
+        // 顺序不是随便排的：芯片死透的时候 SDA 被它自己按着，这时候敲 12 拍
+        // 时钟它根本不理（它已经不在走协议了）。必须**先**把它复位出来、总线
+        // 回到空闲态，后面的时钟敲击才有意义。反过来先敲再复位也行，但那是把
+        // 确定有效的动作排在确定无效的动作后面，白白多花几十毫秒。
+        if (stage == 1) mcpHardwareReset();                     // 没接线时是空函数
+        else            i2cStrobe(stage == 2 ? 12 : 40, stage == 2 ? 5 : 60);
         delay(10);
         Wire.begin(I2C_SDA, I2C_SCL);
         Wire.setClock(400000);
         Wire.setTimeOut(25);
-        // begin_I2C() 内部会写 IOCLR=0x05 做**软件复位**（bit2 就是软件复位
-        // 位，效果等同拉 RESET 脚）。所以这一级顺手把"寄存器被清空"也修了。
+        // ⚠⚠ begin_I2C() **不会**复位芯片。它只是 new 一个 Adafruit_I2CDevice
+        // 再探一下地址应答（Adafruit_MCP23XXX.cpp:33-36 就这三行），没有任何
+        // 寄存器写入。这里以前的注释写着「内部会写 IOCLR=0x05 做软件复位」——
+        // **是错的**，那版注释把人带偏了：以为 1/2 级顺手清了寄存器，其实
+        // 1/2 级和 0 级做的是同一件事（探地址 + 重刷列配置），只多敲了时钟。
+        // 这大概就是上到板子之后键盘还是会失灵、只能断电的原因。
+        //
+        // 真要清寄存器可以写 IOCON(0x05) 的 bit2（SOFT RESET），但那还是走
+        // 总线 —— 总线已经卡死时根本送不到。这一点也正是要用复位脚的原因。
         if (!mcp.begin_I2C(MCP23017_ADDR, &Wire)) continue;   // 失败就升一级
         mcpApplyColumnConfig();
         if (mcpColumnStrobeOk()) {
@@ -7657,7 +7724,13 @@ static bool recoverI2CBus(void) {
     // 把 IODIRA 一起带上：0xFF 说明芯片是被复位过 / 配置丢了，0x00 说明配置
     // 还在、问题在总线或写入上 —— 两者修法完全不同，光看"恢复失败"四个字
     // 分不出来，下次再犯还是只能猜。
-    ELERR("I2C", "总线恢复失败 IODIRA=%02X", mcpReadIODIR());
+    //
+    // 再带上"硬复位试没试过"，因为它一刀切开了两类病根：
+    //   硬复位已试仍然失败 → 芯片放开了 SDA 还是不通 → 病根在**外部**（焊点、
+    //     短路、上拉电阻坏了），软件再怎么写都白搭，该动烙铁了
+    //   没接线             → 还不知道芯片能不能被救回来，需要先飞线
+    ELERR("I2C", "总线恢复失败 IODIRA=%02X %s", mcpReadIODIR(),
+          (MCP_RESET_PIN >= 0) ? "硬复位已试" : "无复位脚");
     return false;
 }
 
@@ -11042,6 +11115,14 @@ void setup() {
     }
 
     // I2C / MCP23017
+    // 复位脚必须在碰 I2C **之前**先拉高：这颗芯片的 RESET 是低有效的，S3 刚
+    // 上电时这个 IO 还是高阻，万一芯片自己被随机复位，就会一直待在复位里 ——
+    // 16 个列脚全是输入态，键盘从开机起就是哑的，而且 I2C 侧看起来完全正常
+    // （芯片在复位里照样应答地址），最难查的那种哑法。
+#if MCP_RESET_PIN >= 0
+    pinMode(MCP_RESET_PIN, OUTPUT);
+    digitalWrite(MCP_RESET_PIN, HIGH);
+#endif
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000);
     // ⚠ 这个超时以前只有 recoverI2CBus() 里有，主路径一直吃 Arduino 默认的
