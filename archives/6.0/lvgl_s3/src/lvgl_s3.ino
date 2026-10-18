@@ -424,21 +424,31 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 // 永久按住复位，比接 VCC 严重得多。
 //
 // ===========================
-// 这块板子的接法：**MCP23017 的 VCC 直接接它自己的 RESET 脚**（常高）。
+// MCP23017 的硬件复位脚：接 S3 的 GPIO11。
 //
-// 为什么回到这个接法：它本来就是数据手册对"RESET 不用作控制"的标准建议，
-// 而且是这台机器上**唯一被实测验证过键盘能用**的配置。为了一个"理论上的
-// 硬复位恢复手段"去改成 GPIO 控制，结果是引入了新的故障面（悬空浮窗、
-// 驱动它时的下拉瞬间、和接线错误叠加出来的电源短路），收益却一次都没兑现过。
+// 接法（两件事，缺一不可）：
+//   1. RESET → GPIO11
+//   2. RESET → 10kΩ → **3.3V** 上拉   ← 必须接，而且只能接 3.3V
 //
-// 保留 -1 的含义：固件不去驱动这一脚。于是
-//   · mcpHardwareReset() 编译成空的，恢复阶梯自动跳过硬复位那一级
-//   · mcpResetWireSelfTest() 不做任何拉低动作，不会再去动用户的接线
-//   · 屏幕上的自检项如实报"未接复位脚"，而不是拿一个不成立的判据骗人
+// 为什么值得接 GPIO：芯片状态机卡死时会**一直拉着 SDA 不放**，敲多少个时钟都
+// 松不开 —— 时钟救援只对「还在正常走协议、只是总线停在半个字节中间」有效。
+// 数据手册 TABLE 1-2 写死：RESET 拉低后 **1µs 内所有输出脚进入高阻**。也就是说
+// RESET 是唯一能让它主动松手的手段，而且**不需要断电**，S3 自己一个 IO 就完成了。
+// mcpHardwareReset() 干的就是这件事：它走复位脚、不经过 I2C，总线已经废了照样生效。
 //
-// 代价（要认）：芯片状态机真卡死时，少了"不重新上电也能拽出来"这一招，
-// 只能靠 recoverI2CBus 的时钟敲击那一路。这是明知的取舍，不是遗漏。
-#define MCP_RESET_PIN -1
+// 为什么必须有上拉：S3 在 bootloader 阶段、以及 setup() 里那行 digitalWrite 之前，
+// 这个 IO 是高阻。芯片内部只有 **100kΩ 的弱上拉**，节点会长时间悬在中间电压，
+// 而 RESET 是施密特触发输入（VIL≤0.2VDD、VIH≥0.8VDD）—— 落在中间就是随机进出复位。
+// 表现就是键盘毫无征兆地失灵。10k 才能把这个窗口彻底关掉。
+//
+// ⚠⚠ 上拉只能接 **3.3V**，绝对不要接模块自己的 VCC。
+//   这台机器上踩过：为了"加强上拉"给 SDA/SCL 各加了一个 4.7k 到模块 VCC，
+//   结果键盘直接全哑，害得排查方向整个跑偏到复位脚上。那个 VCC 未必是 3.3V，
+//   而 ESP32-S3 的 GPIO **不耐 5V（上限 3.6V）** —— 拉到 5V 等于把 5V 灌进主控引脚。
+//
+//   同理 SDA/SCL **不要**外加上拉：模块板上本来就自带，I2C 能正常工作就是证据，
+//   并联更多上拉不会让总线更稳，只会让低电平驱动更吃力。
+#define MCP_RESET_PIN 11
 
 #define WDT_TIMEOUT  10
 
@@ -7721,16 +7731,10 @@ struct McpWireCheck {
 static McpWireCheck g_mcpWire = { false, false, false, 0xFF };
 
 static const char* mcpWireVerdict(void) {
-#if MCP_RESET_PIN < 0
-    // 固件不碰复位脚时，"拉低应当失败"这条判据根本不成立，
-    // 如实说没接，别拿一个没跑过的判据报一个看似权威的结论。
-    return "未接复位脚";
-#else
     if (g_mcpWire.strobeHigh && !g_mcpWire.strobeLow) return "线通 芯片正常";
     if (g_mcpWire.strobeHigh &&  g_mcpWire.strobeLow) return "复位线未接";
     if (g_mcpWire.strobeBack)                            return "上电态失败";
     return "芯片无响应";
-#endif
 }
 
 static void mcpResetWireSelfTest(void) {
