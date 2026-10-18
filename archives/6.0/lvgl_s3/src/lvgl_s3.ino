@@ -423,9 +423,22 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 // 就是键盘毫无征兆地失灵，正是要治的病。另外 RESET 是**低有效**，接 GND 等于
 // 永久按住复位，比接 VCC 严重得多。
 //
-// 改成 -1 就等于「这根线没接」，固件退回纯软件恢复（只敲时钟），行为跟改动前
-// 完全一致，方便分清到底是哪一级起了作用。
-#define MCP_RESET_PIN 11
+// ===========================
+// 这块板子的接法：**MCP23017 的 VCC 直接接它自己的 RESET 脚**（常高）。
+//
+// 为什么回到这个接法：它本来就是数据手册对"RESET 不用作控制"的标准建议，
+// 而且是这台机器上**唯一被实测验证过键盘能用**的配置。为了一个"理论上的
+// 硬复位恢复手段"去改成 GPIO 控制，结果是引入了新的故障面（悬空浮窗、
+// 驱动它时的下拉瞬间、和接线错误叠加出来的电源短路），收益却一次都没兑现过。
+//
+// 保留 -1 的含义：固件不去驱动这一脚。于是
+//   · mcpHardwareReset() 编译成空的，恢复阶梯自动跳过硬复位那一级
+//   · mcpResetWireSelfTest() 不做任何拉低动作，不会再去动用户的接线
+//   · 屏幕上的自检项如实报"未接复位脚"，而不是拿一个不成立的判据骗人
+//
+// 代价（要认）：芯片状态机真卡死时，少了"不重新上电也能拽出来"这一招，
+// 只能靠 recoverI2CBus 的时钟敲击那一路。这是明知的取舍，不是遗漏。
+#define MCP_RESET_PIN -1
 
 #define WDT_TIMEOUT  10
 
@@ -7708,10 +7721,16 @@ struct McpWireCheck {
 static McpWireCheck g_mcpWire = { false, false, false, 0xFF };
 
 static const char* mcpWireVerdict(void) {
+#if MCP_RESET_PIN < 0
+    // 固件不碰复位脚时，"拉低应当失败"这条判据根本不成立，
+    // 如实说没接，别拿一个没跑过的判据报一个看似权威的结论。
+    return "未接复位脚";
+#else
     if (g_mcpWire.strobeHigh && !g_mcpWire.strobeLow) return "线通 芯片正常";
     if (g_mcpWire.strobeHigh &&  g_mcpWire.strobeLow) return "复位线未接";
     if (g_mcpWire.strobeBack)                            return "上电态失败";
     return "芯片无响应";
+#endif
 }
 
 static void mcpResetWireSelfTest(void) {
