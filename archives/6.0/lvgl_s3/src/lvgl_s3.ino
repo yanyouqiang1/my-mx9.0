@@ -425,7 +425,7 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 //
 // 改成 -1 就等于「这根线没接」，固件退回纯软件恢复（只敲时钟），行为跟改动前
 // 完全一致，方便分清到底是哪一级起了作用。
-#define MCP_RESET_PIN 43
+#define MCP_RESET_PIN 11
 
 #define WDT_TIMEOUT  10
 
