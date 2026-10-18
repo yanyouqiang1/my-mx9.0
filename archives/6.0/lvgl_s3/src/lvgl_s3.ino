@@ -1202,12 +1202,20 @@ static void handleCommand(const String& cmd);   // 真正定义在文件后段�
 // 解析放在 loop() 里逐行做，和 BLE / USB HID 通道同一个纪律：
 // 串口缓冲、LVGL 调用都在主任务，函数本身不做任何阻塞读。
 static bool c3Connected = false;
+// 开机至今从 C3 收到的字节数。
+//
+// 为什么单独计数而不是只看 c3Connected：PONG 要等 C3 先被问才会来，而"灯效和
+// 灯光键全无反应"这条症状既可能是 C3 没接（一个字节都没有），也可能是接了但
+// 不回话（有杂字节、没 PONG）。这两个在界面上看起来一模一样，只能靠字节数区分。
+// 同样地，这也**不是**匹配日志措辞，是硬件侧可观测的事实。
+static uint32_t c3RxBytes = 0;
 static void handleC3Command(const String& cmd);   // 定义在文件后段
 static void knobAdjust(int dir);                  // 定义在文件后段
 static void handleC3Events(void) {
     static String serialBuffer = "";
     while (Serial1.available() > 0) {
         char c = (char)Serial1.read();
+        c3RxBytes++;
         if (c == '\n') {
             serialBuffer.trim();
             if (serialBuffer.length() > 0) {
@@ -7673,6 +7681,61 @@ static void mcpHardwareReset(void) {
 #endif
 }
 
+// ===========================
+// RESET 连线自检
+// ===========================
+// 唯一能证明「RESET 这根线真的落在芯片脚上」的动作 —— 必须主动去戳它一脚。
+//
+// 为什么非做不可：固件把 MCP_RESET_PIN 改成实际接线的那一脚之后，如果这根线
+// 其实**没焊到芯片的 RESET 上**（焊错脚 / 虚焊 / PCB 上断线），那拉高拉低对
+// 芯片毫无影响。而「拉高没用」和「芯片本身坏了」在键盘上的表现**完全一样**：
+// 都是全哑，I2C 侧都照样答地址。只看 mcpColumnStrobeOk() 失败，分不出这两种 ——
+// 于是每次都只能盯着同一批日志反复猜到底该动软件还是动烙铁。
+//
+// 判据（RESET 低有效，拉低后芯片一定进复位态，16 个列脚全变高阻）：
+//   strobeHigh=真 + strobeLow=假  → 线通了，芯片也能驱动列，硬件合格
+//   strobeHigh=真 + strobeLow=真  → **复位线没接到这颗芯片上**（最常见的一类）
+//   strobeHigh=假                → 没供电 / I2C 不通 / 列配置写不进去
+//
+// 收尾必须把 RESET 拉回高并重刷列配置。不这么做的话测完这一轮键盘就真的哑了，
+// 而用户看到的是「本来就坏的键盘」，根本分不清是自己测坏的。
+struct McpWireCheck {
+    bool    strobeHigh;   // RESET 拉高时列选通过 —— 期望真
+    bool    strobeLow;    // RESET 拉低时列选通过 —— 期望**假**（真 = 线没接上）
+    bool    strobeBack;   // 拉回高之后列选通过 —— 期望真
+    uint8_t iodira;       // 直读方向寄存器：FF=被复位过/配置丢了，00=配置还在
+};
+static McpWireCheck g_mcpWire = { false, false, false, 0xFF };
+
+static const char* mcpWireVerdict(void) {
+    if (g_mcpWire.strobeHigh && !g_mcpWire.strobeLow) return "线通 芯片正常";
+    if (g_mcpWire.strobeHigh &&  g_mcpWire.strobeLow) return "复位线未接";
+    if (g_mcpWire.strobeBack)                            return "上电态失败";
+    return "芯片无响应";
+}
+
+static void mcpResetWireSelfTest(void) {
+#if MCP_RESET_PIN >= 0
+    // 必须从高电平开始：芯片得先在正常工作态，后面「拉低应当失败」才有意义
+    pinMode(MCP_RESET_PIN, OUTPUT);
+    digitalWrite(MCP_RESET_PIN, HIGH);
+    delay(5);
+    g_mcpWire.strobeHigh = mcpColumnStrobeOk();
+
+    // 拉低 → 进复位态 → 列脚全高阻 → 列选必须失败
+    digitalWrite(MCP_RESET_PIN, LOW);
+    delay(5);
+    g_mcpWire.strobeLow = mcpColumnStrobeOk();
+
+    // 拉回来并重刷列配置，把芯片放回正常态再交还主循环
+    digitalWrite(MCP_RESET_PIN, HIGH);
+    delay(5);
+    mcpApplyColumnConfig();
+    g_mcpWire.strobeBack = mcpColumnStrobeOk();
+#endif
+    g_mcpWire.iodira = mcpReadIODIR();
+}
+
 static bool recoverI2CBus(void) {
     // ---- 第 0 级：总线还通，只是芯片丢了寄存器配置 ----
     // 最常见也最便宜，一次 I2C 外设都不用重建。覆盖 IODIRA/IODIRB 被复位
@@ -10738,10 +10801,12 @@ static const char* ctStageName(uint32_t s) {
 }
 
 // 第二张 HUD（内存详情）延迟 1.4s 弹出，让第一张"重启原因"先被看到
-// 开机诊断 HUD 队列：三张依次弹出（原因 → 内存 → 上次现场）。
-// 之前只支持一张，第二个字段只能靠额外的 pending 标志硬塞；换成队列后
-// 后面再加诊断项直接 push 就行。
-#define BOOT_HUD_MAX 3
+// 开机诊断 HUD 队列：三张依次弹出（原因 → 内存 → 上次现场），
+// 后面接的是两张**硬件自检**（键盘扩展 / C3 串口）。
+// 为什么硬件自检必须走屏幕而不是串口：这块板子没有 CDC（日志只能进 PSRAM 缓冲，
+// 要靠网页 LOG:dump 才拿得到），而"键盘全哑"的用户恰恰**没有键盘**去翻菜单 ——
+// 这正是这类故障最难查的地方：唯一的证据通道被故障本身堵死了。
+#define BOOT_HUD_MAX 6
 struct BootHudItem {
     unsigned long atMs;
     char title[16];
@@ -10855,6 +10920,31 @@ static void showBootDiagnostics(void) {
         // 没有记录 = 断电重启（RTC 慢存会掉电清零），不是软件崩溃
         snprintf(buf, sizeof(buf), "断电或首次烧录");
         pushBootHud(2900, "上次", buf, CLR_TEXT_DIM);
+    }
+
+    // 第四张：键盘扩展（MCP23017）硬件自检。判据见 mcpResetWireSelfTest。
+    //
+    // 这一张是"键盘全哑"时**唯一还能用**的证据：不依赖按键，也不依赖串口。
+    // 之前只有内存/重启原因这些跟故障本身无关的项，等于让一个失灵的用户
+    // 去读一份没告诉他坏在哪的体检报告。
+    {
+        char w[40];
+        snprintf(w, sizeof(w), "%s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+        bool wireGood = g_mcpWire.strobeHigh && !g_mcpWire.strobeLow;
+        pushBootHud(4400, "键盘扩展", w, wireGood ? CLR_GREEN : CLR_RED);
+        // 同一条也落进日志：开机 HUD 一闪而过，日志是能翻回来查的
+        if (wireGood) ELINFO("I2C", "自检 %s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+        else         ELERR ("I2C", "自检 %s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+    }
+
+    // 第五张：C3 串口（灯效 / 灯光键 / 旋钮都走这条线）。
+    // 故意排在 8s 而不是紧跟 setup 尾巴：PONG 和心跳要等 C3 先被问才来，
+    // 刚开机就报"0 字节"，那条信息什么也证明不了，只会误导人去查 UART 接线。
+    {
+        char w[40];
+        snprintf(w, sizeof(w), "%lu字节 %s",
+                 (unsigned long)c3RxBytes, c3Connected ? "已握手" : "未握手");
+        pushBootHud(8000, "C3 串口", w, c3RxBytes ? CLR_GREEN : CLR_AMBER);
     }
 
     LOG_PORT.printf("[BOOT] prev: hang=%u stage=%u(%s) key=%s uptimeMs=%u\n",
@@ -10978,6 +11068,10 @@ void setup() {
     tft.init(240, 240);
     tft.setSPISpeed(40000000);
     tft.setRotation(1);
+    // 面板 GRAM 上电是随机内容，从 tft.init() 到 LVGL 第一次 flush 之间
+    // （还要走完 SPIFFS / 壁纸 / 键位表）有好几秒，这段时间用户看到的就是满屏
+    // "雪花点"。先刷成黑底，接下来的启动延迟至少看起来像正常开机而不是坏了。
+    tft.fillScreen(ST77XX_BLACK);
 
     // LVGL
     lvgl_driver_init(&tft);
@@ -11248,6 +11342,9 @@ void setup() {
     for (int r = 0; r < NUM_ROWS; r++) {
         pinMode(rowPins[r], INPUT_PULLUP);
     }
+    // 复位线自检必须放在列配置刷好之后、显示之前：它要读写 GPIO 寄存器才测得准，
+    // 结果又要赶在 showBootDiagnostics() 之前落到屏幕上。
+    mcpResetWireSelfTest();
 
     // 看门狗
     #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
