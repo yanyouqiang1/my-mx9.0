@@ -711,6 +711,61 @@ static uint8_t hostKeySent[NUM_ROWS][NUM_COLS] = {0};
 // 幽灵按键。反正这时候本来一个键也扫不出来。
 static bool mcpHealthy = true;
 
+// ---------------------------------------------------------------------------
+// 死机探测（每拍都跑，8ms 级）
+//
+// 为什么需要这一层：原来只有 500ms 一次的全量自检（mcpColumnStrobeOk），
+// 它抓得住"已经彻底死透"，抓不住"正在半死"。
+//
+// 现场症状是：按住空格（或 A、I）→ 主机收到 6~7 次 → 然后全哑。而"6~7 次"
+// 本身需要 12~14 次电平翻转，每次都得稳定满 DEBOUNCE_DELAY(20ms) 才认一次
+// 账，也就是 **240~280ms**。这个时长和 500ms 的自检周期是同一量级，能不能
+// 赶在连发发出去之前检测到**全看自检 tick 落在哪里** —— 这正是它偶发的原因：
+// 运气好一次连发都没有，运气差 6~7 次全发给主机，然后才判死。
+//
+// 换成每拍都跑之后，最坏 2 拍（16ms）就能判死，连发根本发不出去。
+//
+// 两路探测互相补盲：
+//   ① 空闲态行脚检查 —— 抓"某一列被芯片死死按低"（连发的直接根源）
+//   ② 同键连发计数   —— 抓故障时好时坏、撑不满一整轮的短命故障
+// ---------------------------------------------------------------------------
+
+// ① 空闲态自检：连续几拍读到"所有列都放开时仍有行脚为低"。
+// 要连续 MCP_IDLE_STRIKE_N 拍才判死 —— 列脚刚从驱动切回高阻的那一瞬间
+// 可能还在建立，单拍读数不作数。
+#define MCP_IDLE_STRIKE_N 2
+static uint8_t g_mcpIdleStrike = 0;
+
+// 最近一次判死时"空闲态仍被拉低"的行脚位图（bit0=行0 … bit9=行9）。
+// 留进日志是为了能直接对上是哪几行 → 排查时缩小到具体某一列。
+static uint16_t g_mcpIdleLowRows = 0;
+
+// ② 同键连发计数：同一颗键在 GHOST_WINDOW_MS 内被认下 GHOST_BURST_N 次
+// 按下 —— 人手做不到（最快也就 ~10 键/秒 = 同键 ~100ms 一次），
+// 而半死的总线正好会造出这个形状。
+//
+// 只存计数不存时间戳：整个窗口共用一个起点 ghostWinMs，过期就整块清零。
+// 省掉 160×4 字节的时间戳数组，代价只是每 400ms 一次 160 字节 memset。
+#define GHOST_WINDOW_MS 400
+#define GHOST_BURST_N    4
+static uint8_t           ghostPresses[NUM_ROWS][NUM_COLS];
+static unsigned long     ghostWinMs = 0;
+
+// 自动复位成功次数。**跨重启保存**（NVS）：用户遇到"键盘失灵"多半伴随一次
+// 重启，不落盘的话开机就归零，看到的永远是 0，等于没记。
+static uint32_t g_mcpRecoverN = 0;
+
+// 判死之后的重试节奏。
+static unsigned long mcpRetryMs = 0;
+// 恢复间隔：正常 300ms；一旦出现"刚恢复就又坏"的连击，退到 2s。
+// 不退的话最坏情况就是每 300ms 敲一次 I2C，而总线真废掉时每次
+// begin_I2C 都要吃满 25ms 超时 —— 主循环被反复打断，界面跟着一起卡。
+#define MCP_RETRY_MS        300
+#define MCP_RETRY_MS_SLOW  2000
+#define MCP_STRIKE_SLOW      3
+static uint8_t  g_mcpRefault = 0;    // 连续"恢复后立刻又判死"的次数
+static unsigned long mcpStableMs = 0;
+
 static uint32_t totalKeyCount = 0;
 static uint16_t baseMatrix[NUM_ROWS][NUM_COLS] = { 0 };
 static bool fnPressed = false;
@@ -1755,6 +1810,10 @@ static void i2cStrobe(int pulses, uint16_t halfUs);
 static void mcpApplyColumnConfig(void);
 static void mcpResetMatrixState(void);
 static void mcpHardwareReset(void);
+static bool mcpIdleRowsClean(void);
+static bool mcpGhostBurstAt(int r, int c);
+static void mcpTripFault(void);
+static uint32_t mcpAutoRecoverCount(void);
 void bootDetailTick(void);
 static void renderCurrentDisplayBase(void);
 static void updateDynamicElements(void);
@@ -7165,19 +7224,48 @@ static void scanKeyboardMatrix(void) {
         //
         // 现在改成真写一列再读回来核对：写进去的图案读不出来，就是芯片没法用了。
         // 每 500ms 一次，只多 3 个 I2C 事务，代价可以忽略。
+        //
+        // 这一路只负责**判死**，不再自己动手恢复 —— 判死之后一律交给下面那个
+        // 统一入口，免得三路探测各写一套重试节奏，最后谁在敲总线都说不清。
         if (!mcpColumnStrobeOk()) {
-            ct_mark(CT_S_SCAN_RECOVER);
-            ELWARN("I2C", "列选异常 正在恢复总线");
-            mcpHealthy = false;
-            if (!recoverI2CBus()) {
-                return;   // 没救回来，这一轮扫描直接跳过（下面读到的全是垃圾）
-            }
-            ELINFO("I2C", "总线已恢复");
+            ELWARN("I2C", "列选自检失败 判死");
+            mcpTripFault();
         }
-        mcpHealthy = true;
     }
-    // 自检判死之后不再盲扫 —— 理由和"连发"那个现象写在 mcpHealthy 的声明处。
-    if (!mcpHealthy) return;
+
+    // ---- 统一自愈入口：任何一路判死都在这里恢复 ----
+    //
+    // 判死之后**不再盲扫**（理由和"连发"现象写在 mcpHealthy 的声明处）：
+    // 这时候一个键也扫不出来，盲扫唯一的作用是产生幽灵按键。
+    //
+    // 恢复本身是阻塞的（阶梯最深一级要几十毫秒），所以按间隔退避，不要每一拍
+    // 都去敲 —— 总线真废掉时每次 begin_I2C 都要吃满 25ms 超时。
+    if (!mcpHealthy) {
+        unsigned long iv = (g_mcpRefault >= MCP_STRIKE_SLOW) ? MCP_RETRY_MS_SLOW
+                                                              : MCP_RETRY_MS;
+        if (millis() - mcpRetryMs >= iv) {
+            mcpRetryMs = millis();
+            ct_mark(CT_S_SCAN_RECOVER);
+            // 点名是哪几行被按死、以及同键连发计数，排障时能直接缩小到某一列
+            ELWARN("I2C", "开始恢复 总线=%s 空闲低行=%03X",
+                   g_mcpIdleStrike ? "空" : "列选",
+                   (unsigned)g_mcpIdleLowRows);
+
+            if (recoverI2CBus()) {
+                mcpHealthy = true;
+                g_mcpIdleStrike  = 0;                       // 重新开始计连续判死
+                memset(ghostPresses, 0, sizeof(ghostPresses));
+                g_mcpRefault = 0;                            // 本次是真救回来了
+                mcpStableMs = millis();                      // 稳定性计时起点
+                g_mcpRecoverN = mcpAutoRecoverCount() + 1;
+                preferences.putUInt("mcp_recover_n", g_mcpRecoverN);  // 跨重启保留
+                ELINFO("I2C", "已复位自动恢复 累计第 %lu 次", (unsigned long)g_mcpRecoverN);
+            } else {
+                ELWARN("I2C", "恢复未成功 稍后重试");
+            }
+        }
+        return;   // 没恢复就一直不扫
+    }
 
     // LOGO 长按判定。矩阵键本来**没有**长按检测（工程里所有 _HOLD 都来自
     // C3 小 MCU 的 Serial1 上报），这里按"按下时记时刻 + 每拍看一次还按着没有"
@@ -7201,8 +7289,11 @@ static void scanKeyboardMatrix(void) {
         // 端口字节、改一位、再写回 —— 一次 digitalWrite = 2 次 I2C 事务。
         // 16 列 × (LOW + HIGH) = 32 次 digitalWrite = **64 次 I2C 事务**，
         // 400kHz 下单次事务 ~112µs，光 I2C 就要 ~7ms，再加上 16×20µs 的列稳定
-        // 等待，一次完整扫描 ~7.3ms。而 loop() 里 SCAN_INTERVAL 是 2ms ——
-        // **需求是硬件能力的 3.5 倍**。扫描是阻塞 I2C，又排在 lvgl_driver_loop()
+        // 等待，一次完整扫描 ~7.3ms。而 loop() 里 SCAN_INTERVAL 现在是 8ms
+        // （这行原来写的是 2ms，是改成寄存器直写之前的初版值；SCAN_INTERVAL
+        //  后来随 LVGL 帧预算一起放宽到 8ms，见文件底部那个常量）。
+        // 也就是说：改成单次寄存器写之前，**需求是硬件能力的 3.5 倍**。
+        // 扫描是阻塞 I2C，又排在 lvgl_driver_loop()
         // 前面，loop() 永远补不回来 → 界面停更（看起来卡死）+ 扫描本身也跑不满
         // （按键失灵）。这就是"切到要素最多的信息面板就整机卡死"的主因。
         //
@@ -7246,6 +7337,28 @@ static void scanKeyboardMatrix(void) {
                 ct_set_ctx(currentSysMode, currentDispMode);
 
                 if (currentState) {
+                    // ---- 同键连发探测：卡在任何分发**之前** ----
+                    //
+                    // 放在这里而不是分发之后，是因为用户真正受害的就是"幽灵按键
+                    // 真的发到了主机"这一步 —— 6~7 次连发已经打进正在编辑的文档
+                    // 里了，判死再快也追不回来。这里直接不认这一账。
+                    //
+                    // 注意 keebMatrix 在上面已经翻成 true 了，这没关系：
+                    // hostKeyHeld 仍是 false，于是松键时不会发一个无头的 release，
+                    // 主机那边从头到尾没收到过这颗键，干净。
+                    //
+                    // ⚠ 这里用 continue（只跳过这一格）而**不**中断整轮扫描，是
+                    // 有依据的：DEBOUNCE_DELAY 是 20ms，而一拍（SCAN_INTERVAL）
+                    // 只有 8ms —— 一轮之内任何单元格都不可能攒够 20ms 的连续
+                    // 稳定，也就**不可能**再升成稳定态、产生第二个幽灵按键。
+                    // 所以整轮扫完是安全的，不加 break 反而少一处状态机。
+                    if (mcpGhostBurstAt(r, c)) {
+                        ELWARN("I2C", "同键连发 %u 次 判死 行=%d 列=%d",
+                               (unsigned)ghostPresses[r][c], r, c);
+                        mcpTripFault();
+                        continue;   // 这一格本次不认账
+                    }
+
                     // 按键按下
                     totalKeyCount++;
                     lastActivityTime = millis();
@@ -7543,6 +7656,21 @@ static void scanKeyboardMatrix(void) {
         mcp.writeGPIOA(0xFF);
         mcp.writeGPIOB(0xFF);
     }
+
+    // ---- 空闲态自检：一整轮跑完，列脚刚刚全部放开，此刻行脚必须全高 ----
+    //
+    // 这是三路探测里**最快**的一路：每 8ms 一拍，连续 2 拍不对就判死，
+    // 最坏 16ms。原来 500ms 一次的自检在"按住键连发"的场景下根本来不及
+    // （连发本身要 240~280ms），只能靠运气。
+    //
+    // 不变量和为什么不会误报见 mcpIdleRowsClean() 的注释。
+    if (mcpIdleRowsClean()) {
+        g_mcpIdleStrike = 0;
+    } else if (++g_mcpIdleStrike >= MCP_IDLE_STRIKE_N) {
+        ELWARN("I2C", "空闲态仍有行脚被拉低=%03X 判死",
+               (unsigned)g_mcpIdleLowRows);
+        mcpTripFault();
+    }
 }
 
 // ===========================
@@ -7645,6 +7773,102 @@ static bool mcpColumnStrobeOk(void) {
     uint8_t b = mcp.readGPIOB();
     mcp.writeGPIOB(0xFF);          // 同时回到"每轮扫描开始时两个端口都是 0xFF"
     return (a == 0xFE) && (b == 0xFE);
+}
+
+// 空闲态行脚自检：所有列都放开时，10 个行脚必须**全部**是高。
+//
+// 为什么这个不变量成立：一轮扫描结束时 16 列已经全部写回 0xFF，也就是没有
+// 任何一根列脚被选中。此刻**无论用户按着几颗键**，行脚都必然读回高 ——
+// "按下"在电气上只是把行脚和列脚接通，而列脚此刻是高电位，中间不存在低电位
+// 源，行脚自己的内部上拉（INPUT_PULLUP，见 setup）把它拉高。所以：
+//
+//     行脚为低  ⟺  芯片正在驱动一根本该放开的列
+//
+// 这正是"按住一个键连发六七次"的直接根源 —— 那一列被芯片按死不放，行脚就
+// 一直读到"按下"，而总线又时通时不通，让这个读数反复翻转；每一次翻转只要
+// 稳定满 20ms，三态消抖就认一次账，于是物理上按了一次、主机收到 6~7 次。
+//
+// 为什么这一条比 mcpColumnStrobeOk 更适合抓运行期故障：
+//   · mcpColumnStrobeOk 是**写完立刻读寄存器**，读到的是芯片"认为自己"驱动成
+//     什么；寄存器对得上、引脚实际没松开的情况它照样判通过。
+//   · 这里读的是**引脚上的真实电平**。输出锁存器卡死、寄存器丢失、输出级损坏
+//     —— 三种病根都会在这里现形，而它们对 I2C 侧全都"表现正常"。
+//
+// 代价：10 次 digitalRead + 一次 50µs 沉降，每 8ms 一拍，约占一拍预算的 1%，
+// 而且**不产生任何 I2C 事务**。
+//
+// ⚠ 调用位置有讲究：必须在**一整轮列循环结束**之后调用。此时列脚刚被写回
+//   0xFF，正好是"没有任何列被选中"这个前提成立的那一刻。
+static bool mcpIdleRowsClean(void) {
+    // 等引脚和芯片输出级都落定再读。MCP23017 的输出建立时间是几百 ns 量级，
+    // 50µs 足够；相对一拍的 8ms 也完全可以忽略。
+    delayMicroseconds(50);
+
+    uint16_t low = 0;
+    for (int r = 0; r < NUM_ROWS; r++) {
+        if (digitalRead(rowPins[r]) == LOW) low |= (uint16_t)(1u << r);
+    }
+    g_mcpIdleLowRows = low;
+    return low == 0;
+}
+
+// 同键连发检测：在消抖**认下按下**的那一刻调用，返回 true = 这一格不可信。
+//
+// 判据：同一颗键在 GHOST_WINDOW_MS(400ms) 内被认下 GHOST_BURST_N(4) 次按下。
+// 人手做不到 —— 就算世界纪录手速，同一颗键也得 ~100ms 一次，400ms 最多 4 次
+// 的边界；正常打字连按同一个字母的间隔远大于此。而半死的总线正是把这个形状
+// 批量生产出来的。
+//
+// 存在的意义是补 ① 的盲区：① 要求故障**持续整整一拍**（8ms）才看得见，
+// 而真正的故障往往是时好时坏的 —— 坏 5ms 好 30ms，① 每次读都干净，
+// 但消抖照样会把中间那几毫秒认成"按了一下"。这种短命故障只有按**认账事件**
+// 去数才抓得到。
+//
+// 越早判死越好：调用点在任何分发**之前**，幽灵按键不会走到主机去。
+static bool mcpGhostBurstAt(int r, int c) {
+    unsigned long nowMs = millis();
+
+    // 整个窗口共用一个起点，过期就整块清零（160 字节 memset，可忽略）
+    if (nowMs - ghostWinMs >= GHOST_WINDOW_MS) {
+        memset(ghostPresses, 0, sizeof(ghostPresses));
+        ghostWinMs = nowMs;
+    }
+    if (ghostPresses[r][c] < 255) ghostPresses[r][c]++;
+    return ghostPresses[r][c] >= GHOST_BURST_N;
+}
+
+// 自动复位成功次数，懒加载自 NVS。
+// 之所以要懒加载：这一段代码在 setup() 里读 preferences 之前也可能在
+// 运行期被调到，而 preferences.begin() 的时机由 setup() 控制。
+static uint32_t mcpAutoRecoverCount(void) {
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        g_mcpRecoverN = preferences.getUInt("mcp_recover_n", 0);
+    }
+    return g_mcpRecoverN;
+}
+
+// 统一的判死入口。三路探测（500ms 列选自检 / 空闲态行脚 / 同键连发）
+// 都必须走这里，不要就地写 mcpHealthy = false。
+//
+// 它额外干一件就地赋值干不了的事：**统计"刚恢复就又坏"**。
+// 恢复成功之后短时间内再次判死，说明这不是间歇干扰而是救不回来的那种坏
+// （焊点虚焊 / 短路 / 芯片本身坏了）—— 每 300ms 敲一次 I2C 既救不了，
+// 又会把主循环连同界面一起拖死，所以连续几次之后把重试间隔退到 2s，
+// 并在日志里明确喊出来，让用户知道该动烙铁而不是继续折腾软件。
+//
+// mcpStableMs == 0 表示"本次上电以来还没恢复过"，此时第一次判死不算反复。
+static void mcpTripFault(void) {
+    if (!mcpHealthy) return;              // 已经判死了，不用重复计数
+    if (mcpStableMs != 0 && millis() - mcpStableMs < MCP_RETRY_MS) {
+        g_mcpRefault++;
+        if (g_mcpRefault == MCP_STRIKE_SLOW) {
+            ELERR("I2C", "恢复后立刻又卡死（%u 次） 重试已放慢 请查 RESET 焊点与芯片",
+                  (unsigned)g_mcpRefault);
+        }
+    }
+    mcpHealthy = false;
 }
 
 // 直读方向寄存器 IODIRA(0x00)。Adafruit 库没暴露读方向的接口，走原始 Wire。
@@ -10980,12 +11204,26 @@ static void showBootDiagnostics(void) {
     // 去读一份没告诉他坏在哪的体检报告。
     {
         char w[40];
-        snprintf(w, sizeof(w), "%s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+        uint32_t rc = mcpAutoRecoverCount();
+        // 自动复位次数跟着这张卡一起报。必须**跨重启**才有用：遇到"键盘失灵"
+        // 的用户十有八九已经重启过一次，只放内存里的话开机看到的就是 0，
+        // 等于这一项永远在骗人。
+        //
+        // 只在 rc>0 时才追加：屏只有 240 宽，常态下多出来的字纯属占地方，
+        // 而"发生过复位"这件事本身才是要报出来的信息。
+        if (rc) snprintf(w, sizeof(w), "%s IO=%02X 复位%lu",
+                         mcpWireVerdict(), g_mcpWire.iodira, (unsigned long)rc);
+        else   snprintf(w, sizeof(w), "%s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+        // 复位线本身合格、但发生过自动复位 → 琥珀色提醒：能自愈说明这机器有过
+        // I2C 干扰，值得留意；线不合格 → 红色，那是要动烙铁的。
         bool wireGood = g_mcpWire.strobeHigh && !g_mcpWire.strobeLow;
-        pushBootHud(4400, "键盘扩展", w, wireGood ? CLR_GREEN : CLR_RED);
+        uint32_t clr = !wireGood ? CLR_RED : (rc ? CLR_AMBER : CLR_GREEN);
+        pushBootHud(4400, "键盘扩展", w, clr);
         // 同一条也落进日志：开机 HUD 一闪而过，日志是能翻回来查的
-        if (wireGood) ELINFO("I2C", "自检 %s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
-        else         ELERR ("I2C", "自检 %s IO=%02X", mcpWireVerdict(), g_mcpWire.iodira);
+        if (wireGood) ELINFO("I2C", "自检 %s IO=%02X 累计自动复位 %lu 次",
+                             mcpWireVerdict(), g_mcpWire.iodira, (unsigned long)rc);
+        else         ELERR ("I2C", "自检 %s IO=%02X 累计自动复位 %lu 次",
+                             mcpWireVerdict(), g_mcpWire.iodira, (unsigned long)rc);
     }
 
     // 第五张：C3 串口（灯效 / 灯光键 / 旋钮都走这条线）。
