@@ -7682,6 +7682,34 @@ static void mcpResetMatrixState(void) {
     memset(debounceCandMs, 0, sizeof(debounceCandMs));
 }
 
+// 上电时把 MCP23017 一起复位一遍，再去初始化它。
+//
+// 为什么必须在开机做：MCP23017 的寄存器是**掉电易失**的，IODIRA/OLAT 这些
+// 上电默认回到 0xFF（全输入）。于是芯片每次上电的寄存器状态，取决于它自己
+// 在上电瞬间经历了什么 —— 电源爬坡沿抖动、VDD 比主控慢到位、或者干脆是一次
+// 掉电重启，都会让它带着一份**不确定的寄存器内容**进入工作状态。
+//
+// 而"列脚是输出还是输入"这件事决定了键盘能不能用。只靠 I2C 写寄存器去纠正，
+// 是**假设**寄存器已经被写成功过一次；芯片要是卡在某个写不进去的状态，
+// 这个假设从第一步就不成立。数据手册给的唯一确定手段就是 RESET 脚。
+//
+// 时序比运行期那一次宽裕：这一刻 VDD 可能还在爬坡，而且反正只花 20ms。
+//   TRSTL（复位低电平宽度）手册要求 ≥1µs，这里给 10ms
+//   放开后等 10ms，让内部状态机和总线逻辑都稳下来再发第一条 I2C
+//
+// ⚠ 前提是这个脚真的接上了 GPIO11 且上拉接的是 **3.3V**。上拉接到 5V 的
+//   模块 VCC 时，GPIO11 写高只有 3.3V，够不到 0.8VDD 的 VIH —— 芯片压根
+//   出不了复位态，这一段会静默失效，症状是"复位好像没起作用"。
+static void mcpPowerOnReset(void) {
+#if MCP_RESET_PIN >= 0
+    pinMode(MCP_RESET_PIN, OUTPUT);
+    digitalWrite(MCP_RESET_PIN, LOW);
+    delay(10);
+    digitalWrite(MCP_RESET_PIN, HIGH);
+    delay(10);
+#endif
+}
+
 // 硬复位 MCP23017：把 RESET 脚拉低几毫秒再放开。
 //
 // 这是整个阶梯里唯一能对付「芯片状态机死透、自己拉着 SDA 不放」的动作，也是
@@ -11232,14 +11260,10 @@ void setup() {
     }
 
     // I2C / MCP23017
-    // 复位脚必须在碰 I2C **之前**先拉高：这颗芯片的 RESET 是低有效的，S3 刚
-    // 上电时这个 IO 还是高阻，万一芯片自己被随机复位，就会一直待在复位里 ——
-    // 16 个列脚全是输入态，键盘从开机起就是哑的，而且 I2C 侧看起来完全正常
-    // （芯片在复位里照样应答地址），最难查的那种哑法。
-#if MCP_RESET_PIN >= 0
-    pinMode(MCP_RESET_PIN, OUTPUT);
-    digitalWrite(MCP_RESET_PIN, HIGH);
-#endif
+    // 碰 I2C **之前**先把芯片硬复位一遍，让它从确定的寄存器状态开始。
+    // 理由和时序见 mcpPowerOnReset()：寄存器掉电易失，只靠 I2C 去写是建立在
+    // "寄存器已经能被写进去"这个假设上的，而这个假设在芯片上电那一刻并不成立。
+    mcpPowerOnReset();
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(400000);
     // ⚠ 这个超时以前只有 recoverI2CBus() 里有，主路径一直吃 Arduino 默认的
