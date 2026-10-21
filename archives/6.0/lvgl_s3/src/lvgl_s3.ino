@@ -1810,6 +1810,7 @@ static void i2cStrobe(int pulses, uint16_t halfUs);
 static void mcpApplyColumnConfig(void);
 static void mcpResetMatrixState(void);
 static void mcpHardwareReset(void);
+static bool mcpRestartChip(void);
 static bool mcpIdleRowsClean(void);
 static bool mcpGhostBurstAt(int r, int c);
 static void mcpTripFault(void);
@@ -7957,6 +7958,68 @@ static void mcpHardwareReset(void) {
 }
 
 // ===========================
+// 手动重启 MCP23017（CPG 键长按触发）
+// ===========================
+//
+// 为什么单列一条路，不直接复用 recoverI2CBus()：
+// recoverI2CBus() 是"总线已经判死才走的自愈阶梯"，它的前提是**已经坏了**。
+// 长按 CPG 是用户**主动要求**把扩展芯片从确定状态重启一遍 —— 哪怕此刻键盘
+// 还完全正常也要做（"我怀疑它抽风了，先复位再说"）。所以这里的顺序是
+// "先复位 → 再重建 → 再自检"，判据也比阶梯里更严：列选必须真的通，
+// 探到地址不算数（芯片掉回全输入态时地址照答不误）。
+//
+// 五件事，顺序不能换：
+//   1. 拉复位脚 —— RESET 接了 GPIO11 的机器才有效，没接的机器这步是空函数。
+//      数据手册：RESET 拉低后 1µs 内所有输出脚进高阻，芯片会主动松开 SDA。
+//   2. 重建 I2C 外设 —— 上一步已经把总线放开了，但主控自己的 I2C 外设
+//      可能还停在半个字节中间，必须 end/begin 重新武装。
+//   3. 重新初始化 + 重刷列配置 —— 复位后寄存器回到 0xFF（全输入），
+//      不重刷的话 16 个列脚一个都不驱动，键盘直接全哑。
+//   4. 列选自检 —— 唯一能证明"列脚真的能驱动低"的判据。
+//   5. 清消抖 + 清"按住"状态 —— 复位瞬间留在 keebMatrix 里的按下必须抹掉，
+//      否则会冒幽灵键，主机那边还会永远按着一个组合键不放。
+//
+// ⚠ 失败时把 mcpHealthy 打成 false：让扫描主循环里的完整阶梯接手
+//   （那边还有 12/40 拍时钟救援，manual 这条只做了复位+重建）。
+//   不这么做的话，手动重启失败之后键盘会一直保持"半死"状态 ——
+//   自愈阶梯只对"被判定为死"的芯片动手。
+static bool mcpRestartChip(void) {
+    ELINFO("I2C", "手动重启 MCP23017 开始");
+
+    // 1) 硬复位复位脚（没接线的机器上这一步编译成空）
+    mcpHardwareReset();
+
+    // 2) 重建 I2C 外设
+    Wire.end();
+    delay(5);
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);
+    Wire.setTimeOut(25);
+
+    // 3) 重新初始化芯片 + 重刷列配置
+    if (mcp.begin_I2C(MCP23017_ADDR, &Wire)) {
+        mcpApplyColumnConfig();
+
+        // 4) 列选自检
+        if (mcpColumnStrobeOk()) {
+            // 5) 清干净状态
+            mcpResetMatrixState();
+            memset(ghostPresses, 0, sizeof(ghostPresses));
+            g_mcpIdleStrike = 0;
+            g_mcpRefault    = 0;
+            mcpStableMs     = millis();
+            mcpHealthy      = true;
+            ELINFO("I2C", "手动重启 MCP23017 成功");
+            return true;
+        }
+    }
+
+    ELERR("I2C", "手动重启失败 IODIRA=%02X 交自愈阶梯", (unsigned)mcpReadIODIR());
+    mcpHealthy = false;      // 交给完整阶梯继续救（含 12/40 拍时钟救援）
+    return false;
+}
+
+// ===========================
 // RESET 连线自检
 // ===========================
 // 唯一能证明「RESET 这根线真的落在芯片脚上」的动作 —— 必须主动去戳它一脚。
@@ -10293,7 +10356,9 @@ static void handleC3Command(const String& cmd) {
     // 一次反应，但该键的原有语义照常落回下面 —— 摸猫的时候手按到静音键，
     // 它喵一声，你的电脑同时也静音了（和 8285 那段静音处理是同一个态度）。
     //
-    // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"进下载模式重启"。
+    // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"重启类"操作
+    //    （CPG 长按 = 重启键盘扩展芯片 MCP23017，MUTE 长按 = 整机重启），
+    //    宠物页不掺和，掉回下面照常执行。
     if (currentSysMode == SYS_MODE_PET) {
         if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头（离散一下）
         else if (cmd.startsWith("ROT:") || cmd == "ENC:+"
@@ -10394,8 +10459,24 @@ static void handleC3Command(const String& cmd) {
         triggerHud("灯效切换", effectNames[currentEffect], lv_color_hex(CLR_ACCENT));
         return;
     }
-    // 两个长按都是进下载模式重启
-    if (cmd == "BTN:MUTE_HOLD" || cmd == "BTN:CPG_HOLD") {
+    // CPG 长按 = 重启键盘扩展芯片（MCP23017），**不再**重启整个 S3。
+    //
+    // 为什么改：从 C3 过来的长按原本被当成"进下载模式重启"，直接 esp_restart()。
+    // 但这套固件整机重启的代价太大（SPIFFS / BLE / USB 协议栈全套重来，几十秒
+    // 黑屏），而用户按下这个键时想解决的往往只是"键盘不灵了" —— 那种情况
+    // 把 MCP23017 复位一下就够了，不该连累整机。详见 mcpRestartChip()。
+    //
+    // MUTE 长按保持原样（整机重启）—— 它是剩下的那一个整机重启入口。
+    if (cmd == "BTN:CPG_HOLD") {
+        bool ok = mcpRestartChip();
+        if (ok) {
+            triggerHud("键盘扩展已重启", "MCP23017 复位完成", lv_color_hex(CLR_GREEN));
+        } else {
+            triggerHud("键盘扩展重启失败", "正在自动恢复", lv_color_hex(CLR_RED));
+        }
+        return;
+    }
+    if (cmd == "BTN:MUTE_HOLD") {
         triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
         pendingRestartMs = millis() + 600;
         return;
