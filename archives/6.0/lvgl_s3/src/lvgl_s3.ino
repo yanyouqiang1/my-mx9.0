@@ -4730,6 +4730,18 @@ static void petPoll(void) {
     }
 
     PetScene want = petGate();
+    // 锁定期间宠物让位。
+    //
+    // 探头的小橘是画在 **lv_layer_top** 上的浮层（petBuildPeek），它盖在活动屏上面
+    // —— 也就是盖在锁屏上面。锁屏是"整屏一把大锁"的告警态，探个猫头出来
+    // 既不合逻辑，又把锁挡掉一半。所以锁着的时候不探头，已经探出来的收回去。
+    if (kbLocked) {
+        if (petScene == SCENE_PEEK) {
+            petDestroyPeek();
+            petScene = SCENE_NONE;
+        }
+        want = SCENE_NONE;
+    }
     if (want == SCENE_PEEK && petScene != SCENE_PEEK) {
         petStartPeek();
     } else if (want == SCENE_NONE && petScene == SCENE_PEEK) {
@@ -5364,9 +5376,20 @@ static void buildCountdownScreen(void) {
 //   响铃中                                 → 让位（响铃卡片是浮层，优先级更高）
 //   息屏                                   → 让位给屏保
 static void updateCountdownVisibility(void) {
+    // ⚠ 锁定期间**不许**接管显示。
+    //
+    // 少了这一条会踩一个很难察觉的坑：倒计时在跑、currentSysMode 又是 NORMAL 时，
+    // wantIt 恒为真，而 currentScreen 是锁屏 ≠ scr_countdown，于是
+    // buildCountdownScreen() 会**每轮 loop 都重建一次**倒计时屏
+    // （lv_obj_del + lv_obj_create），而 showScreen() 又被锁定拦掉、屏上根本看不到。
+    // 结果就是：锁着的时候白烧 CPU，PSRAM 被反复申请/释放，屏还是锁屏。
+    //
+    // 倒计时本身**照跑**（timerRunning 不受影响），解锁之后 wantIt 重新为真，
+    // 倒计时屏会自己回来 —— 锁只锁"打字"，不锁后台任务。
     const bool wantIt = countdownShown && timerRunning
                         && (ringingKind == RING_NONE)
-                        && (currentSysMode == SYS_MODE_NORMAL);
+                        && (currentSysMode == SYS_MODE_NORMAL)
+                        && !kbLocked;
     if (!wantIt) {
         if (scr_countdown) destroyCountdownScreen();
         return;
