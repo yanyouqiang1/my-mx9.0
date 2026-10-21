@@ -364,6 +364,9 @@ static void pushLogLine(const char* line);
 #include "lv_conf.h"
 #include "crash_trace.h"
 #include "elog.h"
+// 锁屏那把大锁。RGB565 数组直接躺在 flash 里（gen_lock_img.py 生成），
+// lv_img_dsc.data 一指就完事 —— 不解码、不拷贝、不占 PSRAM。
+#include "lock_img.h"
 
 // ct_heartbeat 的**唯一定义**。crash_trace.h 里只有 extern 声明，因为
 // bt_link.cpp 也要靠它报活（见 ct_alive 的注释）—— 放成 static 就废了：
@@ -1373,9 +1376,31 @@ static lv_obj_t* scr_settings_light = nullptr;
 static lv_obj_t* scr_recording = nullptr;
 static lv_obj_t* currentScreen = nullptr;
 
+// ===========================
+// 键盘锁定
+// ===========================
+// 详细行为见文件后段"键盘锁定（双击静音键 = 锁定）"那一节。这里只放状态和
+// 句柄，因为紧接着的 showScreen() 就要判断"锁定期间只有锁屏能上"。
+//
+// ⚠ 锁定**不进** currentSysMode。
+//   currentSysMode 说的是"当前是哪个界面"，锁定说的是"整台键盘不往主机发字"，
+//   两者正交 —— 锁着的时候可能正在菜单里、可能在宠物页、可能正要息屏。
+//   塞进 currentSysMode 的话，一换界面锁定就"掉了"，那不叫锁定。
+static bool kbLocked = false;
+static lv_obj_t* scr_lock = nullptr;
+
 // Screen切换函数
 static void showScreen(lv_obj_t* target) {
     if (target == nullptr) return;
+    // 锁定期间**只有锁屏能上**。
+    //
+    // 这一条必须在这里统一挡，不能指望各个调用点自己判断：息屏、宠物探头、
+    // 倒计时全屏、菜单、设置页……全都会各自调 showScreen()，分散去挡一定
+    // 会漏一处，漏一处就表现为"锁着锁着屏幕自己变了"——而锁屏还好端端在后台，
+    // 看起来就像"锁失效了"。
+    //
+    // 解锁的顺序是"先清 kbLocked 再 showScreen()"，所以解锁不受这条拦。
+    if (kbLocked && target != scr_lock) return;
     if (currentScreen == target) return;
     currentScreen = target;
     lv_scr_load(target);
@@ -5350,6 +5375,174 @@ static void updateCountdownVisibility(void) {
     else                               updateCountdownScreenText();
 }
 
+// ===========================
+// 键盘锁定（双击静音键 = 锁定，Fn + LOGO = 解锁）
+// ===========================
+//
+// 用户要的行为：
+//   · 双击 C3 上的静音键 → 锁定键盘
+//   · 锁住时整屏一把大锁，下面一行 "YYQ 已锁定"（"已锁定"是红色）
+//   · 锁住时按任何键都**不生效**（一律不发主机），但屏幕要像高警一样：
+//     红色边框闪一下，告诉用户"键我收到了，只是被锁着"
+//   · 再按 Fn + LOGO 解锁
+//
+// 三个容易踩的点（各自在下面有详细注释）：
+//   1. 锁定状态**不进** currentSysMode（见上面 kbLocked 的注释）
+//   2. 锁定期间**只有锁屏能上屏**（统一挡在 showScreen() 里）
+//   3. 锁定判定必须放在**同键连发探测之前**（见按键分发那段注释）
+//
+// 锁定状态**落 NVS**：重启之后仍然是锁着的。
+//   锁的意义就是"不让别人打字"，要是重启就自动解锁，拔电重插就能绕过，
+//   这锁形同虚设。解锁入口有两个：Fn + LOGO、网页/BLE 的 LOCK: 指令。
+
+#define NVS_KEY_LOCKED      "kb_locked"
+#define MUTE_DOUBLE_TAP_MS  350      // 双击判定窗口（和 CPG 双击同量级）
+#define LOCK_FLASH_MS       700      // 红框一共闪多久
+#define LOCK_FLASH_HALF_MS  90       // 红框一亮一灭各多久
+
+// 锁屏排版。坐标和 mock_lock.py 里的完全一致 —— 改了这里也要改那个脚本，
+// 不然电脑上画出来的和屏上不一样，排查起来纯属浪费。
+#define LOCK_TXT_Y          182      // "YYQ 已锁定"
+#define LOCK_HINT_Y         206      // "Fn + LOGO 解锁"
+
+static lv_img_dsc_t lockImgDsc;              // 喂给 lv_img_set_src 的描述符
+static lv_obj_t*    lockImgObj    = nullptr; // 大锁
+static lv_obj_t*    lockBorderObj = nullptr; // 红色边框（闪烁告警）
+static lv_obj_t*    lockLblLocked = nullptr; // "已锁定"（红）
+static lv_obj_t*    lockLblYyq    = nullptr; // "YYQ"（灰）
+
+static unsigned long lockFlashStartMs = 0;
+static bool          lockFlashOn      = false;
+
+// 双击静音键的配对状态（和 CPG 双击那套一模一样）
+static unsigned long g_muteTapMs    = 0;      // 上一条 BTN:MUTE 的时刻
+static bool          g_muteTapArmed = false;  // 是否还挂着一次"待配对"的单击
+
+// 建锁屏
+static void lockScreenBuild(void) {
+    if (scr_lock != nullptr) return;
+
+    scr_lock = lv_obj_create(NULL);
+    // 底色用**纯黑**：锁图的背景像素本来就是纯黑，底色换成 CLR_BG(0x0B0F17)
+    // 的话，屏上会多出一个"比周围亮一点的方块"，非常难看。
+    lv_obj_set_style_bg_color(scr_lock, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr_lock, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(scr_lock, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(scr_lock, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(scr_lock, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_lock, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 大锁。lockImgDsc.data 直接指向 flash 里的 RGB565 数组。
+    lockImgDsc.header.always_zero = 0;
+    lockImgDsc.header.w          = LOCK_IMG_W;
+    lockImgDsc.header.h          = LOCK_IMG_H;
+    lockImgDsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
+    lockImgDsc.data_size         = LOCK_IMG_W * LOCK_IMG_H * 2;
+    lockImgDsc.data              = (const uint8_t*)lock_img_pixels;
+
+    lockImgObj = lv_img_create(scr_lock);
+    lv_obj_set_size(lockImgObj, LOCK_IMG_W, LOCK_IMG_H);
+    lv_obj_set_pos(lockImgObj, (240 - LOCK_IMG_W) / 2, 2);
+    lv_img_set_src(lockImgObj, &lockImgDsc);
+
+    // "已锁定"（红）先建、先居中，"YYQ" 再用 align_to 挂到它左边 ——
+    // 这样整行是**作为一个整体**居中的，而不是两段各自居中然后错开。
+    //
+    // 为什么不用一个 label 写 "YYQ 已锁定"：LV_LABEL_RECOLOR 没开，
+    // 一段文字只能一个颜色，"已锁定"要红色就必须拆成两个 label。
+    lockLblLocked = lv_label_create(scr_lock);
+    mkLabel(lockLblLocked, &lv_font_simsun_16_cjk, CLR_RED);
+    lv_label_set_text(lockLblLocked, "已锁定");
+    lv_obj_align(lockLblLocked, LV_ALIGN_TOP_MID, 0, LOCK_TXT_Y);
+
+    lockLblYyq = lv_label_create(scr_lock);
+    mkLabel(lockLblYyq, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+    lv_label_set_text(lockLblYyq, "YYQ");
+    // align_to 是按 base 的**当前坐标**算的，base 刚 align 完坐标还没落地，
+    // 所以先把整屏的布局算一遍再挂。
+    lv_obj_update_layout(scr_lock);
+    lv_obj_align_to(lockLblYyq, lockLblLocked, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+
+    // 提示怎么解锁。用户当然知道是 Fn+LOGO，但锁屏是唯一会用到这条信息的地方，
+    // 写出来省得每次都要翻文档。
+    lv_obj_t* hint = lv_label_create(scr_lock);
+    mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(hint, "Fn + LOGO 解锁");
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, LOCK_HINT_Y);
+
+    // 红色边框：默认隐藏。按键被吞的时候闪一下。
+    // 最后建 = 画在最上层（要盖住锁图和文字的边缘）。
+    lockBorderObj = lv_obj_create(scr_lock);
+    lv_obj_set_size(lockBorderObj, 240, 240);
+    lv_obj_set_pos(lockBorderObj, 0, 0);
+    lv_obj_set_style_bg_opa(lockBorderObj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(lockBorderObj, 4, LV_PART_MAIN);
+    lv_obj_set_style_border_color(lockBorderObj, lv_color_hex(CLR_RED), LV_PART_MAIN);
+    lv_obj_set_style_radius(lockBorderObj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(lockBorderObj, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(lockBorderObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(lockBorderObj, LV_OBJ_FLAG_HIDDEN);
+}
+
+// 拆锁屏
+static void lockScreenDestroy(void) {
+    if (scr_lock != nullptr) {
+        // 同样先换屏再删，别裸着 lv_obj_del 一块可能正在显示的屏
+        swapAwayIfActive(scr_lock, nullptr);
+        if (currentScreen == scr_lock) currentScreen = nullptr;
+        lv_obj_del(scr_lock);
+        scr_lock = nullptr;
+    }
+    lockImgObj    = nullptr;
+    lockBorderObj = nullptr;
+    lockLblLocked = nullptr;
+    lockLblYyq    = nullptr;
+    lockFlashOn   = false;
+}
+
+// 红框闪一下：按键被吞掉时的高警反馈
+static void lockScreenFlash(void) {
+    if (lockBorderObj == nullptr) return;
+    lockFlashStartMs = millis();
+    lockFlashOn = true;
+    lv_obj_clear_flag(lockBorderObj, LV_OBJ_FLAG_HIDDEN);
+}
+
+// 每轮 loop 调一次：按 90ms 一拍做亮/灭交替，超时收起
+static void lockScreenTick(void) {
+    if (lockBorderObj == nullptr || !lockFlashOn) return;
+    unsigned long now = millis();
+    if (now - lockFlashStartMs >= LOCK_FLASH_MS) {
+        lockFlashOn = false;
+        lv_obj_add_flag(lockBorderObj, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    bool wantOn = (((now - lockFlashStartMs) / LOCK_FLASH_HALF_MS) % 2) == 0;
+    if (wantOn) lv_obj_clear_flag(lockBorderObj, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag(lockBorderObj, LV_OBJ_FLAG_HIDDEN);
+}
+
+// 锁定 / 解锁的唯一入口
+static void lockSetLocked(bool locked) {
+    if (kbLocked == locked) return;
+    kbLocked = locked;
+    preferences.putBool(NVS_KEY_LOCKED, locked);
+
+    if (locked) {
+        // 锁上之前 LOGO 可能正被按着 —— 把长按判定的状态清掉，
+        // 不然锁屏上会莫名其妙弹出一个宠物页。
+        logoIsDown = false;
+        logoHoldFired = false;
+        lockScreenBuild();
+        showScreen(scr_lock);
+        ELINFO("LOCK", "键盘已锁定");
+    } else {
+        lockScreenDestroy();
+        gotoMainScreen();
+        triggerHud("键盘锁定", "已解锁", lv_color_hex(CLR_GREEN));
+    }
+}
+
 // 启停倒计时的唯一入口：设时长、起表、把全屏叫起来。
 // 网页的 TIMERSET: 和键盘设置页的回车键都走这里，避免两处各写一份
 // "谁负责把 countdownShown 置上"的初始化。
@@ -7272,9 +7465,12 @@ static void scanKeyboardMatrix(void) {
     // C3 小 MCU 的 Serial1 上报），这里按"按下时记时刻 + 每拍看一次还按着没有"
     // 自己实现。放在列循环前面，一拍一次就够（SCAN_INTERVAL = 8ms）。
     //
-    // ⚠️ Fn 按住时**完全不进**这段：Fn+LOGO 是系统重启（见按键分发里
+    // ⚠️ Fn 按住时**完全不进**这段：Fn+LOGO 现在是"解锁"（见按键分发里
     // baseKey == K_LOGO 那个分支），长按不能把它抢走。
-    if (logoIsDown && !logoHoldFired && !fnPressed
+    //
+    // ⚠️ 锁定期间也不进：锁屏上不该冒出宠物页。锁定时 LOGO 的按下就被吞了，
+    // logoIsDown 根本不会置位，但这里再挡一道是防"锁定之前正按着 LOGO"。
+    if (logoIsDown && !logoHoldFired && !fnPressed && !kbLocked
         && millis() - logoDownMs >= PET_LOGO_HOLD_MS) {
         logoHoldFired = true;
         if (petScene == SCENE_FULL)      petExitFull();    // 页内：退出
@@ -7338,6 +7534,42 @@ static void scanKeyboardMatrix(void) {
                 ct_set_ctx(currentSysMode, currentDispMode);
 
                 if (currentState) {
+                    // ---- 键盘锁定：按键在这里被拦下 ----
+                    //
+                    // ⚠⚠ 位置必须在**同键连发探测之前**，这不是讲究，是必须：
+                    //   那个探测统计"同一格连续按下的次数"，超阈值就判 MCP23017
+                    //   故障并触发恢复。锁着的时候按键是**被吞掉**的（没发主机），
+                    //   但物理上照样按得出来 —— 连按几下就把连发计数攒到阈值，
+                    //   于是"锁着的时候猛按键盘"会把键盘扩展芯片判死，
+                    //   表现成"锁一次键盘就坏了"。锁定态的按键不进那个计数器。
+                    //
+                    // 拦下的键：不发主机、不计 KPM、不唤醒屏保、不动灯效，
+                    // 只在屏上闪一下红边框，告诉用户"键我收到了，只是被锁着"。
+                    if (kbLocked) {
+                        // Fn 放行：它是修饰键，本身不发主机，但 fnPressed 必须置起来，
+                        // 否则 Fn+LOGO 根本凑不出来 —— 解锁就无从下手。
+                        if (baseKey == K_FN) {
+                            fnPressed = true;
+                            continue;
+                        }
+                        // Fn + LOGO = 解锁。
+                        if (baseKey == K_LOGO && fnPressed) {
+                            // ⚠ logoHoldFired = true：告诉松手那一拍"这一下已经
+                            //   处理过了，别再当短按切显示风格"。不加这一句的话，
+                            //   解锁的瞬间 LOGO 的松手会被当成短按，
+                            //   主屏风格当场换一档 —— 用户看到的是"我明明在解锁，
+                            //   怎么界面样式也变了"。
+                            logoHoldFired = true;
+                            lockSetLocked(false);
+                            continue;
+                        }
+                        // 其余一律吞掉。
+                        // hostKeyHeld 保持 false：按下时没发过 press，
+                        // 松手时自然也不会补一个无头的 release 给主机。
+                        lockScreenFlash();
+                        continue;
+                    }
+
                     // ---- 同键连发探测：卡在任何分发**之前** ----
                     //
                     // 放在这里而不是分发之后，是因为用户真正受害的就是"幽灵按键
@@ -7544,12 +7776,17 @@ static void scanKeyboardMatrix(void) {
                                 // LOGO 现在要区分长按（进/退宠物页）和短按
                                 // （切主屏风格），所以动作**从按下挪到松手**。
                                 // 按下只记时刻；松手时没触发过长按才算短按。
-                                // ⚠️ Fn+LOGO 的重启保持"按下即执行"，不受影响 ——
-                                //    它是唯一一个要求"按下就有反应"的组合键。
-                                if (fnPressed) {
-                                    triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
-                                    pendingRestartMs = millis() + 600;
-                                } else {
+                                //
+                                // ⚠️ Fn + LOGO 现在**只**用来解锁 —— 锁定时在按键分发
+                                //    的锁定分支里就处理掉了（那是唯一会走到这里的
+                                //    情况之外）。整机重启这个动作已经从 Fn+LOGO 上
+                                //    拿掉，剩下的整机重启入口是"静音键长按"
+                                //    （见 handleC3Command 的 BTN:MUTE_HOLD）。
+                                //
+                                //    未锁定时按 Fn+LOGO 什么都不做，所以这里**不能**
+                                //    顺手置 logoIsDown：那会让松手时去切显示风格，
+                                //    而 Fn+LOGO 的语义是"解锁"，不是"切风格"。
+                                if (!fnPressed) {
                                     logoIsDown = true;
                                     logoDownMs = millis();
                                     logoHoldFired = false;
@@ -7625,7 +7862,11 @@ static void scanKeyboardMatrix(void) {
                         // 长按已经由 scanKeyboardMatrix 开头的判定处理过了。
                         if (baseKey == K_LOGO) {
                             logoIsDown = false;
-                            if (!logoHoldFired) {
+                            // ⚠ 锁定期间**跳过**短按动作：按下的时候就被吞了，
+                            //   没发过 press，这里再补动作等于凭空切一次显示风格 ——
+                            //   而 cycleDisplayStyle() 会重建主屏，锁屏就被顶掉了，
+                            //   表现成"锁着锁着屏幕自己变了"。
+                            if (!kbLocked && !logoHoldFired) {
                                 if (petScene == SCENE_FULL) petExitFull();
                                 else if (petScene == SCENE_PEEK) { /* 吞掉：不切风格 */ }
                                 else cycleDisplayStyle();
@@ -9362,6 +9603,16 @@ static void handleCommand(const String& cmd) {
     if (cmd.startsWith("DISP_MODE:")) {
         applyDispMode((uint8_t)cmd.substring(10).toInt());
     }
+    // LOCK:0 | LOCK:1 - 锁定 / 解锁键盘
+    //
+    // 这条是给网页和 PC 端留的入口。键盘上双击静音键能锁、Fn+LOGO 能解锁，
+    // 但"人不在键盘旁边"的时候总得有个远程的办法（比如键盘被猫按住了）。
+    // 回一条 LOCKSTATE，网页那边可以直接读当前状态。
+    else if (cmd.startsWith("LOCK:")) {
+        int v = cmd.substring(5).toInt();
+        lockSetLocked(v != 0);
+        btLinkReplyf("LOCKSTATE", "%d", kbLocked ? 1 : 0);
+    }
     // TIME:epoch - Sync time
     else if (cmd.startsWith("TIME:")) {
         time_t t = cmd.substring(5).toInt();
@@ -10456,8 +10707,43 @@ static void handleC3Command(const String& cmd) {
         return;
     }
     if (cmd == "BTN:MUTE") {
+        // ---- 双击 = 锁定 / 解锁键盘 ----
+        //
+        // 和 CPG 双击（重启扩展芯片）同一套写法：两击之间 ≤350ms 就算双击。
+        //
+        // 第一击**照常静音**：静音键用得远比"锁定"频繁，为了双击把它延后
+        // 350ms 再执行，手感会明显变钝。代价是双击的副作用是"静音 + 锁定"，
+        // 两个语义共用一个键的必然结果（CPG 双击重启也是同理）。
+        //
+        // 锁着的时候双击 = 解锁，和 Fn+LOGO 等价。留着这条是因为万一 Fn 键
+        // 接触不良，用户至少还有一条自救的路。
+        unsigned long now = millis();
+        if (g_muteTapArmed && (now - g_muteTapMs) <= MUTE_DOUBLE_TAP_MS) {
+            g_muteTapArmed = false;   // 清掉，第三次点击当成一次全新的单击
+            lockSetLocked(!kbLocked);
+            return;
+        }
+        g_muteTapArmed = true;
+        g_muteTapMs    = now;
+
         if (!lightOn) { lightOn = true; preferences.putBool("light_on", true); }
         currentMode = MODE_MUTE;
+
+        // ⚠ 锁定期间**不发**静音给主机：锁的意义就是"键盘不控制主机"。
+        //   但"停铃"和"确认通知"是**本机**的事，照旧做 ——
+        //   闹钟响着的时候没人能打字，静音键是唯一的"停下来"手段。
+        if (kbLocked) {
+            lockScreenFlash();     // 和其它键一样：闪红框 = 收到了，但被锁着
+            if (ringingKind != RING_NONE) {
+                stopRinging();
+                return;
+            }
+            if (!acknowledgeAlert()) {
+                triggerHud("键盘已锁定", "按键不会发给电脑", lv_color_hex(CLR_RED));
+            }
+            return;
+        }
+
         ConsumerControl.press(CONSUMER_CONTROL_MUTE);
         ConsumerControl.release();
         // 静音键同时也是停铃键（和灯光键一起，用户指定的两个）。
@@ -10527,6 +10813,7 @@ static void handleC3Command(const String& cmd) {
         return;
     }
     if (cmd == "BTN:MUTE_HOLD") {
+        g_muteTapArmed = false;   // 长按期间不要把之前的单击当成双击的第一击
         triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
         pendingRestartMs = millis() + 600;
         return;
@@ -11778,6 +12065,14 @@ void setup() {
     gotoMainScreen();
     lastActivityTime = millis();
 
+    // 锁定状态是从 NVS 读回来的 —— 锁着的键盘**重启之后仍然是锁着的**。
+    // 锁的意义就是"不让别人打字"，重启就自动解锁的话，拔电重插就能绕过，
+    // 这锁形同虚设。解锁入口：Fn + LOGO，或网页/BLE 的 LOCK:0 指令。
+    if (preferences.getBool(NVS_KEY_LOCKED, false)) {
+        lockSetLocked(true);
+        LOG_PORT.println("[LOCK] 开机恢复：键盘处于锁定状态（Fn+LOGO 解锁）");
+    }
+
     showBootDiagnostics();
     ct_ready();
     ct_startMonitor();
@@ -12009,6 +12304,7 @@ if (lockStateDirty) {
         && ringingKind == RING_NONE
         && saverMode != SAVER_OFF
         && !(countdownShown && timerRunning)
+        && !kbLocked
         && millis() - lastActivityTime > SLEEP_TIMEOUT_MS) {
         currentSysMode = SYS_MODE_SLEEP;
         ct_mark(CT_S_SLEEP);
@@ -12071,6 +12367,10 @@ if (lockStateDirty) {
     // 它挂的是 top 层而不是活动屏，所以底下是主屏/菜单/设置页/黑屏都一样能盖住，
     // 不需要为了显示它去改 currentSysMode。
     drawRingOverlay();
+
+    // ---- 锁屏：红框告警的闪烁节拍 ----
+    // 每轮都调，内部自己判"该不该亮/该灭/该收"，不在闪的时候零开销。
+    lockScreenTick();
 
     // HUD 消失
     ct_mark(CT_S_HUD);
