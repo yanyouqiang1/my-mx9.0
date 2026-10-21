@@ -10639,9 +10639,31 @@ static void knobAdjust(int dir) {
 static unsigned long g_cpgTapMs    = 0;    // 上一条 BTN:CPG 的时刻
 static bool         g_cpgTapArmed = false; // 是否还挂着一次"待配对"的单击
 
-// C3 -> 本机的一条指令。语义照抄 s3.ino 原版，去掉响铃/g_forceOff 那两段
-// （本工程没有闹钟响铃流程，背光总开关叫 lightOn）。
-static void handleC3Command(const String& cmd) {
+// C3 -> 本机的一条指令。语义照抄 s3.ino 原版，去掉 g_forceOff 那段
+// （本工程的背光总开关叫 lightOn）。
+static void handleC3Command(const String& cmdIn) {
+    // ⚠ 响铃期间的**长按静音**，降级成短按静音。
+    //
+    // 为什么：用户长按静音八成是想让铃停下来，而不是想重启键盘。而重启的副作用
+    // 还挺大 —— alarmLastFiredYday 是纯 RAM 变量（853 行），重启归零；墙钟又从
+    // NVS 的 set_epoch 恢复（11795 行）。只要恢复出来的时间正好落在闹钟那一分钟，
+    // 开机就再响一次，用户长按几下就成死循环了。老固件 s3.ino:3948 就是这么处理
+    // 的（"响铃期间长按不当重启用"），lvgl_s3 搬过来时把这段丢了。
+    //
+    // 用"改写命令"而不是"复制一份逻辑"：降级之后下面所有分支看到的都是 BTN:MUTE
+    // —— 宠物反应、静音发给主机、停铃、确认通知，全都原样走一遍，不会两处写
+    // 两份再漂移。
+    //
+    // 非响铃时的长按静音不受影响，照旧整机重启（见下面 BTN:MUTE_HOLD 分支）。
+    String cmd = cmdIn;
+    if (cmd == "BTN:MUTE_HOLD" && ringingKind != RING_NONE) {
+        cmd = "BTN:MUTE";
+        // ⚠ 必须清掉双击配对标志：静音键自己还有一套"双击 = 锁定/解锁"
+        //   （MUTE_DOUBLE_TAP_MS）。不清的话，这次降级会被当成双击的第二击，
+        //   结果不是停铃，而是把键盘锁了 —— 闹钟还响着，键盘却按不动了。
+        g_muteTapArmed = false;
+    }
+
     if (cmd == "PONG") { c3Connected = true; return; }
 
     // 息屏期间任何 C3 动作都算"有人回来了"（旋钮碰一下也算）
@@ -10656,6 +10678,8 @@ static void handleC3Command(const String& cmd) {
     // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"重启类"操作
     //    （CPG 长按 / CPG 双击 = 重启键盘扩展芯片 MCP23017，MUTE 长按 = 整机
     //    重启），宠物页不掺和，掉回下面照常执行。
+    //    （唯一例外：响铃期间的长按静音已经在函数开头被降级成 BTN:MUTE，
+    //      所以响铃时它走的是短按那条路，宠物照常有反应。）
     if (currentSysMode == SYS_MODE_PET) {
         if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头（离散一下）
         else if (cmd.startsWith("ROT:") || cmd == "ENC:+"
@@ -10835,6 +10859,8 @@ static void handleC3Command(const String& cmd) {
         }
         return;
     }
+    // 长按静音 = **整机重启**。响铃期间到不了这里 —— 函数开头已经把长按降级成
+    // 短按静音了（停铃，不重启）。
     if (cmd == "BTN:MUTE_HOLD") {
         g_muteTapArmed = false;   // 长按期间不要把之前的单击当成双击的第一击
         triggerHud("系统重启", "请稍候", lv_color_hex(CLR_RED));
