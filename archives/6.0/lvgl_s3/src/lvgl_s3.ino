@@ -10342,6 +10342,29 @@ static void knobAdjust(int dir) {
     }
 }
 
+// ===========================
+// CPG 双击判定
+// ===========================
+//
+// 为什么必须放在 S3 侧：双击的判据是"两次短按之间隔了多久"，而 **C3 小 MCU
+// 不能刷固件**（它跑的是出厂那版）。C3 那边只认得两种按键事件：
+//   · BTN:CPG      —— 每次松开都发一次（短按）
+//   · BTN:CPG_HOLD —— 按住满 3 秒才发
+// 它**不在按下的瞬间发任何东西**，所以 S3 能拿到的原始信息只有"什么时候收到
+// 一条 BTN:CPG"。双击只能在这儿判。
+//
+// ⚠ 顺带说明一件做不到的事：**长按阈值没法从 3 秒改成 2 秒**。holdDuration
+//   （3000ms）写死在 C3 固件的按钮表里，S3 只能在 3 秒那一刻才收到 BTN:CPG_HOLD，
+//   3 秒之前它对"键还按着"这件事完全无知 —— 想缩短就只能刷 C3。
+//
+// 窗口取 350ms 是有依据的：切换灯效是"**看着结果**再按下一次"的反馈型操作，
+// 两次按键天然被人的视觉反应时间（250~400ms）隔开；而故意双击的人也是这个量级。
+// 窗口太紧 → 双击打不中，用户以为功能坏了；太松 → 连着快速切灯效时误触发重启
+// （这个代价小：重启只花 30ms，键盘照常用，屏幕上还有 HUD 明说发生了什么）。
+#define CPG_DOUBLE_TAP_MS 350
+static unsigned long g_cpgTapMs    = 0;    // 上一条 BTN:CPG 的时刻
+static bool         g_cpgTapArmed = false; // 是否还挂着一次"待配对"的单击
+
 // C3 -> 本机的一条指令。语义照抄 s3.ino 原版，去掉响铃/g_forceOff 那两段
 // （本工程没有闹钟响铃流程，背光总开关叫 lightOn）。
 static void handleC3Command(const String& cmd) {
@@ -10357,8 +10380,8 @@ static void handleC3Command(const String& cmd) {
     // 它喵一声，你的电脑同时也静音了（和 8285 那段静音处理是同一个态度）。
     //
     // ⚠️ 绝对不碰 BTN:CPG_HOLD / BTN:MUTE_HOLD：那两个是"重启类"操作
-    //    （CPG 长按 = 重启键盘扩展芯片 MCP23017，MUTE 长按 = 整机重启），
-    //    宠物页不掺和，掉回下面照常执行。
+    //    （CPG 长按 / CPG 双击 = 重启键盘扩展芯片 MCP23017，MUTE 长按 = 整机
+    //    重启），宠物页不掺和，掉回下面照常执行。
     if (currentSysMode == SYS_MODE_PET) {
         if (cmd == "BTN:MUTE")   { petPetted(2); }              // 摸头（离散一下）
         else if (cmd.startsWith("ROT:") || cmd == "ENC:+"
@@ -10451,6 +10474,28 @@ static void handleC3Command(const String& cmd) {
         return;
     }
     if (cmd == "BTN:CPG") {
+        // ---- 双击 = 重启键盘扩展芯片（MCP23017）----
+        //
+        // 第一次点击的灯效切换**照常立刻执行**。不能为了双击把它延后 350ms
+        // 再切 —— 那会让"单按切灯效"这个原有功能的手感明显变钝，而它的使用
+        // 频率比双击高得多。代价是：双击之后灯效会前进一档，这是"单按=切灯效
+        // / 双击=重启芯片"两个语义共用一个键的必然结果。
+        //
+        // 第二次点击则**不再切灯效**（否则双击会连切两档），改成重启芯片。
+        unsigned long now = millis();
+        if (g_cpgTapArmed && (now - g_cpgTapMs) <= CPG_DOUBLE_TAP_MS) {
+            g_cpgTapArmed = false;   // 清掉，第三次点击当成一次全新的单击
+            bool ok = mcpRestartChip();
+            if (ok) {
+                triggerHud("键盘扩展已重启", "MCP23017 复位完成", lv_color_hex(CLR_GREEN));
+            } else {
+                triggerHud("键盘扩展重启失败", "正在自动恢复", lv_color_hex(CLR_RED));
+            }
+            return;
+        }
+        g_cpgTapArmed = true;
+        g_cpgTapMs    = now;
+
         if (!lightOn) { lightOn = true; preferences.putBool("light_on", true); }
         currentMode = MODE_CPG;
         if (currentEffect == 0) currentEffect = 1;   // 跳过"关闭"这一档
@@ -10466,8 +10511,13 @@ static void handleC3Command(const String& cmd) {
     // 黑屏），而用户按下这个键时想解决的往往只是"键盘不灵了" —— 那种情况
     // 把 MCP23017 复位一下就够了，不该连累整机。详见 mcpRestartChip()。
     //
+    // 它现在是**双击之外的兜底**：双击（两次 BTN:CPG，间隔 ≤350ms）是快路径，
+    // 长按是慢路径。两者互不干扰 —— C3 那边按住满 3 秒只发 BTN:CPG_HOLD、
+    // 不会再补发 BTN:CPG，所以长按永远不会凑成双击。
+    //
     // MUTE 长按保持原样（整机重启）—— 它是剩下的那一个整机重启入口。
     if (cmd == "BTN:CPG_HOLD") {
+        g_cpgTapArmed = false;   // 长按期间不要把之前的单击当成双击的第一击
         bool ok = mcpRestartChip();
         if (ok) {
             triggerHud("键盘扩展已重启", "MCP23017 复位完成", lv_color_hex(CLR_GREEN));
