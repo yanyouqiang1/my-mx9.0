@@ -5409,6 +5409,10 @@ static void updateCountdownVisibility(void) {
 //     红色边框闪一下，告诉用户"键我收到了，只是被锁着"
 //   · 再按 Fn + LOGO 解锁
 //
+// ⚠ 锁屏上**不写**"怎么解锁"：会解锁的人本来就知道，写在屏上等于给旁边
+//   的人指路。解锁方式只写在菜单的「按键速查」里 —— 那是给机主看的，
+//   而锁屏是给"机主之外的人"看的。
+//
 // 三个容易踩的点（各自在下面有详细注释）：
 //   1. 锁定状态**不进** currentSysMode（见上面 kbLocked 的注释）
 //   2. 锁定期间**只有锁屏能上屏**（统一挡在 showScreen() 里）
@@ -5425,8 +5429,13 @@ static void updateCountdownVisibility(void) {
 
 // 锁屏排版。坐标和 mock_lock.py 里的完全一致 —— 改了这里也要改那个脚本，
 // 不然电脑上画出来的和屏上不一样，排查起来纯属浪费。
-#define LOCK_TXT_Y          182      // "YYQ 已锁定"
-#define LOCK_HINT_Y         206      // "Fn + LOGO 解锁"
+//
+// 整块内容是**垂直居中**的：大锁 176px + 8px 缝 + 文字 19px = 203px，
+// 上下各留 (240-203)/2 ≈ 18px。
+// 之前底部还挂着一行"Fn + LOGO 解锁"提示，去掉那一行之后如果不动坐标，
+// 底下会空出一大块，锁和字全挤在上半屏、看着像没排完。
+#define LOCK_IMG_Y          18       // 大锁
+#define LOCK_TXT_Y          202      // "YYQ 已锁定"
 
 static lv_img_dsc_t lockImgDsc;              // 喂给 lv_img_set_src 的描述符
 static lv_obj_t*    lockImgObj    = nullptr; // 大锁
@@ -5489,7 +5498,7 @@ static void lockScreenBuild(void) {
     lockImgObj = lv_img_create(scr_lock);
     if (lockImgObj == nullptr) { lockScreenDestroy(); return; }
     lv_obj_set_size(lockImgObj, LOCK_IMG_W, LOCK_IMG_H);
-    lv_obj_set_pos(lockImgObj, (240 - LOCK_IMG_W) / 2, 2);
+    lv_obj_set_pos(lockImgObj, (240 - LOCK_IMG_W) / 2, LOCK_IMG_Y);
     lv_img_set_src(lockImgObj, &lockImgDsc);
 
     // "已锁定"（红）先建、先居中，"YYQ" 再用 align_to 挂到它左边 ——
@@ -5511,15 +5520,6 @@ static void lockScreenBuild(void) {
     // 所以先把整屏的布局算一遍再挂。
     lv_obj_update_layout(scr_lock);
     lv_obj_align_to(lockLblYyq, lockLblLocked, LV_ALIGN_OUT_LEFT_MID, -5, 0);
-
-    // 提示怎么解锁。用户当然知道是 Fn+LOGO，但锁屏是唯一会用到这条信息的地方，
-    // 写出来省得每次都要翻文档。
-    lv_obj_t* hint = lv_label_create(scr_lock);
-    if (hint) {
-        mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
-        lv_label_set_text(hint, "Fn + LOGO 解锁");
-        lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, LOCK_HINT_Y);
-    }
 
     // 红色边框：默认隐藏。按键被吞的时候闪一下。
     // 最后建 = 画在最上层（要盖住锁图和文字的边缘）。

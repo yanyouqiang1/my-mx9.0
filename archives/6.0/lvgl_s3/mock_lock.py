@@ -29,9 +29,8 @@ CLR_RED = (0xF8, 0x71, 0x71)
 
 # 固件里的坐标（src/lvgl_s3.ino）
 LOCK_W, LOCK_H = 132, 176
-LOCK_X, LOCK_Y = (W - LOCK_W) // 2, 2
-TXT_Y = 182          # "YYQ 已锁定"
-HINT_Y = 206         # "Fn + LOGO 解锁"
+LOCK_X, LOCK_Y = (W - LOCK_W) // 2, 18
+TXT_Y = 202          # "YYQ 已锁定"（下面没有提示行了，整块内容垂直居中）
 
 CJK = "/System/Library/Fonts/Supplemental/Songti.ttc"
 LATIN = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
@@ -69,17 +68,20 @@ def main():
     fc, fl = cjk(16), latin(16)
     centered(d, TXT_Y, [("YYQ ", CLR_TEXT_DIM, False),
                         ("已锁定", CLR_RED, True)], fc, fl)
-    centered(d, HINT_Y, [("Fn + LOGO ", CLR_TEXT_MUTE, False),
-                         ("解锁", CLR_TEXT_MUTE, True)], fc, fl)
 
-    if "--border" in os.sys.argv:
+    # --border 画的是"按键被吞掉时闪红框"的样子，**另存一份**：
+    # 它要是写进 mock_lock.png，主预览就永远带着边框，反而看不出常态长什么样。
+    border = "--border" in os.sys.argv
+    if border:
         d.rectangle([1, 1, W - 2, H - 2], outline=CLR_RED, width=4)
 
-    out = os.path.join(HERE, "assets", "mock_lock.png")
+    name = "mock_lock_border.png" if border else "mock_lock.png"
+    out = os.path.join(HERE, "assets", name)
     im.save(out)
     # 放大 3 倍方便肉眼核对
     im.resize((W * 3, H * 3), Image.NEAREST).save(
-        os.path.join(HERE, "assets", "mock_lock_3x.png"))
+        os.path.join(HERE, "assets",
+                     "mock_lock_border_3x.png" if border else "mock_lock_3x.png"))
     print("已写出 %s" % out)
 
 
