@@ -1,26 +1,33 @@
 /**
  * @file crash_trace.h
  *
- * 崩溃 / 卡死现场记录。
+ * 崩溃现场记录。
  *
  * 为什么要这个：
  *   固件"跑一段时间自己重启"，开机 HUD 显示 esp_reset_reason() = ESP_RST_PANIC
  *   （真 panic，不是掉电也不是看门狗）。但**崩溃的具体位置抓不到**：
  *   panic 之后芯片复位、USB 重新枚举，Windows 侧那个串口句柄直接失效，
- *   PC 上的串口助手根本来不及收到 Guru Meditation 的回溯。这是工具限制，
+ *   PC 上的串口助手根本来得及收到 Guru Meditation 的回溯。这是工具限制，
  *   不是固件的问题 —— 只要不换硬件抓法，就只能靠猜。
  *
  *   所以改成"把现场留在芯片里"：用 RTC_DATA_ATTR（RTC 慢存）存一个结构体。
  *   软件复位（panic 走的就是 esp_restart → SW reset）**不会**清掉它，
  *   下次开机直接读出来打在屏幕上。
  *
- * 两类故障都能抓到：
- *   1) panic —— loop() 停在某一步，ct.stage 就是最后写的那个阶段。
- *   2) 卡死 / 死循环 —— loop() 不再推进心跳，监测任务判定 6 秒无进展，
- *      先把 ct.hang 置 1 再复位，同样留下现场。
- *   （看门狗本来也会兜住，但看门狗只会说"任务超时"，说不出是哪个阶段。）
+ * ⚠ 这里**只记录，不干预**。
  *
- * 代价：几个 volatile 写，纳秒级；一个 8KB 栈的 FreeRTOS 任务。
+ *   以前这个文件里还住着一个"卡死监测任务"：每 2 秒查一次 ct_heartbeat，
+ *   连续 3 次（6 秒）没推进就判死并 esp_restart()。它连同固件里的任务看门狗
+ *   一起拆掉了 —— 那套机制制造的是**查不出原因的重启**：一次"只是慢"而不是
+ *   "卡死"的操作（NVS 分区越碎写越慢，几秒很正常）就被当成死循环复位掉，
+ *   现场表现是"连蓝牙就重启、一存配置就重启"，而日志里什么异常都没有。
+ *   循环论证地看：重启一次之后故障现场也就没了，越重启越没法查。
+ *
+ *   现在固件**不会自己重启**。真出问题时由人按板上的复位重来（板子已经把
+ *   复位线引出来了，见 README 的引脚表），而且重启原因也就成了一个
+ *   有意义的信息，而不是"又一次说不清的重启"。
+ *
+ * 代价：几个 volatile 写，纳秒级。
  */
 
 #ifndef CRASH_TRACE_H
@@ -29,7 +36,6 @@
 #include <stdint.h>
 #include <esp_attr.h>
 #include <esp_system.h>
-#include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -72,11 +78,11 @@ typedef struct {
     uint32_t keyCode;    // 最后按下的键码（0xFFFFFFFF = 无）
     uint32_t sysMode;    // 当时的 currentSysMode
     uint32_t dispMode;   // 当时的 currentDispMode
-    uint32_t hang;       // 1 = 监测任务判定为卡死
+    uint32_t hang;       // 保留字段（历史值恒为 0）：卡死监测任务已拆除
     uint32_t uptimeMs;   // 出事时已运行的毫秒数
     uint32_t ovf;        // 1 = FreeRTOS 检到栈溢出（见 vApplicationStackOverflowHook）
     uint32_t ovfStack;   // 溢出瞬间的栈余量（字节）
-    char     ovfTask[16];// 溢出的任务名（"loopTask" / "ctmon" / "IDLE" ...）
+    char     ovfTask[16];// 溢出的任务名（"loopTask" / "IDLE" ...）
 } CrashTrace;
 
 // ⚠️ ct_rec / ct_prev / ct_heartbeat 的**唯一定义都在 lvgl_s3.ino 里**，
@@ -92,7 +98,7 @@ extern CrashTrace ct_prev;
 extern volatile uint32_t    ct_heartbeat;
 
 // 写阶段。热路径里就是一条 volatile 写，可以放心每处都调。
-// 顺带推进心跳，监测任务靠它判断 loop() 还活着没有。
+// 顺带推进心跳 —— 心跳现在是**纯诊断量**（见文件头），没人再拿它判死。
 static inline void ct_mark(uint32_t stage) {
     ct_rec.stage = stage;
     ct_heartbeat++;
@@ -100,17 +106,12 @@ static inline void ct_mark(uint32_t stage) {
 
 // 只报"我还活着"、**不改**阶段号。
 //
-// 为什么需要它：卡死监测看的是心跳，**不是**任务看门狗。bt_link 里所有
-// 长耗时的地方（cfgStoreRemap 的 NVS 删+写+回读、cfgApplyDoc 的宏/全局键
-// 落盘、preferences.end() 提交、分片发包）都靠 btLinkKeepAlive() 续命，
-// 而它原来只调 esp_task_wdt_reset() —— 那管的是 10 秒的任务看门狗，和 6 秒
-// 的卡死监测是两套完全独立的东西。
+// 谁在替主任务续命（bt_link 里那些长耗时的地方：cfgStoreRemap 的 NVS 删+写+回读、
+// cfgApplyDoc 的宏/全局键落盘、preferences.end() 提交、分片发包），谁就该同时
+// 报一次活 —— 这样"上次跑到哪儿"在开机时能看出个大概，而不是只知道最后那个阶段。
 //
-// 结果就是：一次正常的、只是慢的配置保存（分区越碎越慢，能到好几秒），
-// 任务看门狗被喂住了、可 6 秒监测看心跳没动，判定"卡死"，直接 esp_restart()。
-// 现场表现正是"一连蓝牙就重启、一存映射就重启"。
-//
-// 这个函数就是给喂狗点用的：谁在替主任务续命，谁就该同时报一次活。
+// ⚠ 以前这里还有一层意思：6 秒卡死监测靠它续命（不续就被判死并复位）。
+//   那套监测已经拆掉了，现在它只是**诊断计数**，不再有任何"续命"的后果。
 static inline void ct_alive(void) {
     ct_heartbeat++;
 }
@@ -151,45 +152,6 @@ static inline void ct_ready(void) {
     ct_rec.ready = 1;
 }
 
-// 监测任务：loop() 每轮都推进 ct_heartbeat。连续 3 次检查（6 秒）没推进
-// 就判定卡死/死循环，把 hang 标记和当时的阶段写进 RTC 慢存再复位。
-//
-// 阈值 6 秒要**小于**看门狗的 10 秒（WDT_TIMEOUT），这样我们能抢在看门狗
-// 之前把现场记下来；又要比最长的正常阻塞长得多 —— loop() 里最久的阻塞是
-// 蓝牙重连的 delay(500) 和一次全屏 SPI flush，都是百毫秒级。
-//
-// 前 8 秒是宽限期：setup() 里 BLE 初始化、FFat 挂载、首屏建控件都在跑，
-// 期间 loop 还没转起来，不能误判。
-static void ct_monitor_task_entry(void* arg) {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(8000));
-    uint32_t last = ct_heartbeat;
-    uint8_t stall = 0;
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        uint32_t hb = ct_heartbeat;   // 不调 esp_task_wdt_reset：本任务没订阅 WDT，调了只会刷警告
-        if (hb == last) {
-            if (++stall >= 3) {
-                ct_rec.hang = 1;
-                ct_rec.uptimeMs = (uint32_t)millis();
-                vTaskDelay(pdMS_TO_TICKS(50));
-                esp_restart();
-            }
-        } else {
-            stall = 0;
-            last = hb;
-        }
-    }
-}
-
-// setup 末尾调用：拉起监测任务
-static inline void ct_startMonitor(void) {
-    static bool started = false;
-    if (started) return;
-    started = true;
-    xTaskCreate(ct_monitor_task_entry, "ctmon", 3072, NULL, 1, NULL);
-}
-
 // ===========================
 // 栈溢出钩子
 // ===========================
@@ -204,7 +166,7 @@ static inline void ct_startMonitor(void) {
 //   问题就在"直接 abort"：此刻正主自己的栈已经被踩烂了，栈上的现场（局部
 //   变量、返回地址）全是垃圾，默认实现连"是哪个任务"都没来得及留。
 //   而本工程最需要回答的问题恰恰是"是谁溢出的" —— 是 loopTask 那个几百个
-//   else-if 的 handleCommand，还是我们自己的 ctmon 监测任务。
+//   else-if 的 handleCommand，还是别的任务。
 //
 //   所以覆盖它：先把任务名 + 当时的栈余量写进 RTC 慢存（这段代码本身极短、
 //   几乎不占栈，安全），再走原来的复位流程。下次开机就能直接看到：
@@ -213,7 +175,7 @@ static inline void ct_startMonitor(void) {
 // 为什么写任务名而不是只写标志位：任务名由 FreeRTOS 常量给出，拷进 RTC
 //   慢存里是安全的（不指向任何易失内存）。若栈溢出发生在**别的**任务上，
 //   这个名字就是唯一能区分的线索 —— "是我怀疑的 loopTask" 还是"是我从没
-//   怀疑过的 ctmon"，排查方向完全不同。
+//   怀疑过的某个别的任务"，排查方向完全不同。
 //
 // ⚠️ 这里的写法刻意保守：不用 snprintf / 不用 String / 不递归。
 //   因为它可能在**任意**任务的栈已经损坏时被调用，任何复杂的调用链都可能
