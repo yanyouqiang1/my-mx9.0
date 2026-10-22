@@ -1,0 +1,39 @@
+name: MESender
+
+options:
+  bundleIdPrefix: com.yanyouqiang.mx9
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+
+packages:
+  MX9BLE:
+    path: ../MX9BLE
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  MESender:
+    type: application
+    platform: iOS
+    sources:
+      - path: MESender
+    dependencies:
+      - package: MX9BLE
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yanyouqiang.mx9.MESender
+        PRODUCT_NAME: MESender
+        # 显式的 Info.plist（不用 GENERATE_INFOPLIST_FILE）。
+        # 蓝牙用途说明必须一眼能看到、能改 —— iOS 13+ 第一次请求权限时
+        # 系统就用这句话决定给不给。
+        INFOPLIST_FILE: MESender/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: YES

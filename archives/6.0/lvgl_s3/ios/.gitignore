@@ -1,0 +1,13 @@
+# Xcode 用户数据（每人一份，不该进版本库）
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# 构建产物
+DerivedData/
+build/
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
