@@ -129,11 +129,39 @@ static BLEServer* s_srv = nullptr;
 
 size_t btLinkPayloadMax(void) {
     if (s_ch == nullptr || !s_connected || s_srv == nullptr) return BT_PAYLOAD_MIN;
-    // 本项目只支持单连接（notify 靠 BLE2902），所以 conn_id 恒为 0。
-    uint16_t mtu = s_srv->getPeerMTU(0);
+    // ⚠⚠⚠ **不能用 s_srv->getPeerMTU(0)**。
+    //
+    //   Arduino 的实现只有一行：
+    //       return m_connectedServersMap.find(conn_id)->second.mtu;
+    //   —— **没有 end() 检查**。而 conn_id 是协议栈分配的，
+    //   "本项目只有单连接所以恒为 0"这个假设**只在第一次连接时成立**：
+    //   断链重连之后槽位不一定还分到 0。
+    //
+    //   find() 落空时返回 end()，解引用它是**未定义行为**，
+    //   读出来的是垃圾 mtu。垃圾 mtu 的后果不是"慢"，是**静默丢数据**：
+    //     · 垃圾值偏大 → 切出来的通知超过真实 MTU
+    //       → BLECharacteristic::notify 只打一条 log_w 就**照发**（它不截断）
+    //       → 协议栈把整条丢掉 → 主机看到"丢片"，日志里什么都没有
+    //     · 垃圾值偏小 → 只是慢
+    //   这正是"蓝牙时好时坏、而且没有任何报错"那种症状的来源。
+    //
+    //   改用公开的 getPeerDevices()：它**按值返回整张表**，
+    //   遍历是安全的（表为空就退回最保守值 BT_PAYLOAD_MIN）。
+    //   代价是一次 map 拷贝 —— emitChunk() 每片问一次，
+    //   但一包也就几百字节，可以忽略；比读到一个来路不明的值划算得多。
+    std::map<uint16_t, conn_status_t> peers = s_srv->getPeerDevices(false);
+    uint16_t mtu = 0;
+    for (std::map<uint16_t, conn_status_t>::const_iterator it = peers.begin();
+         it != peers.end(); ++it) {
+        if (it->second.mtu > mtu) mtu = it->second.mtu;
+    }
     if (mtu <= 3) return BT_PAYLOAD_MIN;          // 还没协商完
     size_t payload = (size_t)mtu - 3;             // 扣掉 3 字节 ATT 头
     if (payload > BT_PAYLOAD_NEGO_MAX) payload = BT_PAYLOAD_NEGO_MAX;
+    // ★ 上限必须和 BT_TX_BODY_MAX 对齐（见 btLinkSend 里的说明）：
+    //   分片预算比正文上限大 4 字节时，一条"正好占满上限"的正文
+    //   会在 btLinkSend() 里被**静默丢掉**（返回 false，调用方还以为发出去了）。
+    if (payload > BT_TX_BODY_MAX) payload = BT_TX_BODY_MAX;
     if (payload < BT_PAYLOAD_MIN)  payload = BT_PAYLOAD_MIN;
     return payload;
 }
@@ -259,6 +287,15 @@ static void emitEnd(const char* verb, const char* key) {
 bool btLinkSend(const char* verb, const char* key, const char* body, size_t len) {
     if (!btLinkReady() || body == nullptr) return false;
     if (!headOk(verb, key)) return false;
+    // ⚠ 超长正文**必须显式拒绝**（不能截断，也不能悄悄丢）。
+    //   这里以前有个坑：分片预算（btLinkPayloadMax，最高 244）和正文上限
+    //   （BT_TX_BODY_MAX = 240）**差了 4 字节**，于是长度落在 241~244 的
+    //   正文"看起来合法"却被这里 return false 挡掉 —— 调用方拿到 false
+    //   一般不当回事（有的甚至直接忽略返回值），于是这条响应**永远没发出去**，
+    //   主机那边只会等到超时，然后报一句"键盘没回话"。
+    //   现在 btLinkPayloadMax() 已经被压在 BT_TX_BODY_MAX 以内，
+    //   两者不会再打架；但这里的检查仍然保留 —— 它是最后一道闸，
+    //   任何"正文比槽子还大"的情况都必须**明确失败**而不是静默丢弃。
     if (len > BT_TX_BODY_MAX) return false;
     // 头 + '\n' 装不下 = 这一组 VERB/KEY 一片正文都带不了，入队也是白占。
     if (chunkRoom(verb, key) == 0) return false;

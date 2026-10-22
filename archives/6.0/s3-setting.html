@@ -108,6 +108,31 @@
                 <button class="btn btn-green" id="syncTimeBtn">同步电脑时间</button>
             </div>
             <div class="hint" id="readAllProgress" style="margin-top: 6px; color: #38bdf8;"></div>
+
+            <!-- BLE 收发流水面板 ----------------------------------------------
+                 ⚠ 这个元素以前**根本不存在**：JS 里的 LOG_PORT_UI() 一直在
+                   document.getElementById('bleLog') 上找它，找不到就直接
+                   return —— 于是页面里所有"→ 发出了什么 / ← 收到了什么 /
+                   ✗ 哪里出错"的记录**全部被静默丢弃**，一个都看不见。
+                   后果是：出问题时页面上只有一句"拉取超时"，
+                   而真正的线索（发了什么、回了几片、在哪一步断的）
+                   早就写好了却没人显示。
+                   这块面板就是那个"把线索捡回来"的地方。
+                 配套：LOG_PORT_UI() 原来那句
+                     box.innerHTML.split('\n').slice(-60).join('\n')
+                 也是无效的 —— innerHTML 里全是 <div>，**一个换行都没有**，
+                 split('\n') 永远只切出 1 段，所谓"保留最近 60 行"从来没生效过。
+                 现在改成按 DOM 子节点裁剪。
+            -->
+            <div style="margin-top: 10px;">
+                <div class="hint">蓝牙收发流水（排查用）：连接后每一次发/收都会记在这里。</div>
+                <pre id="bleLog" style="margin-top: 6px; max-height: 220px; overflow-y: auto;
+                     background: #0b1220; color: #a7f3d0; padding: 10px; border-radius: 6px;
+                     font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.75rem;
+                     white-space: pre-wrap; word-break: break-all; line-height: 1.35;
+                     border: 1px solid #1e293b;"></pre>
+            </div>
+
             <div style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 12px;">
                 <div class="hint">系统下发灯光状态通知（支持 Python 脚本远程触发）：</div>
                 <div class="alert-bar">
@@ -145,7 +170,21 @@
                 <button class="btn-tag" onclick="insertMeTag('SLEEP(1000)')">⏱️ 延时 1s</button>
             </div>
             <textarea id="meTextInput" rows="3" placeholder="例：hello world[ENTER]second line"></textarea>
+            <!-- 「立即发送」勾上 = 存进去之后**立刻**通过键盘把这段字打在电脑上；
+                 不勾 = 只存进键盘，等你按键盘上的 ME 键。
+                 两种模式下 /me_hex.txt 都会被更新，区别只是"要不要现在就打出去"。
+                 固件那边收的是 ME_END 和 ME_END:1 两条指令（老固件只认前者）。 -->
+            <label style="display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 13px;">
+                <input type="checkbox" id="meSendNow" style="width: auto; margin: 0;">
+                立即发送（存进去就直接打在电脑上，不用再按 ME 键）
+            </label>
             <button class="btn btn-green" id="meSendBtn" style="width: 100%; margin-top: 8px;">📡 下发并存入 ME 键</button>
+            <!-- 下发进度：ME 文本是按 128 个 hex 字符一片分批发的，
+                 5KB 中文就是 79 片、每片还固定等 50ms，**要好几秒**。
+                 以前这段没有任何反馈，按钮按下去像死机了，
+                 用户多半会连按几下 —— 而第二次 ME_START 会把固件那边
+                 刚开好的文件**截断重来**，两批数据混在一起。 -->
+            <div class="hint" id="meProgress" style="margin-top: 6px; color: #38bdf8;"></div>
         </div>
 
         <!-- 3. 壁纸 / LOGO 画板上传 -->
@@ -964,11 +1003,33 @@
     let myCharacteristic;
 
     document.getElementById('connectBtn').addEventListener('click', async () => {
+        // ⚠ 先看浏览器有没有 Web Bluetooth。
+        //   macOS 上的 Chrome / 老版 Safari **没有** navigator.bluetooth，
+        //   点连接会直接抛 "Cannot read properties of undefined"，
+        //   页面只会弹一句"连接失败: ..."，用户完全看不出是自己的浏览器不支持。
+        if (!navigator.bluetooth) {
+            const msg = "当前浏览器不支持 Web Bluetooth。\n\n" +
+                        "Chrome/Edge 请在 **Windows / Android / ChromeOS** 上用；\n" +
+                        "macOS 上请用 **Safari 26+**（或 Chrome 141+）。";
+            LOG_PORT_UI("\u2717 " + msg.replace(/\n/g, " "));
+            alert(msg);
+            return;
+        }
+        let device;
         try {
-            const device = await navigator.bluetooth.requestDevice({
+            device = await navigator.bluetooth.requestDevice({
                 acceptAllDevices: true,
                 optionalServices: ["4fafc201-1fb5-459e-8fcc-c5c9c331914b"]
             });
+        } catch (e) {
+            // 用户点了"取消"不算错误，别弹窗吓人。
+            if (e && e.name === 'NotFoundError') { LOG_PORT_UI("用户取消了选择设备"); return; }
+            LOG_PORT_UI("\u2717 选设备失败: " + e.message);
+            alert("选设备失败: " + e.message);
+            return;
+        }
+        // ---- 从这里往下才是"连上了"，后面的失败都**不是连接失败** ----
+        try {
             const server = await device.gatt.connect();
             const service = await server.getPrimaryService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
             myCharacteristic = await service.getCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8");
@@ -998,14 +1059,25 @@
             // 预加载按钮在 HTML 里是 disabled 的，只有连上了才放开
             const rBtn = document.getElementById('readAllBtn');
             if (rBtn) { rBtn.disabled = false; rBtn.title = "再拉一次整份配置（连上时已自动拉过）"; }
-            if (!await cfgPull(true)) {
-                await new Promise(r => setTimeout(r, 600));
-                await cfgPull(true);
+            // ⚠ 拉配置这一段**故意单独包 try**：拉配置失败 != 连接失败。
+            //   以前它和连接共用一个 catch，于是配置拉取出错时弹的是
+            //   "连接失败: ..."—— 蓝牙明明连着，用户却被告知连接失败，
+            //   整个排查方向从一开始就错了。
+            try {
+                if (!await cfgPull(true)) {
+                    await new Promise(r => setTimeout(r, 600));
+                    await cfgPull(true);
+                }
+                // 顺手把 MA/MB 双状态 + 相位徽章也刷一次（cfgPull 内部已经做过，
+                // 这里再调一次是为了覆盖"两次拉取都失败"的情况：老缓存里可能有值）
+                await loadToggleFromCache();
+            } catch (e) {
+                cfgSetStatus("已连接，但拉取配置时出错：" + e.message, "#f87171");
+                LOG_PORT_UI("\u2717 拉配置出错: " + e.message);
             }
-            // 顺手把 MA/MB 双状态 + 相位徽章也刷一次（cfgPull 内部已经做过，
-            // 这里再调一次是为了覆盖"两次拉取都失败"的情况：老缓存里可能有值）
-            await loadToggleFromCache();
         } catch(e) {
+            // 到这里才是真正的"连接阶段"失败
+            LOG_PORT_UI("\u2717 连接失败: " + e.message);
             alert("连接失败: " + e.message);
         }
     });
@@ -1327,12 +1399,30 @@
     }
 
     // 页面上滚动显示 BLE 收发流水，排查"到底发出去没有 / 键盘回了什么"用
+    //
+    // ⚠⚠ 以前这里是**完全失效**的，两个原因叠在一起：
+    //   ① 页面上根本没有 id="bleLog" 的元素（这个面板是后来才补上的），
+    //      document.getElementById 返回 null → 第一行就 return，
+    //      所有记录一条都不显示。
+    //   ② 就算元素在，"保留最近 60 行"那一句也不成立：
+    //        box.innerHTML.split('\n').slice(-60).join('\n')
+    //      innerHTML 里装的是一串 <div>，**里面一个换行字符都没有**，
+    //      split('\n') 永远切出 1 段，slice(-60) 拿到的还是全部 ——
+    //      面板只会越滚越长，几千条之后浏览器被拖垮。
+    //      （顺带一提，它每次都把整段 innerHTML 取出来再拼回去，
+    //       面板越长越慢，是典型的 O(n²)。）
+    //
+    // 现在改成：追加一个 DOM 节点，超出 60 行就从头上砍掉最早的。
+    // 用 textContent 而不是 innerHTML —— 正文里可能有 < > & （宏内容、
+    // 设备回的话都可能出现），拼进 innerHTML 会被当成标签解析。
     function LOG_PORT_UI(msg) {
         const box = document.getElementById('bleLog');
         if (!box) return;
-        if (box.innerHTML.indexOf('（还没有任何收发记录）') >= 0) box.innerHTML = '';
         const t = new Date().toLocaleTimeString();
-        box.innerHTML = (box.innerHTML + `<div>[${t}] ${msg}</div>`).split('\n').slice(-60).join('\n');
+        const div = document.createElement('div');
+        div.textContent = '[' + t + '] ' + msg;
+        box.appendChild(div);
+        while (box.childElementCount > 60) box.removeChild(box.firstChild);
         box.scrollTop = box.scrollHeight;
     }
 
@@ -2526,26 +2616,67 @@
     }
 
     // 下发 ME 文本：按 4.0 起的标准协议走 ME_START / ME_DATA: / ME_END。
-    // 文本先转 UTF-8 再转 hex，所以中文也能存；固件收到后只写 /me_hex.txt，
-    // 一个字都不会立刻打给电脑 —— 要发得按键盘上的 ME 键。
+    // 文本先转 UTF-8 再转 hex，所以中文也能存；固件收到后只写 /me_hex.txt。
+    //
+    // ⚠ 「立即发送」勾上时，收尾那条发的是 **ME_END:1** 而不是 ME_END：
+    //   固件认这个 flag，存完之后**立刻**通过 USB HID 把这段字打在电脑上。
+    //   不勾就还是老的 ME_END —— 只存不发，等用户按键盘上的 ME 键。
+    //   老固件不认 ME_END:1（会把 ":1" 当成未知后缀忽略），所以这个开关
+    //   在没升级固件时就是"勾了也只存"，不会把流程搞坏。
     document.getElementById('meSendBtn').addEventListener('click', async () => {
         const text = document.getElementById('meTextInput').value;
         if (!text) return alert("请输入要发送的文本！");
+        const sendNow = document.getElementById('meSendNow').checked;
 
+        const btn = document.getElementById('meSendBtn');
+        const prog = document.getElementById('meProgress');
         const view = new TextEncoder().encode(text);
         let hexStr = '';
         for (let i = 0; i < view.length; i++) {
             hexStr += view[i].toString(16).padStart(2, '0');
         }
+        const total = Math.ceil(hexStr.length / 128);
 
-        const ok = await sendBLE("ME_START");
-        if (!ok) return;
-        for (let i = 0; i < hexStr.length; i += 128) {
-            const chunkOk = await sendBLE("ME_DATA:" + hexStr.substring(i, i + 128));
-            if (!chunkOk) return;
+        // ⚠ 防重入：上一次还没发完就再点一次，固件那边的 ME_START 会把
+        //   刚开好的文件截断重来，两批数据混在一起，最后存进去的是乱的。
+        if (btn.disabled) {
+            alert("上一批还在下发中，等它发完再试。");
+            return;
         }
-        const endOk = await sendBLE("ME_END");
-        if (endOk) alert(`已存入键盘（${text.length} 字符）。\n现在按键盘上的 ME 键才会发给电脑。`);
+        btn.disabled = true;
+        prog.style.color = "#38bdf8";
+        prog.textContent = `准备下发…（${text.length} 字符 → ${total} 片）`;
+
+        try {
+            const ok = await sendBLE("ME_START");
+            if (!ok) { prog.style.color = "#f87171"; prog.textContent = "✗ ME_START 没发出去"; return; }
+            for (let i = 0, n = 0; i < hexStr.length; i += 128, n++) {
+                const chunkOk = await sendBLE("ME_DATA:" + hexStr.substring(i, i + 128));
+                if (!chunkOk) {
+                    prog.style.color = "#f87171";
+                    prog.textContent = `✗ 第 ${n + 1}/${total} 片没发出去，已中断`;
+                    LOG_PORT_UI(`✗ ME 下发中断在第 ${n + 1}/${total} 片`);
+                    return;
+                }
+                prog.textContent = `下发中… ${n + 1}/${total} 片`;
+            }
+            const endOk = await sendBLE(sendNow ? "ME_END:1" : "ME_END");
+            if (endOk) {
+                prog.style.color = "#4ade80";
+                if (sendNow) {
+                    prog.textContent = `✓ 已存入键盘（${text.length} 字符，${total} 片全部发完），正在发送…`;
+                    alert(`已存入键盘（${text.length} 字符），并已让键盘立刻发给电脑。`);
+                } else {
+                    prog.textContent = `✓ 已存入键盘（${text.length} 字符，${total} 片全部发完）`;
+                    alert(`已存入键盘（${text.length} 字符）。\n现在按键盘上的 ME 键才会发给电脑。`);
+                }
+            } else {
+                prog.style.color = "#f87171";
+                prog.textContent = "✗ ME_END 没发出去，固件那边可能没收尾";
+            }
+        } finally {
+            btn.disabled = false;
+        }
     });
 
     // ========== 2. 按方案按键映射 REMAP ==========

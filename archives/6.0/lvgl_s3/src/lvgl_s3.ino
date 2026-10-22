@@ -55,6 +55,59 @@
 // 之后（因为要用 btLinkStream），这里先前置声明。
 static void pushLogLine(const char* line);
 
+// ---------------------------------------------------------------- USB CDC 日志镜像
+//
+// 为什么要有它：
+//   LOG_PORT 走的是 **UART0（GPIO43/44）**，没接 USB-TTL 就什么都看不见。
+//   而这块板子的 USB 口已经被 HID 键盘占着，"再烧一个纯 HID 程序"就更没法看日志。
+//   这里把同一份日志**再镜像一份**到 USB CDC（ARDUINO_USB_MODE=1 时 Serial
+//   就是 USB-Serial-JTAG），于是插一根 USB 线就能看到全部日志。
+//
+// ⚠⚠ **绝对不能直接在主循环里 Serial.write()**：
+//   HWCDC::write() 在环形缓冲满、而主机又不读的时候，会**阻塞最多
+//   tx_timeout_ms（100ms）**。一行日志一次阻塞 100ms，主循环直接被卡死 ——
+//   那就等于为了看日志把"键盘卡死"这个 bug 重新引入了一遍。
+//   所以：生产者只做一次非阻塞的入队，真正的 write 交给一个**独立任务**。
+//
+// ⚠⚠⚠ **这里只能有声明，不能有函数定义！**
+//   Arduino 构建器生成 .cpp 时，会把全文件的函数原型插到
+//   **"第一个函数定义之前的最后一个 #include"** 后面。
+//   本文件在那一带还**没有** #include <lvgl.h>（它在文件更后面），
+//   所以只要在 include 之前放一个函数定义，原型就会被插到 lvgl.h 之前 ——
+//   那批原型里有 lv_obj_t 形参，于是**整个文件都编译不过**
+//   （报 "'lv_obj_t' does not name a type"，看起来像是别处坏了）。
+//   所以：定义一律放到所有 include 之后（见本文件后面的 logCdcTask/logCdcPush）。
+//
+// 队列满了就**丢掉这一段**（xQueueSend 满了直接返回 false）——
+// 日志的价值在"最近发生了什么"，但一串日志比一条都看不到更糟，所以满了宁可丢。
+// 一段 128 字节 × 32 段 = 4KB，落在 .bss。
+// ⚠⚠ **默认关掉**（LOG_CDC_MIRROR = 0），原因有三个：
+//
+//   ① 在**当前这套编译配置**下它根本没有用：
+//      platformio.ini 里是 ARDUINO_USB_CDC_ON_BOOT=1，于是框架里
+//      `Serial` 就是 **UART0**（HardwareSerial Serial(0)），
+//      而 USB 被 TinyUSB 的 HID 占着 —— macOS 上**看不到任何 CDC 节点**，
+//      /dev/cu.usbmodem* 直接消失。这段镜像写的是 UART0，不是 CDC。
+//   ② 它让 UART0 上的日志**每个字节出现两次**（见 LogMirror::write(buf,size)）。
+//   ③ 它让**两个任务**同时写同一个 HardwareSerial（主任务 + logCdcTask），
+//      而 Arduino 的 HardwareSerial 不是线程安全的 —— 两个写者会互相把
+//      缓冲写花，日志变成乱码。
+//
+//   要用的话：把下面这行改成 1，**并且**把 platformio.ini 的
+//   ARDUINO_USB_MODE 换成 0（TinyUSB CDC），那时 Serial 才是真的 USB CDC。
+//   届时机身上的 USB 会变成 HID+CDC 复合设备，插上就能看到日志。
+#define LOG_CDC_MIRROR 0
+
+#define LOG_CDC_BLOCK   128
+#define LOG_CDC_BLOCKS  32
+
+#if LOG_CDC_MIRROR
+static QueueHandle_t s_logCdcQueue = nullptr;
+
+static void logCdcTask(void* arg);
+static void logCdcPush(const char* data, size_t len);
+#endif
+
 class LogMirror : public Print {
     HardwareSerial* real;
     char    lineBuf[BT_RX_BUF_SIZE];
@@ -66,8 +119,11 @@ public:
     void begin(unsigned long baud) { if (real) real->begin(baud); }
     void end() { if (real) real->end(); }
 
-    size_t write(uint8_t c) override {
-        if (real) real->write(c);
+    // 行组装：把一个字节并进当前行，满一行就交给 BLE 日志通道。
+    // 抽成私有函数，是为了让 write(buf,size) **不要**去调 write(uint8_t) ——
+    // 那条路会把每个字节**再写一遍** real，UART0 上每个字节都会出现两次
+    // （整块写一次 + 逐字节再写一次）。以前就是这么写的。
+    void feedChar(char c) {
         if (c == '\n') {
             // 遇到 \n 才提交一行；\r 单独出现也提交一次（兼容 println 的 \r\n）
             lineBuf[lineLen] = '\0';
@@ -76,20 +132,32 @@ public:
         } else if (c == '\r') {
             // 忽略，\n 那一拍已经处理过
         } else if (lineLen < sizeof(lineBuf) - 2) {
-            lineBuf[lineLen++] = (char)c;
+            lineBuf[lineLen++] = c;
         } else {
             // 行太长，截断并把当前缓冲当成完整一行推出去（兜底，防止 lineLen 溢到下一行）
             lineBuf[sizeof(lineBuf) - 2] = '\0';
             pushLogLine(lineBuf);
-            lineBuf[0] = (char)c;
+            lineBuf[0] = c;
             lineLen = 1;
         }
+    }
+
+    size_t write(uint8_t c) override {
+        if (real) real->write(c);
+#if LOG_CDC_MIRROR
+        logCdcPush((const char*)&c, 1);      // ← USB CDC 镜像（非阻塞）
+#endif
+        feedChar((char)c);
         return 1;
     }
 
     size_t write(const uint8_t* buf, size_t size) override {
         if (real && size) real->write(buf, size);
-        for (size_t i = 0; i < size; i++) write(buf[i]);
+#if LOG_CDC_MIRROR
+        logCdcPush((const char*)buf, size);   // ← USB CDC 镜像（非阻塞）
+#endif
+        // 行组装自己走一遍，**不调 write(uint8_t)**（那会把字节写两遍）。
+        for (size_t i = 0; i < size; i++) feedChar((char)buf[i]);
         return size;
     }
 };
@@ -389,6 +457,47 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 // 白团、Windows 还是青绿渐变；这套是**矢量路径栅格化**出来的，边缘绝对干净，
 // 而且配色是用户点名要的白 / 官方蓝 #0078D4。生成器是 gen_style_icons.py。
 #include "style_icons.h"
+
+// ===========================
+// USB CDC 日志镜像的实现
+// ===========================
+//
+// ⚠ 必须放在**所有 include 之后**：见前面 logCdcPush 声明处的那段警告 ——
+//   Arduino 构建器会把函数原型插到"第一个函数定义之前的最后一个 #include"后面，
+//   在这里放定义就等于把原型的位置推到 lvgl.h 之前，整份文件都编译不过。
+#if LOG_CDC_MIRROR
+static void logCdcTask(void* arg) {
+    (void)arg;
+    char block[LOG_CDC_BLOCK];
+    while (true) {
+        // 阻塞等：有新日志就写出去；队列空了就睡，不占 CPU
+        if (xQueueReceive(s_logCdcQueue, block, portMAX_DELAY) == pdTRUE) {
+            size_t n = strnlen(block, LOG_CDC_BLOCK);
+            if (n > 0) Serial.write((const uint8_t*)block, n);
+        }
+        // ⚠ 不喂狗也不出错：日志任务挂了不该影响键盘
+        vTaskDelay(1);
+    }
+}
+
+// 把一段字节塞进 CDC 队列（非阻塞）。队列满 = 丢，绝不阻塞主循环。
+static void logCdcPush(const char* data, size_t len) {
+    if (s_logCdcQueue == nullptr || data == nullptr) return;
+    char block[LOG_CDC_BLOCK];
+    size_t off = 0;
+    while (off < len) {
+        size_t n = len - off;
+        if (n > LOG_CDC_BLOCK - 1) n = LOG_CDC_BLOCK - 1;
+        memcpy(block, data + off, n);
+        block[n] = '\0';
+        if (xQueueSend(s_logCdcQueue, block, 0) != pdTRUE) {
+            // 队列满：丢掉这一段，绝不阻塞主循环
+            return;
+        }
+        off += n;
+    }
+}
+#endif  // LOG_CDC_MIRROR
 
 // ===========================
 // 硬件配置
@@ -1171,6 +1280,8 @@ static const char* CFG_PROF_NAMES[TOTAL_PROFILES] = { "windows", "mac" };
 static BLEServer* pServer = nullptr;
 static BLECharacteristic* pCharacteristic = nullptr;
 static bool oldDeviceConnected = false;
+// 断链后"下一次尝试重启广播"的时间点。见 loop() 里那段说明。
+static unsigned long advRetryAtMs = 0;
 static unsigned long lastPingTime = 0;
 
 // 这里**不再**有任何"怎么发"的代码。
@@ -1982,6 +2093,36 @@ static void sht31_update(void) {
 //
 // 连接状态交给 bt_link：它要在断链时把正在排队的响应清掉（发出去也没人收，
 // 还会把下一条挤掉），所以别在 .ino 里另存一份 deviceConnected。
+//
+// ---- 广播状态跟踪 ----
+//
+// 为什么需要它：Arduino 的 BLEAdvertising **没有** isAdvertising()，
+// 而 esp_ble_gap_get_state() 在这个 SDK（IDF 4.4）里也不存在。
+// 不跟踪就不知道"现在到底在不在广播"，于是只能盲目重试 ——
+// 而盲目重试的代价是每次都会重新配一遍广播数据、打断正在进行的广播，
+// 反而让主机更难连上。
+//
+// BLEDevice::setCustomGapHandler 是**追加**在内部处理之后的（见 BLEDevice.cpp
+// 第 277 行），不会抢走库自己的逻辑，所以这里可以安全地挂一个自己的处理器，
+// 只看广播开始/结束这两个事件。
+static volatile bool g_advRunning = false;   // 协议栈视角：现在到底在不在广播
+static volatile bool g_advFailed  = false;   // 上一次启动广播被协议栈拒了
+
+static void myGapHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
+    if (event == ESP_GAP_BLE_ADV_START_COMPLETE_EVT) {
+        // status 不为 SUCCESS 时广播根本没起来 —— 必须让 loop() 知道，
+        // 否则设备就"看不见了"，而现场什么日志都没有。
+        // （字段名在这个 SDK（IDF 4.4）里是 adv_start_cmpl，不是 adv_start_complete）
+        bool ok = (param != nullptr &&
+                   param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
+        g_advRunning = ok;
+        g_advFailed  = !ok;
+    } else if (event == ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT) {
+        g_advRunning = false;
+        g_advFailed  = false;
+    }
+}
+
 class MyServerCallbacks : public BLEServerCallbacks {
     // pServer 要转给 bt_link：协商后的 MTU 只在 server 上（characteristic 的
     // getService() 是私有的，拿不到），拿不到就一直按 20 字节保守发。
@@ -6941,71 +7082,168 @@ static void executeActionPayload(String extra) {
     else if (extra.startsWith("CMB:")) executeComboAction(extra.substring(4));
 }
 
+// ===========================
+// ME 键输出：分帧执行（状态机）
+// ===========================
+//
+// 原来的写法是一把梭：while (f.available()) { Keyboard.print(...) }。
+//
+// ⚠⚠ 为什么必须改 —— 这就是"按 ME 键就崩"的真身：
+//
+//   ME 键要把整段文本通过 USB HID 打到主机，**每个字符要发 2 个 HID report**
+//   （按下 + 松开）。而 Arduino 的 USBHID::SendReport() 是**阻塞**的：
+//   它取信号量、把报告交给 TinyUSB，然后**等主机把报告取走**
+//   （tud_hid_report_complete_cb 才给信号量），默认超时 100ms。
+//   主机正常轮询时一个字符约 2ms；5KB 中文 = 10000 个字符 = 20000 个 report
+//   ≈ **40 秒**。主机不轮询时（屏保、别的 USB 设备占着总线）更惨：
+//   每个字符都能吃满 100ms 超时 —— 那就是几十分钟。
+//
+//   一把梭的后果：这 40 秒里 loop() 完全停住 ——
+//     · 屏幕不刷新、按键不响应 → 用户看着像"键盘死了"
+//     · **btLinkPoll() 不再跑 → 蓝牙一条都不回** → 网页那边全是超时，
+//       主机也会因为收不到任何 GATT 应答而判定设备"失联"
+//   所以它不是"复位"，是**主循环被按住**。用户说的"崩"多半就是这个。
+//
+// 改法：拆成状态机，每轮 loop 只发 ME_FRAME_CHARS 个字符就还回 CPU。
+//   于是这 40 秒里键盘仍然是活的：屏幕有进度、按键能中断、蓝牙照常回话。
+//
+// 注意：文本本身仍然是 **hex 字符串**（网页下发时就转好了），
+// 所以发出去的仍然是 ASCII 的 hex，主机按 [HEXS]/[HEXE] 协议自己解码。
+// 这里**不改协议**，只改"什么时候发"。
+
+#define ME_FRAME_CHARS  4      // 每轮 loop 发几个字符（4 个 ≈ 8ms，留得住主循环）
+#define ME_TICK_GAP_MS  1      // 帧与帧之间的最小间隔
+
+static File       meOutFile;
+static bool       meOutActive = false;
+static size_t     meOutTotal  = 0;
+static size_t     meOutSent   = 0;
+static size_t     meOutSkip   = 0;
+static uint8_t    meOutStage  = 0;   // 0=发头 1=发正文 2=发尾 3=收尾
+static unsigned long meOutLastTick   = 0;
+static unsigned long meOutLastReport = 0;
+
+// BOOTDL：收到指令后置位，真正的复位在 loop() 末尾做（见 handleCommand 里那段）。
+static bool g_bootDlPending = false;
+
+static void meOutClose() {
+    if (meOutFile) { meOutFile.close(); meOutFile = File(); }
+}
+
+// 中断正在进行的输出（用户按了别的键）。
+static void meOutCancel() {
+    if (!meOutActive) return;
+    meOutActive = false;
+    meOutClose();
+    LOG_PORT.printf("[ME] cancelled at %u/%u\n",
+                    (unsigned)meOutSent, (unsigned)meOutTotal);
+    triggerHud("ME 文本", "已中断", lv_color_hex(CLR_AMBER));
+}
+
+// 开始把 ME 文本往主机打。原来这段是一把梭，现在只是"起个头"，
+// 真正的发送在 loop() 的 meOutPump() 里分帧做。
+static void meOutStart() {
+    if (meOutActive) { meOutCancel(); }   // 已经在发了 → 先中断旧的
+    if (!SPIFFS.exists("/me_hex.txt")) {
+        LOG_PORT.println("[ME] /me_hex.txt not found");
+        triggerHud("ME 文本", "尚未设置", lv_color_hex(CLR_TEXT_DIM));
+        return;
+    }
+    File f = SPIFFS.open("/me_hex.txt", FILE_READ);
+    if (!f) {
+        LOG_PORT.println("[ME] open /me_hex.txt FAILED");
+        triggerHudBig("ME 文本", "打开失败", lv_color_hex(CLR_RED));
+        return;
+    }
+    meOutFile   = f;
+    meOutTotal  = meOutFile.size();
+    meOutSent   = 0;
+    meOutSkip   = 0;
+    meOutStage  = 0;
+    meOutActive = true;
+    meOutLastTick   = millis();
+    meOutLastReport = millis();
+    LOG_PORT.printf("[ME] start, %u bytes, freeHeap=%u\n",
+                    (unsigned)meOutTotal, (unsigned)ESP.getFreeHeap());
+    triggerHud("ME 文本", "正在发送…", lv_color_hex(CLR_ACCENT));
+}
+
+// 每轮 loop 调一次。返回 true = 还在发。
+static bool meOutPump() {
+    if (!meOutActive) return false;
+    if ((long)(millis() - meOutLastTick) < ME_TICK_GAP_MS) return true;
+    meOutLastTick = millis();
+
+    if (meOutStage == 0) {
+        Keyboard.print("[HEXS]");
+        meOutStage = 1;
+        return true;
+    }
+    if (meOutStage == 2) {
+        Keyboard.print("[HEXE]");
+        meOutStage = 3;
+        return true;
+    }
+    if (meOutStage == 3) {
+        meOutActive = false;
+        meOutClose();
+        LOG_PORT.printf("[ME] done %u/%u (skip=%u) freeHeap=%u\n",
+                        (unsigned)meOutSent, (unsigned)meOutTotal,
+                        (unsigned)meOutSkip, (unsigned)ESP.getFreeHeap());
+        if (meOutSkip > 0) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "已发 %u 跳过 %u",
+                     (unsigned)(meOutSent - meOutSkip), (unsigned)meOutSkip);
+            triggerHud("ME 文本(部分)", buf, lv_color_hex(CLR_AMBER));
+        } else {
+            triggerHud("ME 文本", "已发送", lv_color_hex(CLR_GREEN));
+        }
+        return false;
+    }
+
+    // ---- stage 1：正文 ----
+    int n = 0;
+    while (n < ME_FRAME_CHARS && meOutFile.available()) {
+        int c = meOutFile.read();
+        if (c < 0) break;
+        // ★ 关键安全修：跳过所有 >= 0x80 的字节。
+        //   Keyboard.print((char)c) 走的是 USBHIDKeyboard::press()，
+        //   对 0x80~0xFF 会进入 `modifiers |= (1 << (k-0x80))` 分支。
+        //   当 k-0x80 >= 8（即 k >= 0x88）时，左移数超过 modifier byte 位宽
+        //   是 C/C++ 未定义行为 —— Xtensa 上 5K+ 中文 UTF-8 字节（0xE4/0xB8/0xAD
+        //   这种）反复触发，踩坏堆就会重启。
+        if (c >= 0x80) { meOutSkip++; meOutSent++; n++; continue; }
+        Keyboard.print((char)c);
+        meOutSent++;
+        n++;
+    }
+    ct_alive();
+    if (!meOutFile.available()) meOutStage = 2;
+
+    // 每 ~500ms 报一次进度：既让人知道还在动，也让"真卡住了"有据可查
+    if (millis() - meOutLastReport > 500) {
+        meOutLastReport = millis();
+        LOG_PORT.printf("[ME] %u/%u (skip=%u) freeHeap=%u\n",
+                        (unsigned)meOutSent, (unsigned)meOutTotal,
+                        (unsigned)meOutSkip, (unsigned)ESP.getFreeHeap());
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%u%%", (unsigned)(meOutTotal ? meOutSent * 100 / meOutTotal : 0));
+        triggerHud("ME 文本", buf, lv_color_hex(CLR_ACCENT));
+    }
+    return true;
+}
+
 static void executeMacro(String keyName) {
     // ME 键是特殊的：它带的内容不是"按什么键"，而是一整段要贴给主机的文本。
     // 网页端蓝牙过来时只写 /me_hex.txt（HEX 字符串），按下 ME 键才真的打字。
     // 外面套 [HEXS] / [HEXE] 是主机端识别用的标记 —— 纯 ASCII 打字发中文根本
     // 做不到，hex 走一遍协议才能把 UTF-8 字节原样送到主机。
+    //
+    // ⚠ 这里只"起个头"，真正的发送由 loop() 里的 meOutPump() 分帧做 ——
+    //   一把梭会把主循环按住 40 秒（见上面那段说明）。
     if (keyName == "ME") {
         LOG_PORT.println("[ME] key pressed");
-        if (!SPIFFS.exists("/me_hex.txt")) {
-            LOG_PORT.println("[ME] /me_hex.txt not found");
-            triggerHud("ME 文本", "尚未设置", lv_color_hex(CLR_TEXT_DIM));
-            return;
-        }
-        File f = SPIFFS.open("/me_hex.txt", FILE_READ);
-        if (!f) {
-            LOG_PORT.println("[ME] open /me_hex.txt FAILED");
-            triggerHudBig("ME 文本", "打开失败", lv_color_hex(CLR_RED));
-            return;
-        }
-        const size_t total = f.size();
-        LOG_PORT.printf("[ME] sending %u bytes, freeHeap=%u\n",
-                        (unsigned)total, (unsigned)ESP.getFreeHeap());
-        Keyboard.print("[HEXS]");
-        delay(20);
-        size_t sent = 0;
-        size_t skipped = 0;
-        uint32_t lastReportMs = millis();
-        while (f.available()) {
-            int c = f.read();
-            if (c < 0) break;
-            // ★ 关键安全修：跳过所有 >= 0x80 的字节。
-            // Keyboard.print((char)c) 走的是 USBHIDKeyboard::press()，
-            // 对 0x80~0xFF 会进入 `modifiers |= (1 << (k-0x80))` 分支。
-            // 当 k-0x80 >= 8（即 k >= 0x88）时，左移数超过 modifier byte 位宽
-            // 是 C/C++ 未定义行为 —— Xtensa 上 5K+ 中文 UTF-8 字节（0xE4/0xB8/0xAD
-            // 这种）反复触发，踩坏堆就会重启。中文 ME 真正能发的通道是另开的
-            // BLE notify raw byte，不是这次的范围 —— 安全起见先一律跳过。
-            if (c >= 0x80) { skipped++; sent++; continue; }
-            Keyboard.print((char)c);
-            sent++;
-            // 每 64 字节额外让一次时间片 + 喂一次狗 —— 1ms delay() 不够给 USB host
-            // 留 ACK 时间片，端点缓冲吃紧时 SendReport 可能短暂阻塞。
-            if ((sent & 0x3F) == 0) {
-                ct_alive();
-                delay(2);
-            }
-            // 每 ~500ms 报一次进度，万一真崩了能看出崩在哪一段
-            if (millis() - lastReportMs > 500) {
-                ct_alive();
-                LOG_PORT.printf("[ME] %u/%u (skip=%u) freeHeap=%u\n",
-                                (unsigned)sent, (unsigned)total,
-                                (unsigned)skipped, (unsigned)ESP.getFreeHeap());
-                lastReportMs = millis();
-            }
-        }
-        f.close();
-        delay(20);
-        Keyboard.print("[HEXE]");
-        LOG_PORT.printf("[ME] done %u/%u (skip=%u) freeHeap=%u\n",
-                        (unsigned)sent, (unsigned)total,
-                        (unsigned)skipped, (unsigned)ESP.getFreeHeap());
-        if (skipped > 0) {
-            char buf[40];
-            snprintf(buf, sizeof(buf), "已发 %u 跳过 %u", (unsigned)(sent - skipped), (unsigned)skipped);
-            triggerHud("ME 文本(部分)", buf, lv_color_hex(CLR_AMBER));
-        }
+        meOutStart();
         return;
     }
 
@@ -7335,6 +7573,16 @@ static void scanKeyboardMatrix(void) {
                 ct_set_ctx(currentSysMode, currentDispMode);
 
                 if (currentState) {
+                    // ---- ME 文本正在往主机打：任何键都用来**中断**它 ----
+                    //
+                    // 一次 5KB 的 ME 输出要打 40 秒。这 40 秒里不给用户一个
+                    // 反悔的机会太霸道了 —— 而且按下去也没别的用（键都去打给
+                    // 主机了），所以拿它当"停"最自然。
+                    // Fn 是修饰键，不算"想按点什么"，不拿它中断。
+                    if (meOutActive && baseKey != K_FN) {
+                        meOutCancel();
+                        continue;
+                    }
                     // ---- 键盘锁定：按键在这里被拦下 ----
                     //
                     // ⚠⚠ 位置必须在**同键连发探测之前**，这不是讲究，是必须：
@@ -10152,19 +10400,84 @@ static void handleCommand(const String& cmd) {
         if (got != want) meWriteErrors++;
         meHexBytes += (uint32_t)got;
     }
-    else if (cmd == "ME_END") {
+    // ME_END[:flag] —— 收尾。flag 可选，**缺省 = 只存不发**。
+    //
+    //   ME_END      → 只把文本存进 /me_hex.txt，等用户按键盘上的 ME 键才发
+    //   ME_END:1    → 存进去之后**立刻**通过 USB HID 打给主机
+    //   ME_END:0    → 同 ME_END（显式写 0）
+    //
+    // ⚠ 为什么把 flag 挂在 ME_END 上，而不是另外发一条"现在发"的指令：
+    //   「存进去」和「发出去」必须是**同一条指令**里的两个动作 ——
+    //   分成两条就多一个可能丢失的环节（手机那边 ME_END 发成功了、
+    //   "发"那条指令却在蓝牙断开的瞬间丢了 → 键盘里存了，用户以为发出去了）。
+    //   挂在 ME_END 上，收尾和发送在固件里是原子的，不存在半截状态。
+    //
+    // ⚠ 向后兼容：老网页发的是光秃秃的 "ME_END"，走 startsWith 之后
+    //   flag 解析出来是 0，行为和以前**一模一样**（只存不发）。
+    //   所以这个改动对现有网页端是零影响的，不需要同步升级页面。
+    else if (cmd.startsWith("ME_END")) {
+        // ---- 解析 flag ----
+        // 格式 "ME_END" 或 "ME_END:<flag>"。flag 只认 '1'（其余一律当 0）。
+        // 这里**故意不做更宽松的解析**：flag 的语义是"要不要动主机键盘"，
+        // 解析得越宽松，越容易出现"用户以为没发、其实发出去了"这种反向事故。
+        int meSendNow = 0;
+        int colon = cmd.indexOf(':');
+        if (colon > 0) {
+            String flagStr = cmd.substring(colon + 1);
+            // 只接受单个 '1'。带 #123 请求号的话，请求号已经在进 handleCommand
+            // 之前被摘掉了，这里拿到的应该是干净的 flag。
+            flagStr.trim();
+            if (flagStr == "1") meSendNow = 1;
+        }
+
         if (meFile) { meFile.close(); meFile = File(); }
         size_t sz = 0;
         if (SPIFFS.exists("/me_hex.txt")) {
             File f = SPIFFS.open("/me_hex.txt", FILE_READ);
             if (f) { sz = f.size(); f.close(); }
         }
-        LOG_PORT.printf("[ME] END onDisk=%u appended=%u errs=%u\n",
-                        (unsigned)sz, (unsigned)meHexBytes, (unsigned)meWriteErrors);
+        LOG_PORT.printf("[ME] END onDisk=%u appended=%u errs=%u sendNow=%d\n",
+                        (unsigned)sz, (unsigned)meHexBytes, (unsigned)meWriteErrors,
+                        meSendNow);
         if (sz == 0 || meWriteErrors > 0) {
             triggerHudBig("ME 文本", meWriteErrors ? "写入出错" : "存入失败",
                        lv_color_hex(CLR_RED));
+            btLinkReplyf("MEEND", "ERR:%s", meWriteErrors ? "写入出错" : "存入失败");
         }
+        else {
+            // 存好了。回一句给主机（手机端要知道"确实存进去了"，
+            // 而不是只能盯着键盘屏幕看）。
+            btLinkReplyf("MEEND", "OK:%u:%d", (unsigned)sz, meSendNow);
+        }
+
+        // ---- 要"立即发送"就在这里起发 ----
+        //
+        // meOutStart() 只是"起个头"：开文件、记状态、报个 HUD，
+        // 真正的打字由 loop() 里的 meOutPump() 分帧做（见那段说明：
+        // 一把梭会把主循环按住 40 秒）。所以在这里调它是安全的 ——
+        // handleCommand 跑在主任务里，起个头不阻塞。
+        //
+        // ⚠ 必须在 meFile.close() **之后**：SPIFFS 同一个路径不能同时
+        //   一个 fd 开着写、一个 fd 开着读。顺序错了会拿到空文件或打不开。
+        if (meSendNow) {
+            meOutStart();
+        }
+    }
+    // ME_SEND —— 让主机**按现在的内容**立刻打一遍，不用重新下发文本。
+    //
+    // 为什么要有这条：
+    //   ME_END:1 已经能"边存边发"，但那要求手机手里有文本。
+    //   如果文本早就存好了（比如上次存的、或者用户在电脑上敲的），
+    //   手机只想"现在把它打出去"，就不该再传一遍十几 KB 的 hex ——
+    //   传一遍要好几秒，还多一次写 SPIFFS 的机会。
+    //   这条指令就是那个"只发不存"的动作，等价于用户按了一下 ME 键。
+    //
+    // 语义和物理 ME 键完全一致（走的是同一个 meOutStart），
+    // 所以"按 ME 键"和"手机发 ME_SEND"不会有任何行为差异。
+    else if (cmd.startsWith("ME_SEND")) {
+        LOG_PORT.println("[ME] ME_SEND (send stored text now)");
+        meOutStart();      // 起个头；真正的打字由 loop() 里的 meOutPump() 分帧做
+        btLinkReplyf("MESENT", "OK");
     }
     // ME_TEXT:text —— 网页端一次性直发（旧写法）。仍然保留，
     // 但和新的 ME_START/ME_DATA/ME_END 一样不再立刻往主机打字，
@@ -10216,6 +10529,39 @@ static void handleCommand(const String& cmd) {
             snprintf(buf, sizeof(buf), "%u KB", (unsigned)(total / 1024));
             triggerHud("壁纸传输", buf, lv_color_hex(CLR_AMBER));
         }
+    }
+    // BOOTDL —— 重启进下载模式（自己给自己留一条烧录的路）。
+    //
+    // ⚠⚠ 为什么必须有它：
+    //   这块板子的 USB 被 TinyUSB 的 HID 键盘占着，产品固件跑起来之后
+    //   主机上**看不到任何串口节点**（/dev/cu.usbmodem* 整个消失）。
+    //   于是"产品固件在跑"这个状态下**没法再烧任何东西** ——
+    //   esptool 连不上，因为根本没有串口。
+    //   以前唯一的办法是让人手动按 BOOT+EN；这条指令把这件事自动化了：
+    //   把 BOOT 脚(GPIO0)拉低再复位，复位那一瞬间 ROM 采到 BOOT=0
+    //   就进下载模式，USB 重新枚举，串口节点就回来了。
+    //
+    //   做法：先把 GPIO0 配成推挽输出并拉低，等输出稳定（100ms），
+    //   再 esp_restart()。**顺序不能反** —— 复位时它必须是低电平。
+    //
+    // ⚠ 真正的复位动作放在 loop() 末尾做（g_bootDlPending），
+    //   因为这里正处在 btLinkPoll() 的调用栈里，而回话要等下一轮
+    //   pumpTx() 才发得出去；直接在这里复位，回复永远发不出去，
+    //   主机那边只看到"连接断了"。
+    else if (cmd == "BOOTDL") {
+        btLinkReplyC("BOOTDL", "重启进下载模式");
+        g_bootDlPending = true;
+    }
+    // ME:FIRE —— 从蓝牙手动触发一次 ME 输出，和按键盘上的 ME 键**同一条路**。
+    //
+    // 为什么要有它：
+    //   ① 这条路以前只能靠手碰键盘上的 ME 键才能走，出了事没法在脚本里复现；
+    //   ② 网页上多一个"试发"按钮，不用把文本存进去再按键；
+    //   ③ 它是**验证**"发 ME 会不会把主循环按住"最直接的手段 ——
+    //      发的同时从蓝牙发 PING，主机还能收到回话就说明主循环还活着。
+    else if (cmd == "ME:FIRE") {
+        btLinkReplyC("MEFIRE", "OK");
+        meOutStart();
     }
     // LOGO_JPEG_FLUSH - 网页端把最后一包写完之后显式敲一下"发完了"。
     //
@@ -11569,6 +11915,23 @@ void setup() {
     delay(500);
     Serial1.begin(UART_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
 
+    #if LOG_CDC_MIRROR
+    // USB CDC 日志镜像：把 LOG_PORT 的内容再送一份到 USB。
+    // 真正的 write 放在独立任务里 —— HWCDC::write 在缓冲满时会阻塞 100ms，
+    // 放在主循环里等于自己把"键盘卡死"这个 bug 又请回来。
+    //
+    // ⚠ 默认关着（LOG_CDC_MIRROR=0）：当前配置下 Serial 是 UART0 而 USB 被
+    //   TinyUSB HID 占着，开着只会让 UART0 的日志重复一遍、还多一个任务
+    //   和主任务抢同一个串口。要用见文件头那段说明。
+    if (s_logCdcQueue == nullptr) {
+        s_logCdcQueue = xQueueCreate(LOG_CDC_BLOCKS, LOG_CDC_BLOCK);
+        if (s_logCdcQueue) {
+            xTaskCreate(logCdcTask, "log_cdc", 3072, nullptr, 1, nullptr);
+            LOG_PORT.println("[LOG] USB CDC 日志镜像已开");
+        }
+    }
+#endif
+
     // 早分配 PSRAM 日志环形缓冲:越早越好,从这里开始的所有 LOG_PORT.printf
     // 都能进缓冲,后面网页发 LOG:dump 能一次性拉到。失败降级到不缓冲
     // (Serial0 仍正常,只是网页看不到日志而已,不至于死锁)
@@ -11823,6 +12186,11 @@ void setup() {
     // 二进制旁路：壁纸 JPEG 是裸字节，走文本通道会被 0x00 截碎。
     btLinkSetBinaryIo(logoRxProbe, logoRxSink);
 
+    // ★ 必须在 startAdvertising() **之前**挂上：只有挂上之后启动的那次广播，
+    //   才会把 ESP_GAP_BLE_ADV_START_COMPLETE_EVT 送过来，
+    //   g_advRunning 才是准的（loop() 里的"断链后重试广播"全靠它判断）。
+    BLEDevice::setCustomGapHandler(myGapHandler);
+
     BLEDevice::startAdvertising();
 
     // 文件系统：必须用 SPIFFS，不能再用 FFat。
@@ -12044,6 +12412,11 @@ void loop() {
     // 前后都有键盘扫描和 LVGL 刷新。
     cfgPostPump();
 
+    // ME 文本往主机发送：每轮只发几个字符（见 meOutPump 上面那段说明）。
+    // ★ 必须放在 loop() 里 —— 一把梭会把主循环按住 40 秒，
+    //   屏幕不刷新、按键不响应、**蓝牙一条都不回**，用户看着就是"键盘崩了"。
+    meOutPump();
+
     // 配置 JSON 的接收超时兜底：网页发到一半关掉页面/走出蓝牙范围时，
     // cfgRxActive 必须放掉 —— 不然下一段 CFGBEGIN 之前的 CFGDATA 会被
     // 追加到上一段残留后面，攒出一份谁也解析不了的 JSON。
@@ -12083,13 +12456,51 @@ void loop() {
 
     // 连接状态归 bt_link 管（它要在断链时清掉排队中的响应），这里只盯"刚断开"
     // 这一个边沿来重启广播，让主机能重新扫到。
-    if (!btLinkConnected() && oldDeviceConnected) {
-        ct_mark(CT_S_BLE_DELAY);
-        btLinkDelay(500);          // 喂狗版 delay()，别在这 500ms 里饿着
-        BLEDevice::startAdvertising();
-        oldDeviceConnected = btLinkConnected();
+    //
+    // ⚠⚠⚠ 以前这里是**只试一次**：断链 → 等 500ms → startAdvertising() → 就没了。
+    //
+    //   而 startAdvertising() 内部最后是 esp_ble_gap_start_advertising()，
+    //   它在"上一个广播还没停干净 / 协议栈还没从断链事件里缓过来"的时候会
+    //   返回 ESP_ERR_INVALID_STATE —— Arduino 那层只打一条 log_e，
+    //   **不往上抛、不返回失败**。于是这一次重试**静默失败**，
+    //   设备从此再也不广播，主机再也扫不到它，只能拔电重插才活。
+    //
+    //   这就是"蓝牙时好时坏"的根因：设备没崩、没重启、没死机，
+    //   就是**扫不到**了，而且现场什么日志都没有。
+    //
+    //   现在改成**一直重试，直到广播真的起来**（判据是 g_advRunning，
+    //   由 GAP 的 ADV_START/ADV_STOP 事件维护，见 myGapHandler）。
+    //   重试间隔 1.5 秒，不影响别的功能 —— 连上了就不再重试。
+    if (!btLinkConnected()) {
+        if (oldDeviceConnected) {
+            oldDeviceConnected = false;
+            advRetryAtMs = millis() + 500;   // 断链后先让协议栈缓 500ms
+            ct_mark(CT_S_BLE_DELAY);
+        }
+        if ((long)(millis() - advRetryAtMs) >= 0) {
+            advRetryAtMs = millis() + 3000;
+            // ★ 只有**确实没在广播**才重试。已经在广播还去调 startAdvertising()
+            //   会重新配一遍广播数据、把正在进行的广播打断一下 ——
+            //   那样设备"在广播但一直被打断"，主机根本扫不到它。
+            //
+            // ⚠⚠ 这里**必须乐观置位**（调完立刻当成已经起来了）。
+            //   踩过的坑：先前是靠"ADV_START_COMPLETE 事件说起来了"才置位的，
+            //   万一那个事件因为任何原因没送到，g_advRunning 就永远是 false，
+            //   于是每 3 秒重下一次 startAdvertising() —— 广播被反复重建，
+            //   实测下来设备**活着、USB HID 正常，但 BLE 完全扫不到**。
+            //
+            //   现在改成：调用完先假定成功；只有协议栈**明确报失败**
+            //   （ADV_START_COMPLETE 的 status 不对）或**明确报停**
+            //   （ADV_STOP_COMPLETE）才会把标志清回去、触发下一次重试。
+            if (!g_advRunning) {
+                BLEDevice::startAdvertising();
+                g_advRunning = true;
+                g_advFailed  = false;
+            }
+        }
+    } else {
+        oldDeviceConnected = true;
     }
-    if (btLinkConnected() && !oldDeviceConnected) oldDeviceConnected = true;
 
     // Ping
     if (millis() - lastPingTime > 2000) {
@@ -12255,6 +12666,27 @@ if (lockStateDirty) {
     ct_mark(CT_S_LVGL);
     lvgl_driver_loop();
     delayMicroseconds(500);
+
+    // ---- BOOTDL：重启进下载模式 ----
+    //
+    // 放在**一轮的最末尾**：前面那条回话（btLinkReplyC）是在上一轮
+    // btLinkPoll() 的 pumpTx() 里发出去的，到这里它已经出去了。
+    //
+    // 做法：把 BOOT 脚(GPIO0)拉低再复位。复位那一瞬间 ROM 采到 BOOT=0
+    // 就进下载模式，USB 重新枚举成 CDC —— 主机上 /dev/cu.usbmodem*
+    // 就回来了，不用再让人手动按 BOOT+EN。
+    //
+    // ⚠ 顺序不能反：必须先把 GPIO0 **配成输出并拉低**，等它稳定（100ms），
+    //   复位时它才是低电平。先复位后拉低没有意义（那时已经在跑了）。
+    if (g_bootDlPending) {
+        g_bootDlPending = false;
+        LOG_PORT.println("[BOOTDL] 拉低 BOOT 脚并复位");
+        pinMode(GPIO_NUM_0, OUTPUT);
+        digitalWrite(GPIO_NUM_0, LOW);
+        delay(100);
+        esp_restart();
+        return;      // 理论上到不了这里
+    }
 
     // 完整跑完一轮：心跳 +1，监测任务据此判断有没有卡死
     ct_mark(CT_S_IDLE);
