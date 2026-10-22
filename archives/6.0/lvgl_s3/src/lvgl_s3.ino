@@ -558,6 +558,11 @@ TwoWire Wire_SHT(1);
 //    故意不加：宠物页里矩阵键照常走普通键盘分支发给主机，宠物只作反应。
 //    宠物页的全部操作走 C3 实体键（静音/旋钮/灯光长按），那些键矩阵里没有。
 #define SYS_MODE_PET       11
+// 按键速查对话框。追加在末尾，同样**不是**"设置模式"（理由同宠物页）：
+// 它没有可调字段，全屏的按键只用来翻页和关闭。
+// 这次它**要**进 scanKeyboardMatrix() 的 inUiMode —— 速查表是纯查阅界面，
+// 在里面打字没有任何意义，矩阵键照常发主机只会把主机屏幕搞得莫名其妙。
+#define SYS_MODE_HELP      12
 #define IS_SETTING_MODE(m) ((m) >= SYS_MODE_SET_TIME && (m) <= SYS_MODE_SET_LIGHT)
 static uint8_t currentSysMode = SYS_MODE_NORMAL;
 static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处理）
@@ -885,9 +890,10 @@ static bool   menuInSub = false;     // 当前在二级
 // **既不会被画出来也不会报错** —— 表现是"菜单项存在、能选中、能进去，
 // 但屏幕上就是看不见那一行"，非常像被什么盖住了。
 // 加第 7 个大类「宠物」时这里只加到 6，症状就是这个。改大它。
-#define MENU_ROW_MAX 8
+// 第 8 个大类「帮助」加进来之后是 8，这里留到 10 留点余量。
+#define MENU_ROW_MAX 10
 
-// 列表最多能同时显示几行（一级 7 个大类，二级最多 5 项，6 够用 —— 第 7 个
+// 列表最多能同时显示几行（一级 8 个大类，二级最多 5 项，6 够用 —— 第 7/8 个
 // 大类靠 menuScrollOffset 滚进窗口）
 #define MENU_VISIBLE_ITEMS 6
 
@@ -922,7 +928,8 @@ enum MenuAction {
     MA_PET_PEEK_ON,     // 宠物：主动打招呼开关
     MA_PET_WINDOW,      // 宠物：显示时段
     MA_PET_OPEN,        // 宠物：进全屏页
-    MA_PET_RESET        // 宠物：清空亲密度
+    MA_PET_RESET,       // 宠物：清空亲密度
+    MA_OPEN_HELP        // 按键速查（这一块板子上的功能速查表）
 };
 
 struct MenuEntry {
@@ -967,6 +974,14 @@ static const MenuEntry menuEntriesPet[] = {
     { "去找小橘",     MA_PET_OPEN },
     { "清空亲密度",   MA_PET_RESET }
 };
+// 帮助组**追加在末尾**（第 8 个）。理由和宠物组一样：分组编号是用户的肌肉记忆，
+// 插在中间会让原来"第 N 组"的位置全变。
+// 里面只放一项：一张按键速查表。这块板子上的功能已经多到记不住了
+// （灯光键短按切控制目标、长按切背光、静音键双击锁键盘、CPG 键双击重启扩展芯片……），
+// 全靠记忆迟早要出事，所以直接列出来。
+static const MenuEntry menuEntriesHelp[] = {
+    { "按键速查",     MA_OPEN_HELP }
+};
 
 struct MenuGroup {
     const char*     cn;
@@ -975,7 +990,7 @@ struct MenuGroup {
     uint8_t          count;
 };
 
-#define MENU_GROUP_COUNT 7
+#define MENU_GROUP_COUNT 8
 static const MenuGroup menuGroups[MENU_GROUP_COUNT] = {
     { "显示",   "DISPLAY",  menuEntriesDisplay,  sizeof(menuEntriesDisplay)  / sizeof(MenuEntry) },
     { "灯光",   "LIGHTING", menuEntriesLight,    sizeof(menuEntriesLight)    / sizeof(MenuEntry) },
@@ -983,7 +998,8 @@ static const MenuGroup menuGroups[MENU_GROUP_COUNT] = {
     { "键盘",   "KEYBOARD", menuEntriesKeyboard, sizeof(menuEntriesKeyboard) / sizeof(MenuEntry) },
     { "温湿度", "SENSOR",   menuEntriesSensor,   sizeof(menuEntriesSensor)   / sizeof(MenuEntry) },
     { "系统",   "SYSTEM",   menuEntriesSystem,   sizeof(menuEntriesSystem)   / sizeof(MenuEntry) },
-    { "宠物",   "PET",      menuEntriesPet,      sizeof(menuEntriesPet)      / sizeof(MenuEntry) }
+    { "宠物",   "PET",      menuEntriesPet,      sizeof(menuEntriesPet)      / sizeof(MenuEntry) },
+    { "帮助",   "HELP",     menuEntriesHelp,     sizeof(menuEntriesHelp)     / sizeof(MenuEntry) }
 };
 
 // 辅助变量
@@ -1924,6 +1940,10 @@ static void build_recording(void);
 static void build_elog(void);
 static void elogKey(uint16_t baseKey);
 static void elog_notePrevRun(void);
+static void build_help(void);
+static void helpKey(uint16_t baseKey);
+static void helpScrollBy(int d);
+static void helpClose(void);
 static void finishMacroRecording(const String& targetKey);
 static void enterRecording(void);
 static void advanceRecordingStage(void);
@@ -3554,6 +3574,9 @@ static void runMenuAction(MenuAction act) {
             break;
         case MA_OPEN_ELOG:       // 错误日志：重启后在这里翻出错内容
             build_elog();
+            break;
+        case MA_OPEN_HELP:       // 按键速查：一张随时能翻的按键功能表
+            build_help();
             break;
         // 宠物五项。petMenuAction() 内部按 MenuAction 再分派一次，和
         // runMenuAction 一样走枚举，不按数组下标。
@@ -6566,6 +6589,292 @@ static void elogKey(uint16_t baseKey) {
     elogRefresh();
 }
 
+// ===========================
+// 按键速查（菜单里的对话框）
+// ===========================
+//
+// 动机：这块板子上的功能已经多到记不住了 ——
+//   灯光键  短按切控制目标 / 长按切背光 / 响铃时停铃
+//   静音键  短按静音 / 双击锁键盘 / 长按整机重启
+//   CPG 键 短按切灯效 / 双击重启扩展芯片
+//   旋钮    旋转调当前目标 / 按下确认
+//   LOGO    短按切主屏风格 / 长按进宠物页
+//   Fn+LOGO 解锁键盘
+// 全靠记忆迟早要出事，所以做成一张表放在菜单里，随时翻。
+//
+// 形态：**独立屏幕**，但画成"浮在暗底上的对话框"（深底 + 居中卡片 + 强调色描边）。
+//   为什么不做成菜单屏的子对象（那样菜单能透出来，更像真模态）：
+//   菜单屏会被 build_menu() 重排、被换屏换掉，浮层挂在它身上等于把生命周期
+//   绑在别人身上；更要命的是从菜单退回主屏 / 进屏保之后，浮层会"跟着复活"——
+//   表现是"关掉速查表之后，下次打开菜单它又自己冒出来了"。
+//   独立屏幕和错误日志页一个套路：showScreen() 切进来，关掉时它还活着，下次直接复用。
+//
+// 滚动是**手动窗口**（elogScroll 那套）：LVGL 自带的滚动条要靠手指/滚轮驱动，
+// 这块板子上只有旋钮，拧不动它。
+
+#define HELP_HEAD   0
+#define HELP_ENTRY  1
+
+struct HelpItem {
+    uint8_t     kind;   // HELP_HEAD = 分组标题，HELP_ENTRY = 一条速查
+    const char* key;    // 左列：按什么
+    const char* act;    // 右列：会发生什么
+};
+
+// 内容表。**改这里就行**，排版、滚动、位置指示都是自动的。
+//
+// ⚠ 宽度是**量出来**的，不是估的（text_width.py 读的是真实字库的 adv_w）：
+//   左列最宽 "静音键 短按"  = 88px（列宽 92）
+//   右列最宽 "锁定/解锁键盘" = 104px（列宽 108）
+// 写长了会被省略号截断（不会画到屏幕外，但后半句会被砍掉 —— 所以文案要短）。
+// 改文案之后先跑一遍 `text_width.py --margin 92 "..."` 核一下。
+static const HelpItem helpItems[] = {
+    { HELP_HEAD,  "C3 实体键", "" },
+    { HELP_ENTRY, "静音键 短按", "静音切换" },
+    { HELP_ENTRY, "静音键 双击", "锁定/解锁键盘" },
+    { HELP_ENTRY, "静音键 长按", "整机重启" },
+    { HELP_ENTRY, "灯光键 短按", "切控制目标" },
+    { HELP_ENTRY, "灯光键 长按", "背光总开关" },
+    { HELP_ENTRY, "CPG键 短按", "切换灯效" },
+    { HELP_ENTRY, "CPG键 双击", "重启扩展芯片" },
+    { HELP_HEAD,  "旋钮", "" },
+    { HELP_ENTRY, "旋转", "调下面的目标" },
+    { HELP_ENTRY, "按下", "确认/保存" },
+    { HELP_ENTRY, "键盘背光", "本机亮度" },
+    { HELP_ENTRY, "屏幕亮度", "主机亮度" },
+    { HELP_ENTRY, "系统音量", "主机音量" },
+    { HELP_ENTRY, "灯效", "灯光效果" },
+    { HELP_HEAD,  "矩阵键", "" },
+    { HELP_ENTRY, "LOGO 短按", "切主屏风格" },
+    { HELP_ENTRY, "LOGO 长按", "宠物全屏页" },
+    { HELP_ENTRY, "Fn+LOGO", "解锁键盘" },
+    { HELP_ENTRY, "MC", "系统菜单" },
+    { HELP_ENTRY, "MR", "宏录制" },
+    { HELP_ENTRY, "MA/MB", "全局键" },
+    { HELP_ENTRY, "Play", "播放/暂停" },
+};
+#define HELP_ITEM_COUNT  ((int)(sizeof(helpItems) / sizeof(HelpItem)))
+
+// 版面。卡片 232x216 居中在 240x240 上（上下各留 12px）。
+#define HELP_CARD_W      232
+#define HELP_CARD_H      216
+#define HELP_VISIBLE     7       // 一屏显示几行
+#define HELP_ROW_H       22      // 行距（16px 中文字库 line_height = 19，留 3px 缝）
+#define HELP_KEY_W       92      // 左列宽（最宽的一条"静音键 短按"实测 88px）
+#define HELP_ACT_W       108     // 右列宽（最宽的一条"锁定/解锁键盘"实测 104px）
+
+static lv_obj_t* scr_help     = nullptr;
+static lv_obj_t* helpCont     = nullptr;
+static lv_obj_t* helpPosLbl   = nullptr;
+static lv_obj_t* helpRows[HELP_VISIBLE];
+static int       helpScroll   = 0;    // 窗口第一条的下标
+
+// 只在宽度真的变了才写。lv_obj_set_width() 会 invalidate + 重排版，
+// 翻一页要写 14 次（7 行 × 2 列），白白把屏幕刷脏。
+static void setLabelWidth(lv_obj_t* l, lv_coord_t w) {
+    if (l == nullptr) return;
+    if (lv_obj_get_width(l) == w) return;
+    lv_obj_set_width(l, w);
+}
+
+// 刷新可见窗口里的每一行
+static void helpRefresh(void) {
+    if (scr_help == nullptr) return;
+
+    int total = HELP_ITEM_COUNT;
+    int maxScroll = total - HELP_VISIBLE;
+    if (maxScroll < 0) maxScroll = 0;
+    if (helpScroll > maxScroll) helpScroll = maxScroll;
+    if (helpScroll < 0) helpScroll = 0;
+
+    for (int i = 0; i < HELP_VISIBLE; i++) {
+        lv_obj_t* row = helpRows[i];
+        if (row == nullptr) continue;
+        int idx = helpScroll + i;
+        if (idx >= total) { setHidden(row, true); continue; }
+        setHidden(row, false);
+
+        const HelpItem* it = &helpItems[idx];
+        lv_obj_t* bar  = lv_obj_get_child(row, 0);
+        lv_obj_t* klbl = lv_obj_get_child(row, 1);
+        lv_obj_t* albl = lv_obj_get_child(row, 2);
+
+        if (it->kind == HELP_HEAD) {
+            // 分组标题：左边一道琥珀色竖条 + 琥珀色标题，占满整行
+            if (bar) {
+                lv_obj_clear_flag(bar, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_bg_color(bar, lv_color_hex(CLR_AMBER), LV_PART_MAIN);
+            }
+            setText(klbl, it->key);
+            setLabelWidth(klbl, 200);
+            setTextColor(klbl, CLR_AMBER);
+            setHidden(albl, true);
+        } else {
+            if (bar) lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
+            setText(klbl, it->key);
+            setLabelWidth(klbl, HELP_KEY_W);
+            setTextColor(klbl, CLR_ACCENT);
+            setText(albl, it->act);
+            setHidden(albl, false);
+        }
+    }
+
+    // 右上角位置指示：现在显示的是第几条到第几条 / 一共几条
+    if (helpPosLbl) {
+        int first = helpScroll + 1;
+        int last  = helpScroll + HELP_VISIBLE;
+        if (last > total) last = total;
+        static char pb[16];
+        snprintf(pb, sizeof(pb), "%d-%d/%d", first, last, total);
+        setText(helpPosLbl, pb);
+        // 文本变了宽度也会变（"1-7/23" → "17-23/23"），重新居中一次。
+        // align 是样式属性、LVGL 自己在重排时也会重算，但这里显式来一次
+        // 最省心：胶囊就一个元素，重算一次的开销可以忽略。
+        lv_obj_center(helpPosLbl);
+    }
+}
+
+// 翻页。d 为正往下翻，为负往上翻。
+static void helpScrollBy(int d) {
+    int total = HELP_ITEM_COUNT;
+    int maxScroll = total - HELP_VISIBLE;
+    if (maxScroll < 0) maxScroll = 0;
+    int s = helpScroll + d;
+    if (s < 0) s = 0;
+    if (s > maxScroll) s = maxScroll;
+    if (s == helpScroll) return;
+    helpScroll = s;
+    helpRefresh();
+}
+
+// 关掉对话框回到菜单
+static void helpClose(void) {
+    currentSysMode = SYS_MODE_MENU;
+    // 菜单屏一直活着（从来没被删过），切回去就行，不用重建。
+    showScreen(scr_menu);
+}
+
+// 建速查对话框
+static void build_help(void) {
+    if (scr_help == nullptr) {
+        scr_help = lv_obj_create(NULL);
+        // 对话框底：比页面底色更深，让卡片"浮"起来
+        lv_obj_set_style_bg_color(scr_help, lv_color_hex(0x05070C), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(scr_help, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(scr_help, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(scr_help, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(scr_help, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 卡片
+        lv_obj_t* card = lv_obj_create(scr_help);
+        lv_obj_set_size(card, HELP_CARD_W, HELP_CARD_H);
+        lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+        mkCard(card, CLR_SURFACE, 12);
+        // 描边换成强调色暗部：这是一张"浮出来的速查表"，跟普通设置页要能一眼分开
+        lv_obj_set_style_border_color(card, lv_color_hex(CLR_ACCENT_D), LV_PART_MAIN);
+
+        // 标题
+        lv_obj_t* title = lv_label_create(card);
+        mkLabel(title, &lv_font_simsun_16_cjk, CLR_TEXT);
+        lv_label_set_text(title, "按键速查");
+        lv_obj_align(title, LV_ALIGN_TOP_LEFT, 10, 8);
+
+        // 右上角位置胶囊。60px 宽是照最宽的一串"17-23/23"（montserrat_12
+        // 约 51px）定的，再宽就不必要了。
+        lv_obj_t* chip = lv_obj_create(card);
+        lv_obj_set_size(chip, 60, 18);
+        lv_obj_align(chip, LV_ALIGN_TOP_RIGHT, -10, 8);
+        mkChip(chip, CLR_SURFACE_2, CLR_TEXT_DIM, 9);
+        helpPosLbl = lv_label_create(chip);
+        mkLabel(helpPosLbl, &lv_font_montserrat_12, CLR_TEXT_DIM);
+        // 先塞一个**同样 6 个字符**的占位（"0-0/00" vs 真的 "1-7/23"）：
+        // montserrat 是等宽数字，宽高完全一致，label 的尺寸从建出来那一刻
+        // 就是对的，lv_obj_center() 算出来的居中位置不会被后来的文本改动带歪。
+        // （真正的值由 helpRefresh() 在 showScreen() 之前写好，屏上不会出现占位。）
+        lv_label_set_text(helpPosLbl, "0-0/00");
+        lv_obj_center(helpPosLbl);
+
+        // 列表容器：只裁剪，不画底
+        helpCont = lv_obj_create(card);
+        lv_obj_set_size(helpCont, 216, HELP_VISIBLE * HELP_ROW_H);
+        lv_obj_align(helpCont, LV_ALIGN_TOP_LEFT, 8, 32);
+        lv_obj_set_style_bg_opa(helpCont, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(helpCont, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(helpCont, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(helpCont, LV_OBJ_FLAG_SCROLLABLE);
+
+        // HELP_VISIBLE 行，建一次，之后只改文字和配色
+        for (int i = 0; i < HELP_VISIBLE; i++) {
+            lv_obj_t* row = lv_obj_create(helpCont);
+            lv_obj_set_size(row, 216, HELP_ROW_H - 2);
+            lv_obj_set_pos(row, 0, i * HELP_ROW_H);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            // 分组标题左边那道竖条（普通条目里是隐藏的）
+            lv_obj_t* bar = lv_obj_create(row);
+            lv_obj_set_size(bar, 3, 12);
+            lv_obj_set_pos(bar, 2, 3);
+            lv_obj_set_style_bg_color(bar, lv_color_hex(CLR_AMBER), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+            lv_obj_set_style_radius(bar, 1, LV_PART_MAIN);
+            lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
+
+            // 左列：按什么
+            lv_obj_t* klbl = lv_label_create(row);
+            mkLabel(klbl, &lv_font_simsun_16_cjk, CLR_ACCENT);
+            lv_label_set_text(klbl, "");
+            lv_obj_set_width(klbl, HELP_KEY_W);
+            lv_label_set_long_mode(klbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_pos(klbl, 10, 0);
+
+            // 右列：会发生什么
+            lv_obj_t* albl = lv_label_create(row);
+            mkLabel(albl, &lv_font_simsun_16_cjk, CLR_TEXT);
+            lv_label_set_text(albl, "");
+            lv_obj_set_width(albl, HELP_ACT_W);
+            lv_label_set_long_mode(albl, LV_LABEL_LONG_DOT);
+            lv_obj_set_pos(albl, 10 + HELP_KEY_W + 4, 0);
+
+            helpRows[i] = row;
+        }
+
+        // 底部提示
+        lv_obj_t* hint = lv_label_create(card);
+        mkLabel(hint, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+        lv_label_set_text(hint, "旋钮↑↓ 翻看 · ESC 关闭");
+        lv_obj_set_width(hint, 216);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    helpScroll = 0;
+    helpRefresh();
+    showScreen(scr_help);
+    currentSysMode = SYS_MODE_HELP;
+}
+
+// 速查页按键：↑↓/翻页键翻页，ESC·MC 关闭
+static void helpKey(uint16_t baseKey) {
+    if (baseKey == KEY_UP_ARROW) {
+        helpScrollBy(-1);
+    } else if (baseKey == KEY_DOWN_ARROW) {
+        helpScrollBy(1);
+    } else if (baseKey == KEY_PAGE_UP) {
+        helpScrollBy(-HELP_VISIBLE);
+    } else if (baseKey == KEY_PAGE_DOWN) {
+        helpScrollBy(HELP_VISIBLE);
+    } else if (baseKey == KEY_ESC || baseKey == K_MC) {
+        helpClose();
+    }
+}
+
 static void finishMacroRecording(const String& targetKey) {
     if (recKeyCount == 0) {
         triggerHud("宏录制", "没有录到按键", lv_color_hex(CLR_RED));
@@ -7707,10 +8016,14 @@ static void scanKeyboardMatrix(void) {
                     const bool inRecMode = (currentSysMode == SYS_MODE_REC_SEQ
                                             || currentSysMode == SYS_MODE_REC_CMB);
                     const bool inElogMode = (currentSysMode == SYS_MODE_ELOG);
+                    // 速查表是纯查阅界面：在里面打字没有任何意义，矩阵键照常
+                    // 发主机只会把主机屏幕搞得莫名其妙。所以它要进 inUiMode。
+                    const bool inHelpMode = (currentSysMode == SYS_MODE_HELP);
                     const bool inUiMode = (currentSysMode == SYS_MODE_MENU)
                                           || IS_SETTING_MODE(currentSysMode)
                                           || inRecMode
-                                          || inElogMode;
+                                          || inElogMode
+                                          || inHelpMode;
 
                     // 宠物页**故意不在** inUiMode 里：那个分支会把按键吃干净、
                     // 一律不发主机，进去就一个字都打不出来。宠物页要的是
@@ -7736,6 +8049,12 @@ static void scanKeyboardMatrix(void) {
                         // 但放在最前面读起来更清楚。
                         if (inElogMode) {
                             elogKey(baseKey);
+                        }
+                        // 按键速查：↑↓ 翻页 / ESC·MC 关闭。
+                        // 排在菜单分支前面 —— 两者是互斥的 currentSysMode，顺序无所谓，
+                        // 但速查表是从菜单里点进来的，放最前面读起来更清楚。
+                        else if (inHelpMode) {
+                            helpKey(baseKey);
                         }
                         // 菜单（两级）：方向键移动 / 回车进组或执行 / ESC·MC 逐级退回
                         // 二级里 ESC 是"回一级"而不是直接退出 —— 两级菜单必须能往回走，
@@ -10617,6 +10936,13 @@ static void logDumpPump() {
 // 音量、屏幕亮度、静音都是 Consumer 页 usage，本机并不真的持有音量 ——
 // 只能把 usage 丢给主机，由操作系统去调（这和原版 s3.ino 的做法一致）。
 static void knobAdjust(int dir) {
+    if (currentSysMode == SYS_MODE_HELP) {
+        // 速查表里旋钮就是"翻页"。必须排在菜单分支**前面**：
+        // 速查表是从菜单进来的，不挡在前面的话拧旋钮会去翻菜单的选中项
+        // （菜单屏都看不见了，表现为"拧了没反应"）。
+        helpScrollBy(dir);
+        return;
+    }
     if (currentSysMode == SYS_MODE_MENU) {
         // 旋钮在菜单里是"上下翻"，跟着当前层级走（一级翻大类、二级翻组内项）
         uint8_t rows = menuInSub ? curMenuGroup()->count : MENU_GROUP_COUNT;
@@ -10771,6 +11097,9 @@ static void handleC3Command(const String& cmdIn) {
             handleMenuSelect();
         } else if (IS_SETTING_MODE(currentSysMode)) {
             saveSettingScreen();
+        } else if (currentSysMode == SYS_MODE_HELP) {
+            // 速查表里按旋钮 = 关闭（表已经翻完了，没什么要"确认"的）
+            helpClose();
         } else {
             pulseRhythm();   // 顺手打一下律动，旋钮按下去是有反馈的
         }
