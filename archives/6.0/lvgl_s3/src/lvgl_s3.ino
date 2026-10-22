@@ -384,6 +384,11 @@ CrashTrace ct_prev = { 0, 0, 0, 0xFFFFFFFFUL, 0, 0, 0, 0, 0, 0, {0} };
 #define LV_LVGL_H_INCLUDE_SIMPLE 1
 #include <lvgl.h>
 #include "profile_icons.h"   // 4 方案 × 3 档 (S/M/L) RGB565 图标，由 mmx 生成
+// 「方案+按键」页专用的一套图标：白色咬口苹果 + 蓝色 Windows 四格旗。
+// 与 profile_icons.h 的区别：那套是 mmx 生成位图，48px 下苹果是一坨认不出的
+// 白团、Windows 还是青绿渐变；这套是**矢量路径栅格化**出来的，边缘绝对干净，
+// 而且配色是用户点名要的白 / 官方蓝 #0078D4。生成器是 gen_style_icons.py。
+#include "style_icons.h"
 
 // ===========================
 // 硬件配置
@@ -572,10 +577,11 @@ static bool menuNeedsRebuild = false;  // 菜单重建标志（在 loop 中处�
 #define DISP_MODE_RHYTHM          4
 #define DISP_MODE_WALLPAPER       5
 #define DISP_MODE_HIGH_CONTRAST   6
-#define TOTAL_DISP_MODES          7
+#define DISP_MODE_PLAN_KEY        7     // 「方案+按键」：左列方案图标 + 右侧按键名
+#define TOTAL_DISP_MODES          8
 
 static const char* dispModeNames[TOTAL_DISP_MODES] = {
-    "极客仪表盘", "大字时钟", "信息面板", "击键监控", "律动", "壁纸", "高对比度"
+    "极客仪表盘", "大字时钟", "信息面板", "击键监控", "律动", "壁纸", "高对比度", "方案按键"
 };
 
 static uint8_t currentDispMode = DISP_MODE_GEEK;
@@ -1494,6 +1500,33 @@ static lv_obj_t* hc_bar_t_fill      = nullptr;   // 温度进度条填充（0..�
 static lv_obj_t* hc_bar_h_track     = nullptr;   // 湿度进度条槽
 static lv_obj_t* hc_bar_h_fill      = nullptr;   // 湿度进度条填充
 
+// 「方案+按键」页（DISP_MODE_PLAN_KEY）
+// 版面：顶栏是这一页自己的（左上标题 + 右上三颗长方形锁灯），**不建** dashTopBar()；
+// 主体左边 62px 放方案图标，右边 164px 放按键卡；底部两条窄条是温湿度。
+static lv_obj_t* pk_bg          = nullptr;
+static lv_obj_t* pk_lbl_title   = nullptr;   // "YYQ键盘"
+static lv_obj_t* pk_lock[3]     = { nullptr, nullptr, nullptr };  // 三颗长方形灯的底
+static lv_obj_t* pk_lockLbl[3]  = { nullptr, nullptr, nullptr };  // 灯上的 NUM/CAPS/SCR
+static lv_obj_t* pk_icon[2]     = { nullptr, nullptr };  // [0]=mac 苹果 [1]=Windows
+static lv_obj_t* pk_iconCard[2] = { nullptr, nullptr };  // 当前方案图标后面那块高亮底卡
+static lv_obj_t* pk_lbl_cap     = nullptr;   // 左列底下的"方案"二字
+static lv_obj_t* pk_card        = nullptr;   // 右侧按键卡
+static lv_obj_t* pk_lbl_key     = nullptr;   // 按键名（字号动态选）
+static lv_obj_t* pk_lbl_todayCap= nullptr;   // "TODAY"
+static lv_obj_t* pk_lbl_today   = nullptr;   // 今日按键数
+static lv_obj_t* pk_lbl_tCap    = nullptr;   // "温度"
+static lv_obj_t* pk_lbl_tVal    = nullptr;   // 温度值
+static lv_obj_t* pk_lbl_hCap    = nullptr;   // "湿度"
+static lv_obj_t* pk_lbl_hVal    = nullptr;   // 湿度值
+static lv_obj_t* pk_bar_tTrack  = nullptr;   // 温度条槽
+static lv_obj_t* pk_bar_tFill   = nullptr;   // 温度条填充
+static lv_obj_t* pk_bar_hTrack  = nullptr;   // 湿度条槽
+static lv_obj_t* pk_bar_hFill   = nullptr;   // 湿度条填充
+// 记着"当前贴的是哪个方案的图标"。lv_img_set_src() 每次调用都会 invalidate
+// + 重排版，无脑每 100ms 调一次等于屏幕永远 dirty —— 所以只在方案真的变了
+// 的时候才动。（resetStylePointers / build 时会把它重置成不可能值。）
+static uint8_t pkShownProfile = 0xFF;
+
 // ===========================
 // 壁纸：JPEG 上传 + 解码缓冲
 // ===========================
@@ -1636,9 +1669,10 @@ static bool mainContentValid = false;
 #define STYLE_BIT_RHYTHM          (1u << DISP_MODE_RHYTHM)
 #define STYLE_BIT_WALLPAPER       (1u << DISP_MODE_WALLPAPER)
 #define STYLE_BIT_HIGH_CONTRAST   (1u << DISP_MODE_HIGH_CONTRAST)
+#define STYLE_BIT_PLAN_KEY        (1u << DISP_MODE_PLAN_KEY)
 #define STYLE_BIT_ALL             (STYLE_BIT_GEEK | STYLE_BIT_BIG_CLOCK | STYLE_BIT_INFO_PANEL | \
                                    STYLE_BIT_KEY_MON | STYLE_BIT_RHYTHM | STYLE_BIT_WALLPAPER | \
-                                   STYLE_BIT_HIGH_CONTRAST)
+                                   STYLE_BIT_HIGH_CONTRAST | STYLE_BIT_PLAN_KEY)
 // 六种风格全开。之前的"全开就整机卡死"不是风格本身重，是 topLockDot[] 这组
 // 共用指针在切换时没清干净，updateDynamicElements() 一直在写已释放的内存
 // （详见 resetStylePointers 里的注释）。这个坑填掉之后掩码就不再是必需品了。
@@ -1699,6 +1733,23 @@ static void resetStylePointers(void) {
     hc_bar_t_track = nullptr; hc_bar_t_fill = nullptr;
     hc_bar_h_track = nullptr; hc_bar_h_fill = nullptr;
 
+    // 「方案+按键」页的指针。**一个都不能漏** —— 漏一个就是上面注释里
+    // 说的那种野指针：切走风格后 updateDynamicElements() 每 100ms 往已释放
+    // 的地址上写一次，直接踩坏堆。
+    pk_lbl_title = nullptr; pk_card = nullptr;
+    pk_lbl_cap = nullptr; pk_lbl_key = nullptr;
+    pk_lbl_todayCap = nullptr; pk_lbl_today = nullptr;
+    pk_lbl_tCap = nullptr; pk_lbl_tVal = nullptr;
+    pk_lbl_hCap = nullptr; pk_lbl_hVal = nullptr;
+    pk_bar_tTrack = nullptr; pk_bar_tFill = nullptr;
+    pk_bar_hTrack = nullptr; pk_bar_hFill = nullptr;
+    for (int i = 0; i < 3; i++) { pk_lock[i] = nullptr; pk_lockLbl[i] = nullptr; }
+    for (int i = 0; i < 2; i++) { pk_icon[i] = nullptr; pk_iconCard[i] = nullptr; }
+    pk_bg = nullptr;   // 容器本身也清一下（两个调用点其实已经先清过了，
+                       // 这里只是双保险 —— 这个文件的注释里已经为同类坑
+                       // 写过血书，漏一个就是整机重启）
+    pkShownProfile = 0xFF;   // 图标被释放了，下次重建必须重新贴图
+
     // 顶部条是 6 种风格**共用**的一套全局指针，dashTopBar() 建谁就指向谁。
     // 之前漏在这里清理，就踩了和 ipLockDot[] 一模一样的坑，而且这次更隐蔽：
     //
@@ -1720,6 +1771,7 @@ static void destroyMainScreen(void) {
     gk_bg = nullptr; bc_bg = nullptr; ip_bg = nullptr;
     km_bg = nullptr; rh_bg = nullptr; wp_bg = nullptr;
     hc_bg = nullptr;
+    pk_bg = nullptr;
     resetStylePointers();   // 顶部条指针在这里一并清掉
 
     if (scr_main != nullptr) {
@@ -3200,6 +3252,315 @@ static void build_style_high_contrast(void) {
     lv_label_set_long_mode(hc_lbl_strip_chars_val, LV_LABEL_LONG_DOT);
     lv_obj_align(hc_lbl_strip_chars_val, LV_ALIGN_TOP_LEFT, 162, 208);
 
+}
+
+// ===========================
+// 构建：方案 + 按键
+// ===========================
+// 这一页的版面（240x240，下面的坐标全是**屏幕坐标**）：
+//
+//   y=0..28     顶栏：左上角「YYQ键盘」，右上角三颗**长方形**锁状态灯
+//   y=30..204   主体：左列 62px 放方案图标，右侧 164px 放按键卡
+//   y=208..233  底部：温度 / 湿度两条窄条
+//
+// 三个容易踩的点：
+//
+// 1. 这一页**不建** dashTopBar()。老顶栏是"三颗圆点 + 方案序号"，
+//    用户要的是"左上角一行字 + 右边三个长方形指示灯"，两套顶栏不能同时存在。
+//
+// 2. 按键名的字号是**按实测字宽动态选**的（48 → 28 → 24），不是按字符个数。
+//    同样 4~6 个字符，宽度能差 50px：montserrat 48px 下 "RIGHT"=154.0px、
+//    "Space"=148.1px 放得下（卡片内宽 152px），但 "NumLk"=180.3px、
+//    "DOWN"=173.0px、"NumEnt"=207.0px 就撑爆了 —— 一刀切按字符数必然歪一半。
+//    这里用 LVGL 自己的 lv_font_get_glyph_width() 量（带 kerning，返回像素），
+//    和离线工具 lvgl_font_width.py 读的是同一份 adv_w，两边结论一致。
+//
+// 3. 方案图标用**矢量栅格化**的 style_icons.h（白色咬口苹果 + 蓝色 Windows），
+//    不用 profile_icons.h 那套 mmx 位图 —— 那套的苹果 48px 下是一坨认不出的
+//    白团，Windows 还是青绿渐变，不是用户点名要的白 / 蓝。
+#define PK_TITLE_H     28      // 顶栏高
+#define PK_LEFT_X      4
+#define PK_LEFT_W      62
+#define PK_ICON        52      // 方案图标边长
+#define PK_ICON_CARD   61      // 图标后面那块高亮底卡的边长
+#define PK_CARD_X      70
+#define PK_CARD_W      164     // 右边缘 234（和灯组右边缘齐平）
+#define PK_CARD_TOP    32
+#define PK_CARD_BOT    200
+#define PK_KEY_Y       82      // 按键名的顶边（屏幕坐标）
+#define PK_LIGHT_W     38      // 长方形锁灯
+#define PK_LIGHT_H     14
+#define PK_LIGHT_GAP   5
+#define PK_LIGHT_RIGHT 6       // 灯组离右边多远
+#define PK_BAR_Y1      208     // 温度条
+#define PK_BAR_Y2      223     // 湿度条
+#define PK_BAR_H       7
+#define PK_BAR_X0      44      // 条的左端
+#define PK_BAR_X1      176     // 条的右端
+// 温湿度那两个字的中文标签，**故意不让它们跟条的行距一样**（15px）。
+// 中文字体的墨迹是 15px 高（box_h=15, ofs_y=-2），LVGL 把墨迹放在
+// 标签顶边 + (line_height - base_line) - box_h - ofs_y = +3 的位置：
+//   温度标签在 203 → 墨迹 206..220
+//   湿度标签在 218 → 墨迹 221..235
+// 两行只差 15px，墨迹**正好相接、零间隙**，看着就是"温度湿度粘在一起"。
+// 拉开到 17px 行距 → 中间留 2px，才读得出是两行。
+#define PK_LBL_T_Y     201
+#define PK_LBL_H_Y     218
+
+// 按键名的字宽测量：跟 LVGL 内部排版同一套算法（lv_font_get_glyph_width
+// 带 kerning，等价于 lv_txt_get_width，但那个在 misc/lv_txt.h 里、
+// 没有被 lvgl.h 公开导出，所以这里自己按同样逻辑累加）。
+static lv_coord_t pkMeasureKeyWidth(const char* txt, const lv_font_t* font) {
+    if (txt == nullptr || font == nullptr) return 0;
+    lv_coord_t w = 0;
+    for (const char* p = txt; *p; p++) {
+        uint32_t cur = (uint32_t)(uint8_t)*p;
+        uint32_t nxt = (uint32_t)(uint8_t)*(p + 1);   // p+1 指向 '\0' 时是 0
+        lv_coord_t cw = (lv_coord_t)lv_font_get_glyph_width(font, cur, nxt);
+        if (cw > 0) w += cw;
+    }
+    return w;
+}
+
+// 给按键名挑最大的、且放得下的字号。放不下就退一档，全放不下用 24 号兜底。
+static void pkApplyKeyFont(const char* txt) {
+    if (pk_lbl_key == nullptr) return;
+    const lv_font_t* cands[3] = {
+        &lv_font_montserrat_48, &lv_font_montserrat_28, &lv_font_montserrat_24
+    };
+    const lv_coord_t avail = PK_CARD_W - 12;    // 卡片内宽（左右各留 6px）
+    const lv_font_t* pick = cands[2];            // 兜底
+    for (int i = 0; i < 3; i++) {
+        if (pkMeasureKeyWidth(txt, cands[i]) <= avail) { pick = cands[i]; break; }
+    }
+    lv_obj_set_style_text_font(pk_lbl_key, pick, LV_PART_MAIN);
+}
+
+// 方案切换时刷新这一页的图标 + 高亮底卡。
+// 为什么要单独抽一个函数：updateDynamicElements() 开头有"系统时间没校准就
+// return"的分支，只靠它会出现"换了方案图标不跟着变"。老顶栏的
+// updateTopBarProfile() 就是为同一件事抽出来的，这里照抄那个套路。
+// currentProfile：0 = Windows，1 = macOS（见 profileNamesCN）。
+static void updatePlanKeyProfile(void) {
+    if (pk_icon[0] == nullptr || pk_icon[1] == nullptr) return;
+    if (pkShownProfile == currentProfile) return;
+    pkShownProfile = currentProfile;
+
+    bool mac = (currentProfile == 1);
+    // pk_icon[0] = 苹果（macOS 方案），pk_icon[1] = Windows
+    lv_img_set_src(pk_icon[0], mac ? &style_icon_apple_desc : &style_icon_apple_dim_desc);
+    lv_img_set_src(pk_icon[1], mac ? &style_icon_win_dim_desc  : &style_icon_win_desc);
+    for (int i = 0; i < 2; i++) {
+        if (pk_iconCard[i] == nullptr) continue;
+        bool on = (i == 0) ? mac : !mac;
+        lv_obj_set_style_bg_color(pk_iconCard[i], lv_color_hex(CLR_SURFACE_2), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(pk_iconCard[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+    }
+}
+
+// 底部两条窄条的填充长度。
+static void pkSetBarFill(lv_obj_t* fill, lv_coord_t x, lv_coord_t y, float pct) {
+    if (fill == nullptr) return;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+    lv_coord_t trackW = PK_BAR_X1 - PK_BAR_X0;
+    lv_coord_t w = (lv_coord_t)((float)trackW * pct + 0.5f);
+    // 读数非零却一根都不显示，看上去像传感器挂了 —— 至少留 1px
+    if (w == 0 && pct > 0.0f) w = 1;
+    setSizePos(fill, w, PK_BAR_H, x, y);
+}
+
+// 「方案+按键」这一页每 100ms 刷一次的内容。
+//
+// ⚠️ 这个函数**必须**在 updateDynamicElements() 里那个
+// "系统时间没校准就 return"的早退**之前**调用 —— 这一页显示的是
+// "刚按下的键 / 今日次数 / 温湿度 / 锁灯"，**一样都不依赖系统时间**。
+// 要是跟其它风格一样塞在 switch 里（switch 在早退之后），那在没对上 NTP
+// 的时候这一页会一直停在初始状态：按什么键屏幕都不动 —— 正好把这一页
+// 最核心的东西（按键反馈）废掉了。
+static void updatePlanKeyElements(void) {
+    if (pk_bg == nullptr) return;
+
+    // 按键名：内容变了才换字号。字号是按实测字宽挑的
+    // （见 pkApplyKeyFont 的注释），换字号要重排版，不能每 100ms 都做。
+    static char pkLastKey[8] = "";
+    if (strcmp(pkLastKey, lastKeyPressed) != 0) {
+        snprintf(pkLastKey, sizeof(pkLastKey), "%s", lastKeyPressed);
+        pkApplyKeyFont(pkLastKey);
+    }
+    setText(pk_lbl_key, lastKeyPressed);
+
+    // 右下角：今日按键数。todayKeyCount 是"今天按了多少次"，
+    // 本地时间跨日自动清零（按键分发路径里判 todayDateYmd，
+    // 开机时再跟 NVS 的 today_y 比一次）。
+    // 走 formatCountCompact 是因为它最大只到 "12.3k" 那一档，
+    // 宽度不会超过 64px 的框；直接印 10 位数字会把框顶出去。
+    static char pkToday[16];
+    formatCountCompact(pkToday, sizeof(pkToday), todayKeyCount);
+    setText(pk_lbl_today, pkToday);
+
+    // 方案图标：换方案的那一刻 switchProfile() 会调 updatePlanKeyProfile()，
+    // 这里再兜一次 —— 万一这一页是在别的方案下建出来的。
+    updatePlanKeyProfile();
+
+    // 三颗长方形锁灯：亮 = 整颗填语义色，灭 = 暗底灰字。
+    // 语义色和 C3 上 16/17/18 号物理指示灯同源（lockLedColor）。
+    const bool pkLocks[3] = { numLock, capsLock, scrollLock };
+    for (int i = 0; i < 3; i++) {
+        bool on = pkLocks[i];
+        setBgColor(pk_lock[i], on ? lockLedColor[i] : CLR_SURFACE_2);
+        setTextColor(pk_lockLbl[i], on ? CLR_BG : CLR_TEXT_MUTE);
+    }
+
+    // 底部温度 / 湿度。shtAvailable 为 false（传感器没接上）时显示
+    // "--.-°C" / "--%"，条保持空槽 —— 不能拿初值 0 画一根满格，
+    // 骗用户以为读到的是 0% / 0°C（高对比度页也是这么处理的）。
+    static char pkT[16], pkH[16];
+    snprintf(pkT, sizeof(pkT), "%.1f°C", shtTemp);
+    snprintf(pkH, sizeof(pkH), "%.0f%%", shtHumidity);
+    setText(pk_lbl_tVal, shtAvailable ? pkT : "--.-°C");
+    setText(pk_lbl_hVal, shtAvailable ? pkH : "--%");
+
+    // 量程：温度 0..50°C（室内实际 15~35，23°C 正好在中段，一眼能分辨
+    // 偏凉/舒服/偏热；用 0..100 的话室内永远只有 1/4 长，条就废了）。
+    // 湿度 0..100%（传感器本来就是这个量程）。两边都夹紧，坏读数不能让条溢出。
+    float pkTpct = 0.0f, pkHpct = 0.0f;
+    if (shtAvailable) {
+        pkTpct = shtTemp / 50.0f;
+        pkHpct = shtHumidity / 100.0f;
+    }
+    pkSetBarFill(pk_bar_tFill, PK_BAR_X0, PK_BAR_Y1, pkTpct);
+    pkSetBarFill(pk_bar_hFill, PK_BAR_X0, PK_BAR_Y2, pkHpct);
+}
+
+static void build_style_plankey(void) {
+    if (pk_bg) { lv_obj_del(pk_bg); pk_bg = nullptr; }
+
+    pk_bg = makeRootPanel(ensureMainScreen(), CLR_BG);
+
+    // ---- 顶栏：左上标题 ----
+    // 「YYQ键盘」用**一个** label 写完：拆成 "YYQ"(montserrat) + "键盘"(黑体)
+    // 两个 label 的话两种字号行高不同，基线对不齐，中文会比英文高飘几像素。
+    pk_lbl_title = lv_label_create(pk_bg);
+    mkLabel(pk_lbl_title, &lv_font_simsun_16_cjk, CLR_TEXT);
+    lv_label_set_text(pk_lbl_title, "YYQ键盘");
+    lv_obj_align(pk_lbl_title, LV_ALIGN_TOP_LEFT, PK_LEFT_X, 5);
+
+    // ---- 顶栏：右上三颗长方形锁灯 ----
+    // 亮 = 整颗填语义色（NUM 绿 / CAPS 青 / SCR 琥珀），灭 = 暗底灰字。
+    // 颜色跟 C3 上 16/17/18 号物理指示灯同源（lockLedColor）。
+    const char* lockNames[3] = { "NUM", "CAPS", "SCR" };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* b = lv_obj_create(pk_bg);
+        lv_obj_set_size(b, PK_LIGHT_W, PK_LIGHT_H);
+        // 从右往左摆：SCR 最右、CAPS 中间、NUM 最左（跟键盘上物理灯一致）
+        lv_obj_align(b, LV_ALIGN_TOP_RIGHT,
+                     -(PK_LIGHT_RIGHT + (2 - i) * (PK_LIGHT_W + PK_LIGHT_GAP)),
+                     (PK_TITLE_H - PK_LIGHT_H) / 2);
+        mkChip(b, CLR_SURFACE_2, CLR_TEXT_MUTE, 4);
+        pk_lock[i] = b;
+
+        lv_obj_t* t = lv_label_create(b);
+        mkLabel(t, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+        lv_label_set_text(t, lockNames[i]);
+        lv_obj_align(t, LV_ALIGN_CENTER, 0, 0);
+        pk_lockLbl[i] = t;
+    }
+
+    // ---- 左列：方案图标 ----
+    // 两个方案都摆出来，当前方案点亮（白苹果 / 蓝 Windows），另一个压灰。
+    // 高亮底卡先建、图标后建，图标才画在底卡上面。
+    const int iconY[2] = { PK_CARD_TOP + 2, PK_CARD_TOP + 64 };
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t* c = lv_obj_create(pk_bg);
+        lv_obj_set_size(c, PK_ICON_CARD, PK_ICON_CARD);
+        lv_obj_align(c, LV_ALIGN_TOP_LEFT, PK_LEFT_X, iconY[i] - 5);
+        mkChip(c, CLR_SURFACE_2, CLR_TEXT_MUTE, 12);
+        lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, LV_PART_MAIN);
+        pk_iconCard[i] = c;
+
+        lv_obj_t* im = lv_img_create(pk_bg);
+        lv_img_set_src(im, (i == 0) ? &style_icon_apple_desc : &style_icon_win_desc);
+        lv_obj_align(im, LV_ALIGN_TOP_LEFT, PK_LEFT_X + (PK_LEFT_W - PK_ICON) / 2, iconY[i]);
+        pk_icon[i] = im;
+    }
+    pkShownProfile = 0xFF;      // 强制下一次 updatePlanKeyProfile() 真的刷一次
+    updatePlanKeyProfile();     // 按当前方案点亮
+
+    // 左列底下的"方案"二字（16px 中文正好 32px，左列 62px 放得下）
+    pk_lbl_cap = lv_label_create(pk_bg);
+    mkLabel(pk_lbl_cap, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(pk_lbl_cap, "方案");
+    lv_obj_align(pk_lbl_cap, LV_ALIGN_TOP_LEFT, PK_LEFT_X + (PK_LEFT_W - 32) / 2,
+                 iconY[1] + PK_ICON + 12);
+
+    // ---- 右侧：按键卡 ----
+    pk_card = lv_obj_create(pk_bg);
+    lv_obj_set_size(pk_card, PK_CARD_W, PK_CARD_BOT - PK_CARD_TOP);
+    lv_obj_align(pk_card, LV_ALIGN_TOP_LEFT, PK_CARD_X, PK_CARD_TOP);
+    mkCard(pk_card, CLR_SURFACE, 12);
+
+    // 按键名。**挂在卡里**而不是挂在 pk_bg 上：TOP_MID 是相对父对象居中的，
+    // 挂 pk_bg 的话会居中到屏幕中线 x=120，而这张卡的中心在 x=152 ——
+    // 差 32px，看着就是"字没居中"。挂卡里就自动跟着卡走。
+    pk_lbl_key = lv_label_create(pk_card);
+    mkLabel(pk_lbl_key, &lv_font_montserrat_48, CLR_TEXT);
+    lv_label_set_text(pk_lbl_key, "-");
+    // 字号是按实测字宽挑的，理论上一定放得下；但万一 getKeyName() 以后
+    // 加了个超长键名，label 默认的长模式是 WRAP —— 会折成两行把版面顶乱。
+    // CLIP 兜底：宁可右边切掉一点，也不许折行。
+    lv_label_set_long_mode(pk_lbl_key, LV_LABEL_LONG_CLIP);
+    lv_obj_align(pk_lbl_key, LV_ALIGN_TOP_MID, 0, PK_KEY_Y - PK_CARD_TOP);
+
+    // 右下角：今日按键数。数字固定占 64px 的框、右对齐，
+    // 这样不管今天按了多少次（位数在变），"TODAY" 这个词的右边缘都不会跑。
+    pk_lbl_todayCap = lv_label_create(pk_card);
+    mkLabel(pk_lbl_todayCap, &lv_font_montserrat_10, CLR_TEXT_MUTE);
+    lv_label_set_text(pk_lbl_todayCap, "TODAY");
+    lv_obj_align(pk_lbl_todayCap, LV_ALIGN_BOTTOM_RIGHT, -82, -14);
+
+    pk_lbl_today = lv_label_create(pk_card);
+    mkLabel(pk_lbl_today, &lv_font_montserrat_20, CLR_VIOLET);
+    lv_label_set_text(pk_lbl_today, "0");
+    lv_obj_set_width(pk_lbl_today, 64);
+    lv_obj_set_style_text_align(pk_lbl_today, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    // 同上：定宽 64px 的 label 默认会折行，今天的位数万一变多就折成两行。
+    lv_label_set_long_mode(pk_lbl_today, LV_LABEL_LONG_CLIP);
+    lv_obj_align(pk_lbl_today, LV_ALIGN_BOTTOM_RIGHT, -12, -8);
+
+    // ---- 底部：温度 / 湿度两条窄条 ----
+    const char* capNames[2] = { "温度", "湿度" };
+    const int barY[2] = { PK_BAR_Y1, PK_BAR_Y2 };
+    const int capY[2] = { PK_LBL_T_Y, PK_LBL_H_Y };
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t* cap = lv_label_create(pk_bg);
+        mkLabel(cap, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
+        lv_label_set_text(cap, capNames[i]);
+        lv_obj_align(cap, LV_ALIGN_TOP_LEFT, PK_LEFT_X, capY[i]);
+
+        lv_obj_t* val = lv_label_create(pk_bg);
+        mkLabel(val, &lv_font_montserrat_14, CLR_TEXT);
+        lv_label_set_text(val, i == 0 ? "--.-°C" : "--%");
+        lv_obj_align(val, LV_ALIGN_TOP_RIGHT, -6, barY[i] - 5);
+
+        lv_obj_t* track = lv_obj_create(pk_bg);
+        lv_obj_set_size(track, PK_BAR_X1 - PK_BAR_X0, PK_BAR_H);
+        lv_obj_align(track, LV_ALIGN_TOP_LEFT, PK_BAR_X0, barY[i]);
+        mkChip(track, CLR_SURFACE_2, CLR_TEXT_MUTE, 3);
+
+        lv_obj_t* fill = lv_obj_create(pk_bg);
+        lv_obj_set_size(fill, 0, PK_BAR_H);
+        lv_obj_align(fill, LV_ALIGN_TOP_LEFT, PK_BAR_X0, barY[i]);
+        mkChip(fill, i == 0 ? CLR_AMBER : CLR_ACCENT, CLR_TEXT_MUTE, 3);
+
+        if (i == 0) {
+            pk_lbl_tCap = cap; pk_lbl_tVal = val;
+            pk_bar_tTrack = track; pk_bar_tFill = fill;
+        } else {
+            pk_lbl_hCap = cap; pk_lbl_hVal = val;
+            pk_bar_hTrack = track; pk_bar_hFill = fill;
+        }
+    }
 }
 
 // ===========================
@@ -6156,6 +6517,8 @@ void switchProfile(uint8_t profIdx) {
     // 顶部条的序号 + 系统图标立刻跟上。等 updateDynamicElements() 那 100ms 也行，
     // 但它开头有"系统时间未校准就 return"的分支，靠它会出现图标不跟着换。
     updateTopBarProfile();
+    // 「方案+按键」页的图标不在顶栏（它那一页是自带的顶栏），得单独刷。
+    updatePlanKeyProfile();
 }
 
 // ===========================
@@ -10494,6 +10857,17 @@ static void updateDynamicElements(void) {
     if (!lockStateDirty && nowMs - lastRunMs < DYNAMIC_REFRESH_MS) return;
     lastRunMs = nowMs;
 
+    // 「方案+按键」这一页**不显示时钟**，它显示的是"刚按下的键 / 今日次数 /
+    // 温湿度 / 锁灯" —— 一样都不依赖系统时间。所以必须在下面那个
+    // "时间没校准就 return"的早退**之前**更新它。
+    //
+    // 要是跟其它风格一样塞在下面的 switch 里（switch 在早退之后），那在
+    // 没对上 NTP 的时候这一页会一直停在初始状态：按什么键屏幕都不动 ——
+    // 正好把这一页最核心的东西（按键反馈）废掉了。
+    if (currentDispMode == DISP_MODE_PLAN_KEY) {
+        updatePlanKeyElements();
+    }
+
     time_t now = time(nullptr);
     struct tm* ti = localtime(&now);
     // 时间还没校准（NTP 没拿到 / savedEpoch 是 0）—— 把锁脏位先放掉，
@@ -10665,7 +11039,6 @@ static void updateDynamicElements(void) {
             break;
         }
     }
-
     // 三层锁指示（顶部条圆点/外圈、INFO_PANEL 圆点/文字/胶囊）这一帧都写完了，
     // 锁脏位可以放掉。如果这里不 clear，下次 loop() 会再无条件跑一遍
     // updateDynamicElements()，白跑 time()/localtime()。
@@ -10763,6 +11136,7 @@ static void renderCurrentDisplayBase(void) {
     if (rh_bg) { lv_obj_del(rh_bg); rh_bg = nullptr; }
     if (wp_bg) { lv_obj_del(wp_bg); wp_bg = nullptr; }
     if (hc_bg) { lv_obj_del(hc_bg); hc_bg = nullptr; }
+    if (pk_bg) { lv_obj_del(pk_bg); pk_bg = nullptr; }
 
     // **必须清掉子对象指针，否则就是野指针**
     // 上面的 lv_obj_del(ip_bg) 会连同 card / 三颗锁灯胶囊 / 所有 label 一起释放，
@@ -10799,6 +11173,7 @@ static void renderCurrentDisplayBase(void) {
         case DISP_MODE_RHYTHM: build_style_rhythm(); break;
         case DISP_MODE_WALLPAPER: build_style_wallpaper(); break;
         case DISP_MODE_HIGH_CONTRAST: build_style_high_contrast(); break;
+        case DISP_MODE_PLAN_KEY:      build_style_plankey(); break;
     }
     mainContentValid = true;
 }
