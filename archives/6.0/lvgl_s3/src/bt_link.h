@@ -174,6 +174,27 @@ void btLinkInit(BLECharacteristic* ch, void (*onCmd)(const String&));
 void btLinkSetConnected(bool connected, BLEServer* srv = nullptr);
 bool btLinkConnected();
 
+// 协商好的 MTU（ATT 载荷上限，不含 3 字节头）。
+//
+// ⚠⚠ **必须由蓝牙协议栈任务自己报过来**，主循环不许去问 BLEServer。
+//
+// 原因（2026-10-22 定位到的"连接时偶发崩溃"）：
+//   协商结果放在 BLEServer::m_connectedServersMap 这张 std::map 里，
+//   而这张表是**蓝牙任务**在改的：
+//     · ESP_GATTS_CONNECT_EVT  → addPeerDevice()  → insert
+//     · ESP_GATTS_MTU_EVT      → updatePeerMTU()  → find + std::swap
+//     · ESP_GATTS_DISCONNECT_EVT→ removePeerDevice() → erase
+//   主循环如果这时候去 getPeerDevices()（按值拷贝整张表）或者
+//   getPeerMTU()（find + 解引用），就是**一边遍历一边被改** ——
+//   std::map 不是线程安全的，这会直接踩坏堆、随机 panic。
+//   而且 getPeerMTU() **没有 end() 检查**，conn_id 不存在时解引用
+//   end() 是未定义行为，读出来的是垃圾 MTU。
+//
+// 所以：让**蓝牙任务自己**在 onMtuChanged 回调里把 MTU 报过来
+// （那是 ESP_GATTS_MTU_EVT 触发的，param 里直接带着协商结果），
+// 主循环只读一个 uint16_t —— 读写天然原子，没有竞争。
+void btLinkSetPeerMtu(uint16_t mtu);
+
 // 链路是否可用（特征已绑 + 有人连着）。发包前先问这个。
 bool btLinkReady();
 

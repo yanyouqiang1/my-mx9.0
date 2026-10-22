@@ -96,7 +96,12 @@ static void pushLogLine(const char* line);
 //   要用的话：把下面这行改成 1，**并且**把 platformio.ini 的
 //   ARDUINO_USB_MODE 换成 0（TinyUSB CDC），那时 Serial 才是真的 USB CDC。
 //   届时机身上的 USB 会变成 HID+CDC 复合设备，插上就能看到日志。
+//
+// ⚠ 用 #ifndef 包起来，是为了能用编译选项覆盖：
+//   platformio.ini 里加 -DLOG_CDC_MIRROR=1 就能临时开，不用改源码。
+#ifndef LOG_CDC_MIRROR
 #define LOG_CDC_MIRROR 0
+#endif
 
 #define LOG_CDC_BLOCK   128
 #define LOG_CDC_BLOCKS  32
@@ -172,6 +177,17 @@ static LogMirror LogPortProxy(&Serial0);
 // 板子是 N16R8 = 8MB OPI PSRAM，8KB 占比 0.1%，随便用。
 #define LOG_BUF_CAP     8192
 static char*  logRingBuf   = nullptr;   // ps_malloc，setup() 里建
+// 日志环缓冲的互斥锁。
+//
+// ⚠ 为什么必须要有：写日志的**不止主循环**——
+//   BLE 的 GAP / GATT 回调跑在**蓝牙协议栈自己的任务**里，
+//   那里一打日志就会和主循环并发改 logRingLen、并发 memmove 整个缓冲，
+//   轻则日志错乱（UART0 上已经能看到两行字符交错的现象），
+//   重则写越界踩坏 PSRAM —— 这正是"偶尔重启"的一类成因。
+//
+//   拿不到锁就**丢这一行**：日志晚点还会再来一条，
+//   但卡住蓝牙协议栈任务（会拖慢整个 BLE 栈）严重得多。
+static SemaphoreHandle_t s_logMutex = nullptr;
 static size_t logRingLen   = 0;
 static bool   logStreamOn  = false;     // LOG:on / LOG:off 控制
 
@@ -1280,8 +1296,8 @@ static const char* CFG_PROF_NAMES[TOTAL_PROFILES] = { "windows", "mac" };
 static BLEServer* pServer = nullptr;
 static BLECharacteristic* pCharacteristic = nullptr;
 static bool oldDeviceConnected = false;
-// 断链后"下一次尝试重启广播"的时间点。见 loop() 里那段说明。
-static unsigned long advRetryAtMs = 0;
+// 断链后"下一次尝试重启广播"的时间点等广播状态机的变量，
+// 统一放在 myGapHandler 那一段（见那里关于广播状态机的说明）。
 static unsigned long lastPingTime = 0;
 
 // 这里**不再**有任何"怎么发"的代码。
@@ -1309,6 +1325,14 @@ static void pushLogLine(const char* line) {
     size_t n = strlen(line);
     if (n == 0) return;
 
+    // ★ 加锁：主循环和蓝牙协议栈任务可能同时进来（见 s_logMutex 的说明）。
+    //   拿不到锁就丢这一行 —— 绝不阻塞蓝牙任务。
+    bool locked = false;
+    if (s_logMutex != nullptr) {
+        locked = (xSemaphoreTake(s_logMutex, pdMS_TO_TICKS(5)) == pdTRUE);
+        if (!locked) return;
+    }
+
     // 满时丢最老的整行，循环直到能塞下
     while (logRingLen + n + 1 > LOG_BUF_CAP) {
         size_t drop = 0;
@@ -1329,6 +1353,8 @@ static void pushLogLine(const char* line) {
     // 流转发。节流 10Hz（100ms/条）、给关键响应让路、分片收尾，全在 bt_link 里。
     // 这里只管"要不要把这一行推上通道"，一个字节的协议细节都不碰。
     if (logStreamOn) btLinkStream("LOG", line);
+
+    if (locked) xSemaphoreGive(s_logMutex);
 }
 
 static void handleCommand(const String& cmd);   // 真正定义在文件后段的命令解析入口
@@ -2105,8 +2131,37 @@ static void sht31_update(void) {
 // BLEDevice::setCustomGapHandler 是**追加**在内部处理之后的（见 BLEDevice.cpp
 // 第 277 行），不会抢走库自己的逻辑，所以这里可以安全地挂一个自己的处理器，
 // 只看广播开始/结束这两个事件。
-static volatile bool g_advRunning = false;   // 协议栈视角：现在到底在不在广播
-static volatile bool g_advFailed  = false;   // 上一次启动广播被协议栈拒了
+//
+// ⚠ 关键：Arduino 那套封装**不能**用来判断"广播起来没有"。
+//   BLEAdvertising::start()（BLEAdvertising.cpp:186）里有两处静默失败：
+//     · :216 esp_ble_gap_config_adv_data() 出错 → log_e 后**直接 return**，
+//       底下的 esp_ble_gap_start_advertising() 根本不会被调用；
+//     · :247 esp_ble_gap_start_advertising() 出错 → log_e 后**直接 return**。
+//   两条路都不往上抛、也没有返回值 —— 调用方完全看不出失败。
+//   于是"重启广播"这一句调用如果正好踩中其中一条，设备就永远不再广播，
+//   主机侧只看到"扫不到"，而板子上没有任何异常。
+//
+//   另外 BLEServer 在 ESP_GATTS_DISCONNECT_EVT 里**不会**自动重启广播
+//   （BLEServer.cpp:206 的注释写着 "we also want to start advertising again"，
+//   但代码里根本没做）—— 断链后广播是停掉的，必须我们自己拉起来。
+//
+// 所以这里改成一个小状态机，判据全部来自协议栈事件，不靠"调用过就算成功"：
+//   ADV_IDLE    确定没在广播
+//   ADV_PENDING 已经发起启动，等协议栈确认
+//   ADV_RUNNING 协议栈确认在广播（ADV_START_COMPLETE, status=SUCCESS）
+//   ADV_FAILED  协议栈明确拒了（status≠SUCCESS）或等确认超时
+enum AdvState { ADV_IDLE = 0, ADV_PENDING, ADV_RUNNING, ADV_FAILED, ADV_STOPPING };
+
+static volatile int   g_advState;          // 前置声明在 UART 指令通道那边（ADV_IDLE==0，零初始化即可）
+static unsigned long  advRetryAtMs  = 0;      // 下次尝试重启广播的时刻
+static unsigned long  advDeadlineMs = 0;      // PENDING 状态的确认超时
+static uint8_t        advFailStreak;      // 连续失败次数（决定退避间隔）
+
+// 我们自己留一份广播参数：和 Arduino BLEAdvertising 的默认值**完全一致**
+// （见 BLEAdvertising.cpp 构造函数：adv_int_min=0x20 / adv_int_max=0x40 /
+//   ADV_TYPE_IND / PUBLIC / ADV_CHNL_ALL / ALLOW_SCAN_ANY_CON_ANY），
+// 区别是自己持有 —— 重启广播时直接调 IDF 接口，能拿到真实错误码。
+static esp_ble_adv_params_t s_advParams = {};
 
 static void myGapHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
     if (event == ESP_GAP_BLE_ADV_START_COMPLETE_EVT) {
@@ -2115,12 +2170,65 @@ static void myGapHandler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* p
         // （字段名在这个 SDK（IDF 4.4）里是 adv_start_cmpl，不是 adv_start_complete）
         bool ok = (param != nullptr &&
                    param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS);
-        g_advRunning = ok;
-        g_advFailed  = !ok;
+        g_advState = ok ? ADV_RUNNING : ADV_FAILED;
+        if (ok) advFailStreak = 0;
+        LOG_PORT.printf("[ADV] start_complete ok=%d\n", ok ? 1 : 0);
     } else if (event == ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT) {
-        g_advRunning = false;
-        g_advFailed  = false;
+        // 这是**我们自己**发的 stop 的回执 —— 状态机自己知道在等什么，
+        // 所以这里不改状态（改了会把 ADV_STOPPING 冲掉，下一轮又去 stop）。
+        LOG_PORT.println("[ADV] stop_complete");
+    } else if (event == ESP_GAP_BLE_ADV_TERMINATED_EVT) {
+        // 广播被**终止**（最常见就是主机连上来了，控制器自动停广播）。
+        // 这时状态要改回 IDLE，否则看护逻辑会以为"还在广播"而不再管。
+        if (g_advState != ADV_STOPPING) g_advState = ADV_IDLE;
+        LOG_PORT.printf("[ADV] terminated state=%d\n", (int)g_advState);
     }
+}
+
+// 第 1 步：先让控制器把广播停下来。
+//
+// 为什么必须先 stop 再 start：
+//   实测（2026-10-22，UART0 日志）：主机连上时控制器自动停了广播，
+//   但它内部"广播已启用"的标志**不一定**被清掉。这时候直接调
+//   esp_ble_gap_start_advertising() 会**返回 ESP_OK 却什么都不做** ——
+//     · 不报错（所以日志里一条 [ADV] 错误都没有）
+//     · 不发 ADV_START_COMPLETE（所以也看不到"启动成功"）
+//     · 也不会真的开始广播（所以设备再也扫不到）
+//   当时的现场：第 1、2 轮断链后都成功重启了广播，第 3 轮就再也起不来。
+//
+//   先 stop 一次把控制器的状态清干净，再 start，才是确定可靠的做法。
+//   stop 是异步的，所以拆成两段：这里只发 stop，真正 start 放到
+//   loop() 里等 ADV_STOPPING 的期限到了再做（不能在 loop 里干等）。
+static void btAdvStop() {
+    esp_ble_gap_stop_advertising();     // 失败也无所谓（本来就没在广播）
+    g_advState = ADV_STOPPING;
+    advDeadlineMs = millis() + 120;     // 等控制器把 stop 收完
+    LOG_PORT.println("[ADV] 发 stop，等收尾");
+}
+
+// 第 2 步：真正启动广播。
+//
+// 为什么**不**用 Arduino 的 BLEDevice::startAdvertising()：
+//   ① 它每次都会重新 esp_ble_gap_config_adv_data() 配一遍广播数据，
+//      等于把广播整个重建 —— 主机会看到设备"闪一下又没了"。
+//   ② 它失败时是静默 return（BLEAdvertising.cpp:219 和 :250），拿不到错误码。
+//
+// 改成直接调 IDF 的 esp_ble_gap_start_advertising()：
+//   · 广播数据在 setup 里已经由 Arduino 配过一次（设备名 + service UUID），
+//     这里复用、不重复配，广播不会被重建；
+//   · 拿得到真实错误码，可以写进日志（BLE 的 LOG:dump 能回拉出来）。
+static esp_err_t btAdvStart() {
+    esp_err_t err = esp_ble_gap_start_advertising(&s_advParams);
+    g_advState    = ADV_PENDING;
+    advDeadlineMs = millis() + 2000;   // 2 秒内没有协议栈确认就算失败
+    if (err != ESP_OK) {
+        advFailStreak++;
+        LOG_PORT.printf("[ADV] start rc=%d streak=%u\n",
+                        (int)err, (unsigned)advFailStreak);
+    } else {
+        LOG_PORT.println("[ADV] start 已发起，等确认");
+    }
+    return err;
 }
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -2128,6 +2236,26 @@ class MyServerCallbacks : public BLEServerCallbacks {
     // getService() 是私有的，拿不到），拿不到就一直按 20 字节保守发。
     void onConnect(BLEServer* pServer)    { btLinkSetConnected(true, pServer); }
     void onDisconnect(BLEServer* pServer) { btLinkSetConnected(false); }
+
+    // ★ 协商好的 MTU 由**蓝牙协议栈任务自己**报过来 ★
+    //
+    // 为什么不能由主循环去问 BLEServer：
+    //   协商结果放在 BLEServer::m_connectedServersMap 这张 std::map 里，
+    //   而这张表**正是蓝牙任务在改**（CONNECT_EVT 插、MTU_EVT 改、
+    //   DISCONNECT_EVT 删）。主循环这时候去拷贝/查找它 =
+    //   一边遍历一边被改 —— std::map 不是线程安全的，
+    //   结果是踩坏堆、随机 panic。
+    //   而且 Arduino 的 getPeerMTU() **没有 end() 检查**，
+    //   conn_id 不存在时解引用 end() 是未定义行为，读出来的是垃圾 MTU
+    //   → 按它算出来的包长会超 → 协议栈整条丢掉 → 静默丢片。
+    //
+    // onMtuChanged 是 ESP_GATTS_MTU_EVT 触发的，param 里直接带着协商结果，
+    // 而且它跑在蓝牙任务里 —— 在这里取，天然没有竞争。
+    void onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
+        if (param != nullptr && param->mtu.mtu >= 23) {
+            btLinkSetPeerMtu(param->mtu.mtu);
+        }
+    }
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
@@ -7124,7 +7252,119 @@ static unsigned long meOutLastTick   = 0;
 static unsigned long meOutLastReport = 0;
 
 // BOOTDL：收到指令后置位，真正的复位在 loop() 末尾做（见 handleCommand 里那段）。
-static bool g_bootDlPending = false;
+static bool g_bootDlPending;      // 前置声明在 UART 指令通道那边
+// BOOTAPP：同上，但方向相反（拉高 BOOT 脚后复位，用来从下载模式回应用）。
+static bool g_bootAppPending;     // 前置声明在 UART 指令通道那边
+
+// ===========================
+// UART0 维护指令通道（USB-TTL / COM 口）
+// ===========================
+//
+// 为什么要有：LOG_PORT 走的是 UART0，但 UART0 的**接收方向一直没人用**。
+//   于是"只有一根 USB-TTL 线"的时候，除了看日志什么也做不了 ——
+//   比如蓝牙配对记录过期（主机侧报 Code=14 "Peer removed pairing
+//   information"），明明固件里有 BOND:clr 指令，却因为**连不上蓝牙**
+//   而根本发不出去。加了这条通道，维护动作走串口就能做，不依赖蓝牙链路。
+//
+// 一行一条，'\n' 结束：
+//   PING          → 回 PONG（顺便验证串口双向通不通）
+//   BOND:LIST     → 列出蓝牙配对记录
+//   BOND:CLR      → 清掉全部配对记录（专治 Code=14）
+//   ADV:STATUS    → 打印当前广播状态
+//   REBOOT        → 软复位
+//   BOOTDL/BOOTAPP→ 进下载模式 / 回应用模式
+//
+// ⚠ 串口上**只有**维护指令，没有业务指令 —— 键盘/网页那条路才是业务的。
+static void btBondList(char* buf, size_t n);
+static int  btBondClearAll(void);
+
+// 列出蓝牙配对记录（Arduino 的 BLE 封装没暴露这两个接口，直接用 IDF 的）。
+// Arduino BLE 封装没有 bond 管理接口，而 IDF 有：
+//   esp_ble_get_bond_device_num / esp_ble_get_bond_device_list
+//   esp_ble_remove_bond_device
+static void btBondList(char* buf, size_t n) {
+    if (buf == nullptr || n == 0) return;
+    int cnt = esp_ble_get_bond_device_num();
+    int off = snprintf(buf, n, "COUNT:%d", cnt);
+    if (cnt > 0) {
+        esp_ble_bond_dev_t devs[8];
+        int want = (cnt > 8) ? 8 : cnt;
+        if (esp_ble_get_bond_device_list(&want, devs) == ESP_OK) {
+            for (int i = 0; i < want && off < (int)n - 20; i++) {
+                uint8_t* a = devs[i].bd_addr;
+                off += snprintf(buf + off, n - off,
+                                " %02X:%02X:%02X:%02X:%02X:%02X/m%X",
+                                a[5], a[4], a[3], a[2], a[1], a[0],
+                                (unsigned)devs[i].bond_key.key_mask);
+            }
+        }
+    }
+}
+
+static int btBondClearAll(void) {
+    int cnt = esp_ble_get_bond_device_num();
+    int removed = 0;
+    if (cnt > 0) {
+        esp_ble_bond_dev_t devs[8];
+        int want = (cnt > 8) ? 8 : cnt;
+        if (esp_ble_get_bond_device_list(&want, devs) == ESP_OK) {
+            for (int i = 0; i < want; i++) {
+                if (esp_ble_remove_bond_device(devs[i].bd_addr) == ESP_OK) {
+                    removed++;
+                }
+            }
+        }
+    }
+    return removed;
+}
+
+static void handleUartCommand(const String& cmd) {
+    if (cmd == "PING") {
+        LOG_PORT.println("UART> PONG");
+    }
+    else if (cmd == "BOND:LIST") {
+        char buf[160];
+        btBondList(buf, sizeof(buf));
+        LOG_PORT.printf("UART> BOND %s\n", buf);
+    }
+    else if (cmd == "BOND:CLR") {
+        int removed = btBondClearAll();
+        LOG_PORT.printf("UART> BOND removed=%d left=%d\n",
+                        removed, esp_ble_get_bond_device_num());
+    }
+    else if (cmd == "ADV:STATUS") {
+        LOG_PORT.printf("UART> ADV state=%d streak=%u connected=%d\n",
+                        (int)g_advState, (unsigned)advFailStreak,
+                        btLinkConnected() ? 1 : 0);
+    }
+    else if (cmd == "REBOOT") {
+        LOG_PORT.println("UART> reboot");
+        delay(50);
+        esp_restart();
+    }
+    else if (cmd == "BOOTDL")  { g_bootDlPending = true;  LOG_PORT.println("UART> BOOTDL 排队"); }
+    else if (cmd == "BOOTAPP") { g_bootAppPending = true; LOG_PORT.println("UART> BOOTAPP 排队"); }
+    else {
+        LOG_PORT.printf("UART> 未知指令: %s\n", cmd.c_str());
+    }
+}
+
+static void handleUartEvents(void) {
+    static String buf = "";
+    while (Serial0.available() > 0) {
+        char c = (char)Serial0.read();
+        if (c == '\n') {
+            buf.trim();
+            if (buf.length() > 0) {
+                handleUartCommand(buf);
+                buf = "";
+            }
+        } else if (c != '\r') {
+            if (buf.length() < 96) buf += c;   // 掐断超长行
+        }
+    }
+}
+
 
 static void meOutClose() {
     if (meOutFile) { meOutFile.close(); meOutFile = File(); }
@@ -10199,7 +10439,14 @@ static void handleCommand(const String& cmd) {
             ELWARN("LOG", "回拉快照没内存");
             btLinkSendC("LOGDUMP", "0", "");
         } else {
+            // 冻结快照。**必须拿同一把锁** —— 蓝牙任务可能正在往环缓冲里写，
+            // 不加锁就会拷到"写了一半"的缓冲，回拉出来的行是乱的。
+            bool locked = false;
+            if (s_logMutex != nullptr) {
+                locked = (xSemaphoreTake(s_logMutex, pdMS_TO_TICKS(20)) == pdTRUE);
+            }
             memcpy(logDumpSnap, logRingBuf, logRingLen);   // 冻结一份，见下
+            if (locked) xSemaphoreGive(s_logMutex);
             logDumpLen = logRingLen;
             logDumpPos = 0;
             if (btLinkStreamBegin("LOGDUMP", "0", logDumpLen)) {
@@ -10212,6 +10459,38 @@ static void handleCommand(const String& cmd) {
                 btLinkReplyC("LOGDUMP", "");
             }
         }
+    }
+    // === BLE 配对记录（bond）管理 ===
+    //
+    // 为什么需要：
+    //   主机（iOS/macOS 的 CoreBluetooth、Chrome）一旦和设备配过对，就会记下
+    //   长期密钥（LTK）。如果设备这边把配对记录弄丢了（刷固件、NVS 被清、
+    //   协议栈自己删掉），主机下次连接时会用旧密钥来配对，设备认不出来，
+    //   于是**主机侧报 CBError Code=14 "Peer removed pairing information"**，
+    //   连接在加密协商阶段就失败。
+    //
+    //   现场表现：手机能连、网页连不上；或者网页第一次连上之后就再也连不上
+    //   （因为每次失败都会断链，而断链又会触发"广播不重启"那个老 bug）。
+    //
+    //   IDF 有现成的接口：esp_ble_get_bond_device_num/list、
+    //   esp_ble_remove_bond_device()。Arduino 的 BLE 封装**没有**暴露，
+    //   这里直接调 IDF 的。
+    //
+    //   BOND:list → 列出配对记录（地址 + 类型）
+    //   BOND:clr  → 全部删掉，让主机下次按"新设备"重新配对
+    else if (cmd == "BOND:list") {
+        char buf[160];
+        btBondList(buf, sizeof(buf));
+        btLinkSendC("BOND", "0", buf);
+        LOG_PORT.printf("[BOND] list: %s\n", buf);
+    }
+    else if (cmd == "BOND:clr") {
+        int removed = btBondClearAll();
+        char buf[48];
+        snprintf(buf, sizeof(buf), "REMOVED:%d LEFT:%d",
+                 removed, esp_ble_get_bond_device_num());
+        btLinkSendC("BOND", "0", buf);
+        LOG_PORT.printf("[BOND] cleared: %s\n", buf);
     }
     // ---------------- 配置 JSON：拉取 ----------------
     else if (cmd == "CFGGET") {
@@ -10551,6 +10830,15 @@ static void handleCommand(const String& cmd) {
     else if (cmd == "BOOTDL") {
         btLinkReplyC("BOOTDL", "重启进下载模式");
         g_bootDlPending = true;
+    }
+    // BOOTAPP —— 反向操作：把 BOOT 脚拉高再复位，让芯片回到"正常启动应用"。
+    //
+    // 用法：BOOTDL 进下载模式 → 主机烧录 → 烧完（或者 ROM 模式里
+    // 收到这条指令）用 BOOTAPP 复位回应用，**全程不用碰 BOOT/EN 按钮**。
+    // 原理见 loop() 里 g_bootAppPending 那段注释。
+    else if (cmd == "BOOTAPP") {
+        btLinkReplyC("BOOTAPP", "重启回应用模式");
+        g_bootAppPending = true;
     }
     // ME:FIRE —— 从蓝牙手动触发一次 ME 输出，和按键盘上的 ME 键**同一条路**。
     //
@@ -11939,6 +12227,11 @@ void setup() {
         logRingBuf = (char*)ps_malloc(LOG_BUF_CAP);
         if (logRingBuf) {
             memset(logRingBuf, 0, LOG_BUF_CAP);
+            // 互斥锁：主循环和蓝牙协议栈任务可能同时写这个环缓冲
+            // （见 s_logMutex 的说明）。拿不到锁就丢日志行，绝不阻塞蓝牙任务。
+            if (s_logMutex == nullptr) {
+                s_logMutex = xSemaphoreCreateMutex();
+            }
             // 回拉快照：LOG:dump 期间环形缓冲还会被新日志改写，不冻结一份
             // 读出来的行是错位的。放 PSRAM，别占内部 DRAM。
             logDumpSnap = (char*)ps_malloc(LOG_BUF_CAP);
@@ -12188,10 +12481,28 @@ void setup() {
 
     // ★ 必须在 startAdvertising() **之前**挂上：只有挂上之后启动的那次广播，
     //   才会把 ESP_GAP_BLE_ADV_START_COMPLETE_EVT 送过来，
-    //   g_advRunning 才是准的（loop() 里的"断链后重试广播"全靠它判断）。
+    //   g_advState 才是准的（loop() 里的"断链后重试广播"全靠它判断）。
     BLEDevice::setCustomGapHandler(myGapHandler);
 
+    // 自己留一份广播参数：和 Arduino BLEAdvertising 的默认值**完全一致**
+    // （见 BLEAdvertising.cpp 构造函数：adv_int_min=0x20 / adv_int_max=0x40 /
+    //   ADV_TYPE_IND / PUBLIC / ADV_CHNL_ALL / ALLOW_SCAN_ANY_CON_ANY）。
+    // 自己留着是为了重启广播时能直接调 IDF 接口、拿到真实错误码
+    // （Arduino 那层失败是静默的，见 btAdvRestart 的注释）。
+    s_advParams.adv_int_min       = 0x20;
+    s_advParams.adv_int_max       = 0x40;
+    s_advParams.adv_type          = ADV_TYPE_IND;
+    s_advParams.own_addr_type     = BLE_ADDR_TYPE_PUBLIC;
+    s_advParams.channel_map       = ADV_CHNL_ALL;
+    s_advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    s_advParams.peer_addr_type    = BLE_ADDR_TYPE_PUBLIC;
+
+    // 第一次广播仍然走 Arduino 的封装：它顺带把广播数据（设备名 + service UUID）
+    // 配好，之后 btAdvRestart() 复用这份数据、不再重复配，广播不会被重建。
     BLEDevice::startAdvertising();
+    g_advState    = ADV_PENDING;   // 等 ADV_START_COMPLETE 确认
+    advDeadlineMs = millis() + 3000;
+    advRetryAtMs  = millis() + 3000;
 
     // 文件系统：必须用 SPIFFS，不能再用 FFat。
     //
@@ -12454,52 +12765,76 @@ void loop() {
     // 灯光键确认通知要重画面板、旋钮要弹 HUD，都在主任务里做。
     handleC3Events();
 
+    // UART0 维护指令通道（USB-TTL / COM 口）。维护动作（清配对、看广播状态、
+    // 复位、进出下载模式）走串口，不依赖蓝牙链路 —— 蓝牙连不上的时候
+    // 这条通道是唯一的救生索。
+    handleUartEvents();
+
     // 连接状态归 bt_link 管（它要在断链时清掉排队中的响应），这里只盯"刚断开"
     // 这一个边沿来重启广播，让主机能重新扫到。
     //
     // ⚠⚠⚠ 以前这里是**只试一次**：断链 → 等 500ms → startAdvertising() → 就没了。
-    //
-    //   而 startAdvertising() 内部最后是 esp_ble_gap_start_advertising()，
-    //   它在"上一个广播还没停干净 / 协议栈还没从断链事件里缓过来"的时候会
-    //   返回 ESP_ERR_INVALID_STATE —— Arduino 那层只打一条 log_e，
-    //   **不往上抛、不返回失败**。于是这一次重试**静默失败**，
-    //   设备从此再也不广播，主机再也扫不到它，只能拔电重插才活。
+    //   而 startAdvertising() 内部的失败是**静默**的（见上面 myGapHandler 那段注释），
+    //   于是那一次重试只要踩中失败路径就再也没人管 —— 设备从此不再广播，
+    //   主机再也扫不到它，只能拔电重插才活。
     //
     //   这就是"蓝牙时好时坏"的根因：设备没崩、没重启、没死机，
     //   就是**扫不到**了，而且现场什么日志都没有。
     //
-    //   现在改成**一直重试，直到广播真的起来**（判据是 g_advRunning，
-    //   由 GAP 的 ADV_START/ADV_STOP 事件维护，见 myGapHandler）。
-    //   重试间隔 1.5 秒，不影响别的功能 —— 连上了就不再重试。
-    if (!btLinkConnected()) {
+    // 现在改成持续看护，判据全部来自协议栈事件 + 连接状态：
+    //   · PENDING 超过 2 秒没等到 ADV_START_COMPLETE → 当成静默失败，重来
+    //   · 协议栈明确拒了（status≠SUCCESS）→ 退避后重来（1s → 3s）
+    //   · **连接期间强制认为"没在广播"**（关键，见下面那段说明）
+    //   · 断链后等 800ms 再重启，让控制器把上一段广播收干净
+    if (btLinkConnected()) {
+        // ★★★ 这里是"蓝牙时好时坏"的**真正根因** ★★★
+        //
+        // 主机一连上，控制器会**自动停广播**，但它**不会**发
+        // ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT —— 那个事件只在"代码主动调
+        // stop_advertising()"时才发。
+        //
+        // 所以"现在到底有没有在广播"**绝对不能只看协议栈事件**：
+        // 连上一次之后，状态会永远停在"在广播"，断链后看护逻辑认为
+        // "还在广播，不用管"，于是**永远不再重启广播** ——
+        // 设备从此再也扫不到，只能拔电重插才活。
+        //
+        // 实测复现（2026-10-22，tools/ble_cycle.py + UART0 日志）：
+        //   3345ms ESP_GATTS_CONNECT_EVT
+        //   3569ms ESP_GATTS_DISCONNECT_EVT
+        //   之后 **一次 esp_ble_gap_start_advertising 都没有**
+        //   → 12 秒内 BLE 扫不到设备
+        //
+        // 连接期间直接把状态钉成 IDLE（"肯定没在广播"），
+        // 断链后看护逻辑就一定会把广播拉起来。
+        g_advState = ADV_IDLE;
+        oldDeviceConnected = true;
+    } else {
         if (oldDeviceConnected) {
             oldDeviceConnected = false;
-            advRetryAtMs = millis() + 500;   // 断链后先让协议栈缓 500ms
+            // 断链后先给控制器 800ms 收尾时间：太早调 esp_ble_gap_start_advertising
+            // 会被控制器拒（"刚断链、上一段广播还没停干净"）。
+            // IDF 4.4 的 GAP 事件里**没有**"控制器断链完成"这个信号
+            // （只有 GATTS 的 ESP_GATTS_DISCONNECT_EVT），所以只能按时间退避。
+            advRetryAtMs  = millis() + 800;
+            advFailStreak = 0;
             ct_mark(CT_S_BLE_DELAY);
         }
-        if ((long)(millis() - advRetryAtMs) >= 0) {
-            advRetryAtMs = millis() + 3000;
-            // ★ 只有**确实没在广播**才重试。已经在广播还去调 startAdvertising()
-            //   会重新配一遍广播数据、把正在进行的广播打断一下 ——
-            //   那样设备"在广播但一直被打断"，主机根本扫不到它。
-            //
-            // ⚠⚠ 这里**必须乐观置位**（调完立刻当成已经起来了）。
-            //   踩过的坑：先前是靠"ADV_START_COMPLETE 事件说起来了"才置位的，
-            //   万一那个事件因为任何原因没送到，g_advRunning 就永远是 false，
-            //   于是每 3 秒重下一次 startAdvertising() —— 广播被反复重建，
-            //   实测下来设备**活着、USB HID 正常，但 BLE 完全扫不到**。
-            //
-            //   现在改成：调用完先假定成功；只有协议栈**明确报失败**
-            //   （ADV_START_COMPLETE 的 status 不对）或**明确报停**
-            //   （ADV_STOP_COMPLETE）才会把标志清回去、触发下一次重试。
-            if (!g_advRunning) {
-                BLEDevice::startAdvertising();
-                g_advRunning = true;
-                g_advFailed  = false;
-            }
+        // ① 发起之后迟迟没有协议栈确认 → 判定为静默失败
+        if (g_advState == ADV_PENDING && (long)(millis() - advDeadlineMs) >= 0) {
+            g_advState = ADV_FAILED;
+            LOG_PORT.println("[ADV] 等确认超时，按失败处理");
         }
-    } else {
-        oldDeviceConnected = true;
+        // ② stop 收尾完了 → 真正 start
+        if (g_advState == ADV_STOPPING && (long)(millis() - advDeadlineMs) >= 0) {
+            btAdvStart();
+            advRetryAtMs = millis() + (advFailStreak < 3 ? 1000 : 3000);
+        }
+        // ③ 确定没在广播 → 先 stop 再 start（见 btAdvStop 的注释）
+        else if ((g_advState == ADV_IDLE || g_advState == ADV_FAILED) &&
+                 (long)(millis() - advRetryAtMs) >= 0) {
+            btAdvStop();
+            advRetryAtMs = millis() + (advFailStreak < 3 ? 1000 : 3000);
+        }
     }
 
     // Ping
@@ -12683,6 +13018,29 @@ if (lockStateDirty) {
         LOG_PORT.println("[BOOTDL] 拉低 BOOT 脚并复位");
         pinMode(GPIO_NUM_0, OUTPUT);
         digitalWrite(GPIO_NUM_0, LOW);
+        delay(100);
+        esp_restart();
+        return;      // 理论上到不了这里
+    }
+
+    // BOOTAPP —— 反过来：把 BOOT 脚(GPIO0)**拉高**再复位，
+    // 让芯片从 ROM 下载模式回到"正常从 flash 启动应用"。
+    //
+    // 为什么需要它（2026-10-22 实测）：
+    //   ESP32-S3 的 **USB 会话在复位那一瞬间会把 IO0 压低**，
+    //   于是只要 USB 线还插着，按 EN / 复位都会落回 ROM 下载模式 ——
+    //   实测 GPIO_IN 的 IO0 位是 1（物理高电平）、GPIO_ENABLE 的 IO0 位是 0
+    //   （谁也没驱动它），可复位时 ROM 依然采到 boot:0x0（IO0 低）。
+    //   结果就是"烧完固件拔插才好"，而拔插不是每次都方便。
+    //
+    //   这里让固件自己把 GPIO0 配成输出并**拉高**，再复位：
+    //   复位采样到的就是高电平 → ROM 正常启动 flash 里的应用。
+    //   于是「进下载模式 → 烧录 → 回应用模式」全程不用碰 BOOT/EN。
+    if (g_bootAppPending) {
+        g_bootAppPending = false;
+        LOG_PORT.println("[BOOTAPP] 拉高 BOOT 脚并复位");
+        pinMode(GPIO_NUM_0, OUTPUT);
+        digitalWrite(GPIO_NUM_0, HIGH);
         delay(100);
         esp_restart();
         return;      // 理论上到不了这里

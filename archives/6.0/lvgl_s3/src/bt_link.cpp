@@ -122,39 +122,27 @@ static inline size_t headLen(const char* verb, const char* key) {
 //
 // ⚠ 拿不到 / 没连上 / 异常，一律退回 BT_PAYLOAD_MIN。这条路上"乐观"一次
 //   就是静默截断，宁可慢也不能坏。
-// 协商后的 MTU 只在 BLEServer 手上（BLECharacteristic::getService() 是私有的，
-// 拿不到），而 server 是在连接回调里才有的 —— 所以由 onConnect 传进来。
-// 拿不到就一直是 nullptr，btLinkPayloadMax() 退回保守值，不会出错。
-static BLEServer* s_srv = nullptr;
+//
+// ★ 协商后的 MTU **不再从 BLEServer 取**（那是"连接时偶发崩溃"的真凶，
+//   见下面 btLinkSetPeerMtu 的注释）：改由蓝牙任务自己报过来。
+
+// 协商好的 MTU。
+//
+// ⚠⚠⚠ **这个值只能由蓝牙协议栈任务自己报过来**（btLinkSetPeerMtu），
+//   主循环**绝对不许**去问 BLEServer 的那张 peer 表 —— 详见 bt_link.h
+//   里 btLinkSetPeerMtu 的注释（那张 std::map 正在被蓝牙任务改着，
+//   一边遍历一边被改 = 踩坏堆 = 随机 panic，这就是"连接时偶发崩溃"）。
+//
+// 读写一个 uint16_t 天然原子，不需要额外的锁。
+static volatile uint16_t s_peerMtu = 0;
+
+void btLinkSetPeerMtu(uint16_t mtu) {
+    s_peerMtu = mtu;
+}
 
 size_t btLinkPayloadMax(void) {
-    if (s_ch == nullptr || !s_connected || s_srv == nullptr) return BT_PAYLOAD_MIN;
-    // ⚠⚠⚠ **不能用 s_srv->getPeerMTU(0)**。
-    //
-    //   Arduino 的实现只有一行：
-    //       return m_connectedServersMap.find(conn_id)->second.mtu;
-    //   —— **没有 end() 检查**。而 conn_id 是协议栈分配的，
-    //   "本项目只有单连接所以恒为 0"这个假设**只在第一次连接时成立**：
-    //   断链重连之后槽位不一定还分到 0。
-    //
-    //   find() 落空时返回 end()，解引用它是**未定义行为**，
-    //   读出来的是垃圾 mtu。垃圾 mtu 的后果不是"慢"，是**静默丢数据**：
-    //     · 垃圾值偏大 → 切出来的通知超过真实 MTU
-    //       → BLECharacteristic::notify 只打一条 log_w 就**照发**（它不截断）
-    //       → 协议栈把整条丢掉 → 主机看到"丢片"，日志里什么都没有
-    //     · 垃圾值偏小 → 只是慢
-    //   这正是"蓝牙时好时坏、而且没有任何报错"那种症状的来源。
-    //
-    //   改用公开的 getPeerDevices()：它**按值返回整张表**，
-    //   遍历是安全的（表为空就退回最保守值 BT_PAYLOAD_MIN）。
-    //   代价是一次 map 拷贝 —— emitChunk() 每片问一次，
-    //   但一包也就几百字节，可以忽略；比读到一个来路不明的值划算得多。
-    std::map<uint16_t, conn_status_t> peers = s_srv->getPeerDevices(false);
-    uint16_t mtu = 0;
-    for (std::map<uint16_t, conn_status_t>::const_iterator it = peers.begin();
-         it != peers.end(); ++it) {
-        if (it->second.mtu > mtu) mtu = it->second.mtu;
-    }
+    if (s_ch == nullptr || !s_connected) return BT_PAYLOAD_MIN;
+    uint16_t mtu = s_peerMtu;
     if (mtu <= 3) return BT_PAYLOAD_MIN;          // 还没协商完
     size_t payload = (size_t)mtu - 3;             // 扣掉 3 字节 ATT 头
     if (payload > BT_PAYLOAD_NEGO_MAX) payload = BT_PAYLOAD_NEGO_MAX;
@@ -212,9 +200,14 @@ void btLinkInit(BLECharacteristic* ch, void (*onCmd)(const String&)) {
 
 void btLinkSetConnected(bool connected, BLEServer* srv) {
     s_connected = connected;
-    // server 只在连上时给；断开就清掉，免得下次连的是别的实例时拿着旧的
-    // 指针去问 MTU（那会读到一个不相关连接的协商结果）。
-    s_srv = connected ? srv : nullptr;
+    // srv 现在**不用**了：协商后的 MTU 改由蓝牙任务自己报过来
+    // （btLinkSetPeerMtu），主循环不再去碰 BLEServer 的那张 peer 表 ——
+    // 详见 bt_link.h 里 btLinkSetPeerMtu 的注释。
+    (void)srv;
+    // 协商结果作废：连上时还没协商（等 ESP_GATTS_MTU_EVT 报），
+    // 断开时旧的更不能用 —— 不清的话下一条包会按上一次的 MTU 算长度，
+    // 而这次连接可能协商出更小的 MTU → 静默丢包。
+    s_peerMtu = 0;
     if (!connected) {
         // 断开后正在排队的响应发出去也没人收，白占队列，还会把下一条挤掉。
         for (int i = 0; i < BT_TXQ_LEN; i++) s_txq[i].used = false;
