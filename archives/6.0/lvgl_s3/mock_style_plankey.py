@@ -6,12 +6,13 @@
 
 用法：
     /usr/bin/python3 mock_style_plankey.py
-    # 输出 assets/mock_plankey.png / _mac.png / _single.png，以及 _compare.png 对照图
+    # 输出 assets/mock_plankey.png（当前=Windows）/ _mac.png（当前=macOS），
+    # 以及 _compare.png 对照图
 
-三种摆法（A / B / C）：
-    A  两个方案图标都显示，当前方案点亮、另一个压灰
-    B  只显示当前方案的图标（另一个完全不出现）
-    C  当前方案大图标在上，另一个小图标在下（做视觉主次）
+左列的摆法（2026-10-22 用户定稿）：
+    **只画当前方案那一个图标** —— 白苹果 = macOS，蓝色 Windows = Windows。
+    原来试过"两个都摆、当前点亮另一个压灰"，实测在 240px 屏上分不清哪个是当前，
+    压灰那版只剩一团灰影，所以砍掉。图标下面也不再挂「方案」两个字。
 
 坐标系全部是 240x240 的屏幕坐标，和固件里要写的值一一对应。
 """
@@ -54,6 +55,8 @@ LEFT_X = 4              # 左列(方案)左边
 LEFT_W = 62             # 左列宽
 ICON = 52               # 方案图标边长
 ICON_CARD = 61          # 图标后面那块高亮底卡
+ICON_CARD_Y = 82        # 底卡顶边（跟按键名 label 的顶边齐平）
+ICON_Y = 86             # 图标本体的顶边（底卡 61 - 图标 52，居中 → +4）
 CARD_X = 70             # 右卡(按键)左边
 CARD_W = 164            # 右卡宽（右边缘 234，和灯组右边缘齐平）
 CARD_TOP = 32
@@ -121,52 +124,25 @@ def draw_title(d, locks=(True, False, False)):
                 fill=color if on else CLR_SURFACE_2)
         tw = d.textlength(name, font=ft)
         d.text((x + (LIGHT_W - tw) / 2, y + 1), name, font=ft,
-               fill=CLR_BG if on else CLR_TEXT_MUTE)
+               fill=CLR_BG if on else CLR_TEXT_DIM)
 
 
-def draw_icons(d, variant, current):
-    """左列的方案图标。current: 0=Windows 1=macOS"""
+def draw_icons(d, current):
+    """左列**只画当前方案那一个**图标。current: 0=Windows 1=macOS
+
+    底卡顶边 82 = 按键名 label 的顶边，图标和那行大字共用一条上边线。
+    图标在 61px 底卡里居中（61-52=9 → 上 4 下 5），所以图标顶边 86。
+    """
     apple = gi.rasterize(gi.APPLE_SVG, gi.APPLE_VB, ICON, gi.CLR_APPLE)
-    apple_dim = gi.rasterize(gi.APPLE_SVG, gi.APPLE_VB, ICON, gi.CLR_DIM)
     win = gi.rasterize(gi.WINDOWS_SVG, gi.WINDOWS_VB, ICON, gi.CLR_WINDOWS)
-    win_dim = gi.rasterize(gi.WINDOWS_SVG, gi.WINDOWS_VB, ICON, gi.CLR_DIM)
 
     im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ix = LEFT_X + (LEFT_W - ICON) // 2
 
-    if variant == "A":       # 两个都显示，当前点亮
-        ys = [CARD_TOP + 2, CARD_TOP + 64]
-        for slot, (is_mac, y) in enumerate(zip([True, False], ys)):
-            active = (current == 1) == is_mac
-            pic = (apple if is_mac else win) if active else (apple_dim if is_mac else win_dim)
-            if active:
-                rounded(d, [LEFT_X, y - 5, LEFT_X + ICON_CARD - 1, y - 5 + ICON_CARD - 1],
-                        12, fill=CLR_SURFACE_2)
-            im.alpha_composite(pic, (LEFT_X + (LEFT_W - ICON) // 2, y))
-        fc = cjk(16)
-        d.text((LEFT_X + (LEFT_W - d.textlength("方案", font=fc)) / 2, ys[1] + ICON + 12),
-               "方案", font=fc, fill=CLR_TEXT_MUTE)
-
-    elif variant == "B":     # 只显示当前方案
-        y = BODY_TOP + 46
-        pic = apple if current == 1 else win
-        rounded(d, [ix - 5, y - 5, ix + ICON + 4, y + ICON + 4], 12, fill=CLR_SURFACE_2)
-        im.alpha_composite(pic, (ix, y))
-        fc = cjk(12)
-        d.text((LEFT_X + (LEFT_W - d.textlength("方案", font=fc)) / 2, y + ICON + 12),
-               "方案", font=fc, fill=CLR_TEXT_MUTE)
-
-    else:                   # C: 当前大图标 + 另一个小图标
-        big = apple if current == 1 else win
-        small_dim = win_dim if current == 1 else apple_dim
-        y = BODY_TOP + 20
-        rounded(d, [ix - 5, y - 5, ix + ICON + 4, y + ICON + 4], 12, fill=CLR_SURFACE_2)
-        im.alpha_composite(big, (ix, y))
-        s = 24
-        sx = LEFT_X + (LEFT_W - s) // 2
-        sy = y + ICON + 18
-        im.alpha_composite(small_dim.resize((s, s), Image.LANCZOS), (sx, sy))
-
+    rounded(d, [LEFT_X, ICON_CARD_Y,
+                LEFT_X + ICON_CARD - 1, ICON_CARD_Y + ICON_CARD - 1],
+            12, fill=CLR_SURFACE_2)
+    im.alpha_composite(apple if current == 1 else win, (ix, ICON_Y))
     return im
 
 
@@ -227,11 +203,11 @@ def draw_bars(d, temp_c, hum_p):
         d.text((W - 6 - d.textlength(s, font=fl), y - 5), s, font=fl, fill=CLR_TEXT)
 
 
-def render(variant, current, key_text="Space", today=1284, temp=23.5, hum=48):
+def render(current, key_text="Space", today=1284, temp=23.5, hum=48):
     im = Image.new("RGB", (W, H), CLR_BG)
     d = ImageDraw.Draw(im)
     draw_title(d)
-    icons = draw_icons(d, variant, current)
+    icons = draw_icons(d, current)
     im = Image.alpha_composite(im.convert("RGBA"), icons).convert("RGB")
     d = ImageDraw.Draw(im)
     draw_key_card(d, key_text, today)
@@ -243,14 +219,12 @@ def main():
     os.makedirs(ASSETS, exist_ok=True)
 
     cases = [
-        ("A", 0, "mock_plankey.png", "变体A / 当前=Windows"),
-        ("A", 1, "mock_plankey_mac.png", "变体A / 当前=macOS"),
-        ("B", 0, "mock_plankey_single.png", "变体B / 只显示当前方案"),
-        ("C", 0, "mock_plankey_hier.png", "变体C / 主次图标"),
+        (0, "mock_plankey.png", "当前=Windows"),
+        (1, "mock_plankey_mac.png", "当前=macOS"),
     ]
     ims = []
-    for variant, cur, fname, desc in cases:
-        im = render(variant, cur)
+    for cur, fname, desc in cases:
+        im = render(cur)
         p = os.path.join(ASSETS, fname)
         im.save(p)
         im.resize((W * 3, H * 3), Image.NEAREST).save(p.replace(".png", "_3x.png"))

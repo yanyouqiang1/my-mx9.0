@@ -55,10 +55,12 @@ WINDOWS_SVG = (
 WINDOWS_VB = (0, 0, 448, 512)
 
 # 配色：苹果纯白（用户点名"咬了一口的白色"），Windows 用官方蓝 #0078D4。
+#
+# ⚠ 只有**点亮态**两版了：左列现在只显示当前方案的那一个图标
+#   （2026-10-22 用户定稿："左边图标还是展示一个吧，两个也有点分不清楚"），
+#   没有第二个"压灰的另一个方案"了 —— 灰版图标连同它的 8KB 数据一起删掉。
 CLR_APPLE = (0xFF, 0xFF, 0xFF)
 CLR_WINDOWS = (0x00, 0x78, 0xD4)
-# 未选中的那一个：降到三级灰，跟固件的 CLR_TEXT_MUTE 保持一致。
-CLR_DIM = (0x5B, 0x65, 0x79)
 
 # 目标边长（px）。必须和固件里的 PK_ICON（52）以及 mock 里的 ICON 一致 ——
 # 图标是位图，尺寸对不上就是拉伸变形。
@@ -313,15 +315,11 @@ def main():
     size = ICON_SIZE
 
     apple = rasterize(APPLE_SVG, APPLE_VB, size, CLR_APPLE)
-    apple_dim = rasterize(APPLE_SVG, APPLE_VB, size, CLR_DIM)
     win = rasterize(WINDOWS_SVG, WINDOWS_VB, size, CLR_WINDOWS)
-    win_dim = rasterize(WINDOWS_SVG, WINDOWS_VB, size, CLR_DIM)
 
     items = [
-        ("style_icon_apple", apple, "苹果 logo：纯白咬一口剪影（当前方案 = macOS 时点亮）"),
-        ("style_icon_apple_dim", apple_dim, "同上，灰色（未选中态）"),
-        ("style_icon_win", win, "Windows 四格旗：官方蓝 #0078D4（当前方案 = Windows 时点亮）"),
-        ("style_icon_win_dim", win_dim, "同上，灰色（未选中态）"),
+        ("style_icon_apple", apple, "苹果 logo：纯白咬一口剪影（当前方案 = macOS）"),
+        ("style_icon_win", win, "Windows 四格旗：官方蓝 #0078D4（当前方案 = Windows）"),
     ]
 
     with open(OUT_H, "w", encoding="utf-8") as f:
@@ -330,7 +328,7 @@ def main():
 
     if "--preview" in sys.argv:
         os.makedirs(PREVIEW_DIR, exist_ok=True)
-        sheet = Image.new("RGB", (size * 4 + 30, size + 20), (11, 15, 23))
+        sheet = Image.new("RGB", (size * len(items) + 30, size + 20), (11, 15, 23))
         x = 5
         for _name, im, _d in items:
             sheet.paste(im, (x, 10), im)
