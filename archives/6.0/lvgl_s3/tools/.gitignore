@@ -1,0 +1,6 @@
+# PlatformIO 的构建产物（几十 MB，不入库）
+.pio/
+# 编译出来的可执行文件
+hid_cmd
+*.o
+*.d
