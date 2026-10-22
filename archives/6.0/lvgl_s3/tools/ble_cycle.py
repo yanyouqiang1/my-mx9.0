@@ -17,6 +17,7 @@ from bleak import BleakClient, BleakScanner
 
 NAME = "YYQ-MX9.0"
 SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 WAIT = float(sys.argv[2]) if len(sys.argv) > 2 else 12.0
 ONLY = sys.argv[3].upper() if len(sys.argv) > 3 else ""
@@ -64,7 +65,7 @@ async def main():
             async with BleakClient(addr, timeout=12) as client:
                 # 确认链路真的通：读一下特征
                 try:
-                    await client.start_notify(SERVICE_UUID, lambda s, d: None)
+                    await client.start_notify(CHAR_UUID, lambda s, d: None)
                     print("  ✓ 订阅成功（notify 通道 OK）")
                 except Exception as e:
                     print("  ! 订阅失败: %s" % e)
