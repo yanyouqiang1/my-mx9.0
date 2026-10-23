@@ -173,6 +173,8 @@ static LogMirror LogPortProxy(&Serial0);
 #undef  LOG_PORT
 #define LOG_PORT LogPortProxy
 
+// panic 现场留存（ROM 输出接管 + RTC 慢存）见 panic_trace.h。
+
 // === BLE 日志通道缓冲 ===
 // PSRAM 上分一块 8KB 环形缓冲（按行存，超出时丢最老的整行）。
 // 板子是 N16R8 = 8MB OPI PSRAM，8KB 占比 0.1%，随便用。
@@ -448,6 +450,7 @@ static void pushLogLine(const char* line);
 #include "lvgl_st7789_driver.h"
 #include "lv_conf.h"
 #include "crash_trace.h"
+#include "panic_trace.h"
 #include "elog.h"
 // 锁屏那把大锁。RGB565 数组直接躺在 flash 里（gen_lock_img.py 生成），
 // lv_img_dsc.data 一指就完事 —— 不解码、不拷贝、不占 PSRAM。
@@ -487,6 +490,10 @@ static void logCdcTask(void* arg) {
     (void)arg;
     char block[LOG_CDC_BLOCK];
     while (true) {
+        // ROM 的 printf（IDF 日志 / assert / panic 回溯）先进内存环，
+        // 这里**统一**搬进 CDC —— 整个固件只有这一处写 TinyUSB，
+        // 不会出现"日志镜像任务和蓝牙协议栈并发写 CDC FIFO"的竞争。
+        romRingDrain();
         // 阻塞等：有新日志就写出去；队列空了就睡，不占 CPU
         if (xQueueReceive(s_logCdcQueue, block, portMAX_DELAY) == pdTRUE) {
             size_t n = strnlen(block, LOG_CDC_BLOCK);
@@ -3162,9 +3169,11 @@ static bool writeWallpaperChunked(const uint8_t* data, size_t total) {
         }
         size_t w = f.write(data + off, want);
         f.close();
+        // ⚠ 每一片都报一行：崩在哪一片，全靠这行日志。
+        //   不报的话只知道"写盘时崩了"，不知道是第几片、写了多少。
+        LOG_PORT.printf("[WALLPAPER] %s 写 %u/%u\n", path, (unsigned)w, (unsigned)want);
         if (w != want) {
-            // ⚠ 写不进去 —— 这就是 SPIFFS 单文件上限在咬人。
-            //   如实报告实际写进去多少，别装作写成功了。
+            // ⚠ 写不进去 —— 如实报告实际写进去多少，别装作写成功了。
             LOG_PORT.printf("[WALLPAPER] write %s: %u/%u 字节（写到这写不下了）\n",
                             path, (unsigned)w, (unsigned)want);
             SPIFFS.remove(path);
@@ -12734,18 +12743,32 @@ void setup() {
             LOG_PORT.println("[LOG] USB CDC 日志镜像已开");
         }
     }
-    // ⚠ 把 **IDF 自己的** panic / assert 输出也引到 USB CDC。
+    // ⚠ 把 **IDF 自己的** panic / assert 输出也留下来。
     //
     // 为什么必须开：panic 的回溯（哪个函数、哪一行）是崩溃定位的**硬证据**，
     // 而它默认只走 UART0（CONFIG_ESP_CONSOLE_UART_DEFAULT）——
-    // 没接 USB-TTL 就一个字都看不到。setDebugOutput(true) 会把 ROM/IDF 的
-    // putchar 换到 CDC，于是 panic 回溯直接出现在 USB 串口上。
+    // 没接 USB-TTL 就一个字都看不到。
     //
-    // ⚠ 只在 debug 构建里开（LOG_CDC_MIRROR 就是 debug 构建的标志）：
-    //   产品固件 ARDUINO_USB_MODE=1 时 Serial 是 USB-Serial-JTAG，
-    //   没有 CDC 节点，这一行等于什么也没做（而且会覆盖 UART0 的 console）。
-    Serial.setDebugOutput(true);
-    LOG_PORT.println("[LOG] panic/assert 回溯已引到 USB CDC");
+    // ⚠⚠ 但**不能**用 Serial.setDebugOutput(true)：那是把 ROM 的 putchar
+    //   直接接到 TinyUSB 的 CDC TX FIFO，而那个 FIFO 不是线程安全的 ——
+    //   蓝牙协议栈任务的 log_d() 和主循环的日志镜像任务会并发写它，
+    //   实测会把 CDC 通道整个写哑，并让设备在传输途中随机重启。
+    //   （2026-10-23 实测：开了它之后 CDC 一个字节都收不到。）
+    //
+    // ✅ 改用"先进内存环、再由日志镜像任务统一搬进 CDC"，
+    //   并在 panic 钩子里把环的尾巴抄进 RTC 慢存 —— 下次开机直接打印。
+    panicTraceInit();
+    LOG_PORT.println("[LOG] ROM 输出已接管（进内存环），panic 现场会存进 RTC 慢存");
+
+    // 上次 panic 的现场：这次开机先把它打出来。
+    // ⚠ 只报一次（读完就清），免得每次开机都刷一屏。
+    if (panicTraceHas()) {
+        LOG_PORT.printf("[PANIC] ===== 上次 panic 现场（%u 字节）=====\n",
+                        (unsigned)panicTraceLen());
+        LOG_PORT.println(panicTraceText());
+        LOG_PORT.println("[PANIC] ==========================================");
+        panicTraceClear();
+    }
 #endif
 
     // 早分配 PSRAM 日志环形缓冲:越早越好,从这里开始的所有 LOG_PORT.printf
@@ -13051,7 +13074,15 @@ void setup() {
     // 这个上限**不在代码里**，是编译期配置 + 文件系统格式决定的，
     // 不探一次很容易想当然地以为"115KB 也能写成一个文件"——而实际上写不进去，
     // 每次开机重写一次还会变成 boot loop。
-    if (fsMounted) probeSpiffsLimit();
+    if (fsMounted) {
+        probeSpiffsLimit();
+        // ⚠ 顺手把**剩余空间**也报出来：壁纸 115200 字节要落盘，
+        //   分区满不满、还剩多少，必须一眼看得见，别靠猜。
+        LOG_PORT.printf("[SPIFFS] 总 %u 字节，已用 %u 字节，剩 %u 字节\n",
+                        (unsigned)SPIFFS.totalBytes(),
+                        (unsigned)SPIFFS.usedBytes(),
+                        (unsigned)(SPIFFS.totalBytes() - SPIFFS.usedBytes()));
+    }
 
     // 错误日志：把上次运行留在 flash 上的日志读回 RAM，然后补一条"上次怎么结束的"。
     // 必须放在 SPIFFS.begin() 之后 —— elog 靠 SPIFFS 存取。放在这里是因为

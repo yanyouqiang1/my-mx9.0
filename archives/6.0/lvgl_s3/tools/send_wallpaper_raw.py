@@ -44,6 +44,23 @@ RAW_BYTES = W * H * 2          # 115200，和固件的 WP_RAW_BYTES 一致
 CHUNK = 180                    # 和网页端一致：一个 ATT 写稳稳装下
 CHUNK_GAP_S = 0.012            # 无响应写之间的间隔
 PROBE_EVERY = 64               # 每传这么多片问一次固件"你收到多少了"
+# ⚠ --no-probe：完全不问固件"收到多少了"。
+#   2026-10-23 实测：三次传输崩溃分别发生在第 121 / 621 / 121 片，
+#   而探测点在第 128 / 640 / 128 片 —— 每次都紧贴在下一次探测**之前**。
+#   所以先用它验证"探测本身是不是触发点"。
+PROBE_EVERY_OFF = 0
+
+# ⚠ 传大块二进制时的"保守模式"参数。
+#
+# 2026-10-23 实测：固件在传输途中会随机 panic（boots 计数一路涨），
+# 崩点每次都不一样（一次在 21780 字节，一次在 111780 字节），而传输路径
+# 的代码和上一版**逐字节相同** —— 说明不是逻辑错，是 BLE 栈在高并发
+# 写入 + 通知回包下的压力问题。
+#
+# 所以先试"慢一点、小一点"：分片更小 → 每包 ATT 负载更轻；间隔更长 →
+# 给协议栈更多喘息时间。慢的代价只是多花几十秒。
+SLOW_CHUNK = 100
+SLOW_GAP_S = 0.035
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMG = os.path.join(HERE, "..", "..", "wallpaper", "yyq-mx9-wallpaper-240-v2.png")
@@ -92,6 +109,29 @@ def unpack_rgb565(raw):
 async def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     want_verify = "--verify" in sys.argv
+    # --no-cdc：不打开 USB CDC。
+    #
+    # 为什么需要这个开关：固件里 ROM 的 printf 被 setDebugOutput(true) 劫持到
+    # TinyUSB CDC 之后，**两个来源会并发写同一个 CDC TX FIFO**：
+    #   · 主循环的日志镜像任务 → USBCDC::write → tud_cdc_n_write
+    #   · 蓝牙协议栈的 log_d()  → ROM printf → tud_cdc_n_write_char
+    # TinyUSB 的 TX 缓冲不是线程安全的，并发写会把它写坏。
+    # 主机不打开 CDC 口的话，USBCDC::write 会因为"没连上"直接返回 0，
+    # 镜像任务完全不碰 TX FIFO → 竞争的另一头就没了。
+    no_cdc = "--no-cdc" in sys.argv
+    # --slow：保守模式（更小的分片 + 更长的间隔），见 SLOW_CHUNK 的说明
+    slow = "--slow" in sys.argv
+    chunk_size = SLOW_CHUNK if slow else CHUNK
+    gap_s = SLOW_GAP_S if slow else CHUNK_GAP_S
+    # --chunk=N / --gap=MS：手动指定
+    probe_every = PROBE_EVERY
+    if "--no-probe" in sys.argv:
+        probe_every = PROBE_EVERY_OFF
+    for a in sys.argv[1:]:
+        if a.startswith("--chunk="):
+            chunk_size = int(a.split("=", 1)[1])
+        if a.startswith("--gap="):
+            gap_s = int(a.split("=", 1)[1]) / 1000.0
     img_path = args[0] if args else DEFAULT_IMG
     if not os.path.exists(img_path):
         print("✗ 图片不存在：%s" % img_path)
@@ -103,7 +143,7 @@ async def main():
 
     print("=== 图片 %s ===" % img_path)
     print("    240x240 → RGB565 小端 → %d 字节（分 %d 片，每片 %d 字节）"
-          % (len(raw), (len(raw) + CHUNK - 1) // CHUNK, CHUNK))
+          % (len(raw), (len(raw) + chunk_size - 1) // chunk_size, chunk_size))
 
     if want_verify:
         vp = os.path.join(HERE, "..", "assets", "raw_roundtrip.png")
@@ -112,7 +152,9 @@ async def main():
         print("    解回来的对照图：%s" % os.path.abspath(vp))
 
     cdc = CdcLog()
-    if cdc.start():
+    if no_cdc:
+        print("    CDC: 已按 --no-cdc 跳过（固件日志抓不到）")
+    elif cdc.start():
         print("    CDC: %s" % cdc.port)
     else:
         print("    （没找到 CDC 节点，固件日志抓不到）")
@@ -129,7 +171,7 @@ async def main():
     ok = False
     try:
         async with BleakClient(addr, timeout=20) as c:
-            chunk = min(CHUNK, max(20, c.mtu_size - 3))
+            chunk = min(chunk_size, max(20, c.mtu_size - 3))
             print("  协商 MTU=%d → 每片 %d 字节" % (c.mtu_size, chunk))
 
             link = Link(c)
@@ -163,7 +205,7 @@ async def main():
                     failed = True
                     break
                 sent += len(raw[i:i + chunk])
-                await asyncio.sleep(CHUNK_GAP_S)
+                await asyncio.sleep(gap_s)
 
                 n = i // chunk
                 if n % 20 == 0:
@@ -171,7 +213,7 @@ async def main():
 
                 # 每 PROBE_EVERY 片问一次固件"你收到多少了"：
                 # 丢片在这里就能看出来，而不是等最后一句"长度不匹配"才发现。
-                if (n + 1) % PROBE_EVERY == 0:
+                if probe_every and (n + 1) % probe_every == 0:
                     st = await wait_state(link, "RAW", timeout=2.0, verbose=False)
                     if st is None:
                         print("\n  ⚠ 第 %d 片之后设备没回应了" % (n + 1))
