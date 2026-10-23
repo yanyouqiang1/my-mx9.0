@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import MX9BLE
 
@@ -21,8 +22,38 @@ final class SenderModel: ObservableObject {
     @Published var progress: String = ""
     @Published var result: String = ""
     @Published var isSending = false
+    /// 扫描时把周围的设备全列出来。
+    ///
+    /// 默认**打开**：现在是全扫（键盘广播包里没有 service UUID，没法按 service
+    /// 过滤），万一 iOS 那边没把广播名传过来，只显示"像键盘的"就是一个**空列表**
+    /// —— 用户连试都试不了。宁可列表吵一点，也得让人能点。
+    /// 认得出键盘时它会排在最前面并标「键盘」。
+    @Published var showAllDevices = true
 
     let ble = MX9BLE()
+
+    /// 把 ble 的变化**转发**给 model 自己。
+    ///
+    /// ⚠⚠⚠ 不转发的话，View 永远看不到 ble 的变化 ——
+    ///
+    ///   View 里读的是 `model.ble.discovered` / `model.ble.state`，
+    ///   但 SwiftUI 只观察 **model 自己的** objectWillChange。
+    ///   `ble` 是**另一个** ObservableObject（`let ble = MX9BLE()`），
+    ///   它变了**不会**通知 View。
+    ///
+    ///   后果：设备列表 / 连接状态 / 日志都停在旧值，要等**别的东西**
+    ///   触发重绘才刷新。症状特别迷惑人：
+    ///     · 扫到键盘了，列表不出现
+    ///     · 点一下「只存入」这个和蓝牙毫无关系的按钮 → **列表突然全冒出来了**
+    ///   那个按钮改了 `model.mode`，`model` 通知了 View，重绘时
+    ///   才把 `ble.discovered` 读出来 —— 于是"像是"点它才刷新。
+    private var bleRelay: AnyCancellable?
+
+    init() {
+        bleRelay = ble.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
 
     /// 下发一条 ME_DATA 之后至少停这么久（毫秒）。
     private let chunkGapMs: UInt64 = 50
@@ -70,9 +101,11 @@ final class SenderModel: ObservableObject {
         progress = "等待键盘回话…"
         do {
             let body = try await ble.request(last, verb: "MEEND")
+            print("[MX9] ← MEEND \(body)")
             progress = ""
             handleReply(body, expectedHex: expectedHex)
         } catch {
+            print("[MX9] ✗ \(error.localizedDescription)")
             progress = ""
             result = "❌ 没等到键盘回话：\(error.localizedDescription)"
         }
@@ -120,8 +153,10 @@ final class SenderModel: ObservableObject {
 
         if sentNow && mode == .storeAndSend {
             result = "✅ 已存入并立即发送（\(expectedHex / 2) 字节文本）"
+            print("[MX9] ✅ 已存入并立即发送（\(expectedHex / 2) 字节）")
         } else {
             result = "✅ 已存入（\(expectedHex / 2) 字节文本）。按键盘上的 ME 键就会发出去。"
+            print("[MX9] ✅ 已存入（\(expectedHex / 2) 字节）")
         }
     }
 }

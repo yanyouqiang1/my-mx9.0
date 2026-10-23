@@ -18,6 +18,36 @@ public enum MEProtocol {
     /// 固件的广播名（`lvgl_s3.ino` 里 `BLEDevice::init("YYQ-MX9.0")`）。
     public static let deviceName = "YYQ-MX9.0"
 
+    /// 判断一个广播名看起来是不是 MX9 键盘。
+    ///
+    /// ⚠ 为什么只能靠**名字**认设备，不能靠 service UUID：
+    ///
+    ///   iOS 的 `scanForPeripherals(withServices:)` 只会报**广播包里带了那个
+    ///   service UUID** 的外设。而 MX9 键盘的广播包里**只有名字**：
+    ///   实测抓到的广播内容是
+    ///       service_uuids:      []      ← 空
+    ///       manufacturer_data:  {}
+    ///       local_name:         "YYQ-MX9.0"
+    ///
+    ///   Arduino BLE 2.x 也没有 `setAdvertisedService` 这种 API，要在广播里
+    ///   加 service UUID 得自己改 `esp_ble_gap_config_adv_data`（还要重新烧录）。
+    ///
+    ///   ⇒ 按 service 过滤 = **扫一辈子都扫不到**，而且**不报任何错**。
+    ///     所以改成全扫 + 按广播名认。
+    ///
+    ///   认不准也不要紧：连上之后会走 GATT 服务发现，认错了会明确报
+    ///   "设备上没有这个服务"，不会连到别的设备上去。
+    public static func looksLikeKeyboard(name: String) -> Bool {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if n.isEmpty { return false }
+        if n == deviceName.lowercased() { return true }
+        // ⚠ 只认 "MX9"（机型名），**不要**认 "YYQ" —— 用户名下还有别的设备
+        //   叫 "yyq2 号"（另一台 HID 键盘 / 手机名），按 "YYQ" 认会认错。
+        //   "MX9" 是 MX9 这个机型独有的，覆盖用户改过广播名的情况
+        //   （比如 "my-mx9-keyboard"）。
+        return n.contains("mx9")
+    }
+
     /// 服务 UUID —— 固件 `SERVICE_UUID`。
     public static let serviceUUIDString = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 

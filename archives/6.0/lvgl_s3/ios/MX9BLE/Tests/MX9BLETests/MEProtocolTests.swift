@@ -169,6 +169,31 @@ final class MEProtocolTests: XCTestCase {
         XCTAssertNil(r[0].declaredLength)
     }
 
+    // MARK: - 广播名匹配
+
+    /// ⚠ 这条测试是"一直扫不到键盘"那个 bug 的护栏。
+    ///
+    /// 键盘的广播包里**没有 service UUID**（实测 service_uuids 是空的），
+    /// 所以 iOS 只能靠 `scanForPeripherals(withServices: nil)` 全扫，
+    /// 再按**广播名**认设备。名字认错了，App 就永远找不到键盘。
+    func testLooksLikeKeyboard() {
+        XCTAssertTrue(MEProtocol.looksLikeKeyboard(name: "YYQ-MX9.0"))
+        XCTAssertTrue(MEProtocol.looksLikeKeyboard(name: "yyq-mx9.0"))   // 大小写
+        XCTAssertTrue(MEProtocol.looksLikeKeyboard(name: "  YYQ-MX9.0  "))
+        // 用户改过广播名的情况
+        XCTAssertTrue(MEProtocol.looksLikeKeyboard(name: "YYQ-MX9.0-2"))
+        XCTAssertTrue(MEProtocol.looksLikeKeyboard(name: "my-mx9-keyboard"))
+
+        // 周围的别的设备不能被误认成键盘
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: ""))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "   "))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "iPhone"))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "yyq2 号"))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "Apple Watch"))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "HUAWEI FreeBuds Pro 4"))
+        XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "未知设备"))
+    }
+
     func testResetDropsPartialBuffers() {
         let a = BLEReplyAssembler()
         _ = feed(a, "LOG:9:半截\r")

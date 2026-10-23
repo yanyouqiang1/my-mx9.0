@@ -52,11 +52,23 @@ public final class MX9BLE: NSObject, ObservableObject {
         public let id: UUID
         public let name: String
         public let rssi: Int
+        /// 看起来就是 MX9 键盘（广播名对得上）。
+        public let isKeyboard: Bool
+
+        public init(id: UUID, name: String, rssi: Int, isKeyboard: Bool) {
+            self.id = id
+            self.name = name
+            self.rssi = rssi
+            self.isKeyboard = isKeyboard
+        }
     }
 
     @Published public private(set) var state: LinkState = .bluetoothOff
     @Published public private(set) var discovered: [Discovered] = []
     @Published public private(set) var log: [String] = []
+    /// 出错了就显示在界面上 —— 光写进日志用户是看不到的
+    /// （"点了没反应"就是这么来的：日志里有一行，界面上一点变化都没有）。
+    @Published public private(set) var lastError: String = ""
 
     /// 键盘主动推过来的消息（LOG 之类）。手机端一般用不上，留在日志里方便排查。
     public var onMessage: ((BLEReply) -> Void)?
@@ -72,6 +84,17 @@ public final class MX9BLE: NSObject, ObservableObject {
     private var isWriting = false
     private var reqSeq = 0
     private var pendingRequests: [Int: CheckedContinuation<String, Error>] = [:]
+    /// 用户想扫描（还没等蓝牙就绪时记下来，等就绪了自动开扫）。
+    private var wantsScan = false
+
+    /// 扫到的外设对象，按 identifier 存着。
+    ///
+    /// ⚠⚠⚠ **必须自己存着**，不能靠 `retrievePeripherals(withIdentifiers:)` 反查 ——
+    ///   那个 API 只对系统**已经认识**的外设（连过/配对过）有效，
+    ///   "刚扫到、还没连过"的外设反查回来是 nil ⇒
+    ///   connect() 里直接 return ⇒ **点了没反应**。
+    ///   扫描回调拿到的 CBPeripheral 才是正确的那一个。
+    private var scannedPeripherals: [UUID: CBPeripheral] = [:]
 
     public override init() {
         super.init()
@@ -85,27 +108,68 @@ public final class MX9BLE: NSObject, ObservableObject {
     // MARK: - 对外操作
 
     public func startScan() {
-        guard central.state == .poweredOn else { return }
-        discovered.removeAll()
+        wantsScan = true
+        guard central.state == .poweredOn else {
+            // 蓝牙还没就绪 —— 别直接返回，否则这次扫描就永远丢掉了
+            //（onAppear 调 startScan 时 central 往往还没 poweredOn）。
+            appendLog("蓝牙还没就绪，等一下自动开始扫描…")
+            return
+        }
+        beginScan(clearList: true)
+    }
+
+    /// 已经开始扫了，只是要**继续扫**（不清空已经找到的设备）。
+    ///
+    /// ⚠ 为什么要有这个：iOS 每次 App 回到前台都会**重发一次**
+    ///   `centralManagerDidUpdateState(.poweredOn)`。如果那里直接调
+    ///   `startScan()`（它会 `discovered.removeAll()`），那么
+    ///   **每次切回 App 设备列表就被清空** —— 用户刚扫到键盘，
+    ///   切个别的 App 再回来，列表空了，像是"扫不到"。
+    private func beginScan(clearList: Bool) {
+        if clearList { discovered.removeAll() }
         appendLog("开始扫描…")
+        // ⚠⚠⚠ **这里不能用 withServices 过滤**，必须全扫 + 自己按名字认。
+        //
+        //   iOS 的 scanForPeripherals(withServices:) 只会报**广播包里带了那个
+        //   service UUID** 的设备。而 MX9 键盘的广播包里**只有设备名**：
+        //     实测（Mac 上 bleak 抓的广播包）：
+        //       service_uuids:      []      ← 空
+        //       manufacturer_data:  {}
+        //       local_name:         "YYQ-MX9.0"
+        //   固件那边 Arduino BLE 2.x 也没有 setAdvertisedService 这种 API，
+        //   要在广播里加 service UUID 得自己改 esp_ble_gap_config_adv_data，
+        //   还得重新烧录。
+        //
+        //   ⇒ 按 service 过滤的后果就是：**扫一辈子都扫不到**，
+        //     而且没有任何报错（就是扫不到东西）。这正是"一直显示正在扫描"的真凶。
+        //
+        //   所以：全扫，然后按**广播名**认键盘。
         central.scanForPeripherals(
-            withServices: [CBUUID(string: MEProtocol.serviceUUIDString)],
+            withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
         state = .scanning
     }
 
     public func stopScan() {
+        wantsScan = false
         central.stopScan()
         if case .scanning = state { state = .bluetoothOff }
     }
 
     public func connect(_ item: Discovered) {
-        guard let p = central.retrievePeripherals(withIdentifiers: [item.id]).first
-                ?? peripheralWithIdentifier(item.id) else {
-            appendLog("找不到这个设备了")
+        wantsScan = false
+        // ⚠ 用扫描时存下来的那个 CBPeripheral，**不要**用
+        //   retrievePeripherals(withIdentifiers:) 反查 ——
+        //   那个只对系统已经认识的外设有效，"刚扫到还没连过"的反查是 nil，
+        //   于是这里直接 return，用户看到的就是"点了没反应"。
+        guard let p = scannedPeripherals[item.id]
+                ?? central.retrievePeripherals(withIdentifiers: [item.id]).first else {
+            lastError = "找不到这个设备了，换一个再试试"
+            appendLog("找不到这个设备了（\(item.name)）")
             return
         }
+        lastError = ""
         central.stopScan()
         appendLog("连接 \(item.name)…")
         state = .connecting(item.name)
@@ -131,6 +195,7 @@ public final class MX9BLE: NSObject, ObservableObject {
             appendLog("还没连上，发不出去")
             return false
         }
+        print("[MX9] → \(command)")
         var data = Data(command.utf8)
         data.append(0x0A)   // '\n'
         enqueueWrite(data)
@@ -214,6 +279,9 @@ public final class MX9BLE: NSObject, ObservableObject {
     public func appendLog(_ s: String) {
         log.append(s)
         if log.count > 200 { log.removeFirst(log.count - 200) }
+        // 同时打到 stdout：真机上没别的办法看日志，
+        // `xcrun devicectl device process launch --console` 能把这里抓出来。
+        print("[MX9] \(s)")
     }
 
     // MARK: - 回话派发
@@ -257,7 +325,18 @@ extension MX9BLE: CBCentralManagerDelegate {
             switch raw {
             case .poweredOn:
                 appendLog("蓝牙已开启")
-                if case .bluetoothOff = state { state = .bluetoothOff }
+                // ⚠ 之前用户点"扫描"时蓝牙还没就绪，这一次扫描就被**悄悄丢掉**了
+                //   （startScan 里 `guard central.state == .poweredOn else { return }`），
+                //   表现就是"一直显示正在扫描但什么都没有"。
+                //   现在记住意图，等就绪了自动补上。
+                //
+                // ⚠ iOS 每次 App 回到前台都会**重发一次**这个回调，
+                //   所以这里不能调 startScan()（它会清空设备列表 ——
+                //   用户切个别的 App 再回来，列表就空了，像是"扫不到"）。
+                //   只在还没扫到东西时补扫。
+                if wantsScan && !state.isReady {
+                    beginScan(clearList: discovered.isEmpty)
+                }
             case .poweredOff:
                 state = .bluetoothOff
                 appendLog("蓝牙已关闭")
@@ -286,13 +365,22 @@ extension MX9BLE: CBCentralManagerDelegate {
         let name = advName ?? peripheral.name ?? ""
         let id = peripheral.identifier
         let rssi = RSSI.intValue
+        let isKeyboard = MEProtocol.looksLikeKeyboard(name: name)
         Task { @MainActor in
+            // ★ 把扫描回调拿到的外设对象存下来，连接时直接用它。
+            self.scannedPeripherals[id] = peripheral
             if let idx = self.discovered.firstIndex(where: { $0.id == id }) {
-                self.discovered[idx] = Discovered(id: id, name: name.isEmpty ? "未知设备" : name, rssi: rssi)
+                self.discovered[idx] = Discovered(id: id, name: name.isEmpty ? "未知设备" : name,
+                                                 rssi: rssi, isKeyboard: isKeyboard)
             } else {
-                self.discovered.append(Discovered(id: id, name: name.isEmpty ? "未知设备" : name, rssi: rssi))
-                if name == MEProtocol.deviceName {
+                self.discovered.append(Discovered(id: id, name: name.isEmpty ? "未知设备" : name,
+                                                  rssi: rssi, isKeyboard: isKeyboard))
+                if isKeyboard {
                     self.appendLog("发现键盘：\(name) (RSSI \(rssi))")
+                } else if name.isEmpty {
+                    self.appendLog("扫到一个无名设备（RSSI \(rssi)）")
+                } else {
+                    self.appendLog("扫到设备：\(name) (RSSI \(rssi))")
                 }
             }
         }
@@ -314,6 +402,7 @@ extension MX9BLE: CBCentralManagerDelegate {
         let msg = error?.localizedDescription ?? "未知原因"
         Task { @MainActor in
             self.appendLog("连接失败：\(msg)")
+            self.lastError = "连接失败：\(msg)"
             self.state = .failed(msg)
             self.failAllPendingRequests(msg)
         }
@@ -341,6 +430,7 @@ extension MX9BLE: CBPeripheralDelegate {
             let msg = error.localizedDescription
             Task { @MainActor in
                 self.appendLog("发现服务失败：\(msg)")
+                self.lastError = "发现服务失败：\(msg)"
                 self.state = .failed(msg)
             }
             return
@@ -349,6 +439,7 @@ extension MX9BLE: CBPeripheralDelegate {
         guard let service = peripheral.services?.first(where: { $0.uuid == uuid }) else {
             Task { @MainActor in
                 self.appendLog("设备上没有这个服务")
+                self.lastError = "这个设备上没有 MX9 的服务，可能不是键盘"
                 self.state = .failed("设备上没有这个服务")
             }
             return
@@ -366,6 +457,7 @@ extension MX9BLE: CBPeripheralDelegate {
             let msg = error.localizedDescription
             Task { @MainActor in
                 self.appendLog("发现特征失败：\(msg)")
+                self.lastError = "发现特征失败：\(msg)"
                 self.state = .failed(msg)
             }
             return
@@ -374,6 +466,7 @@ extension MX9BLE: CBPeripheralDelegate {
         guard let ch = service.characteristics?.first(where: { $0.uuid == uuid }) else {
             Task { @MainActor in
                 self.appendLog("设备上没有这个特征")
+                self.lastError = "这个设备上没有 MX9 的特征，可能不是键盘"
                 self.state = .failed("设备上没有这个特征")
             }
             return

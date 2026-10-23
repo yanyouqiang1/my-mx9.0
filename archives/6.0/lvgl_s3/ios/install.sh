@@ -82,8 +82,13 @@ echo "▸ 安装到手机…"
 xcrun devicectl device install app --device "$DEV_ID" "$APP_PATH"
 
 # ---- 5. 启动 ----
+# ⚠⚠⚠ **--activate 不能少**。
+#   不带它，devicectl 是把 App **后台启动**的 —— 而 iOS 对后台 App 会
+#   **推迟蓝牙初始化回调**（centralManagerDidUpdateState 不来），
+#   于是 App 停在初始状态：界面显示"蓝牙未开启"、日志全空、
+#   点"扫描"也没反应。带上 --activate 才是真的把它拉到前台。
 echo "▸ 启动…"
-xcrun devicectl device process launch --device "$DEV_ID" "$BUNDLE_ID" 2>&1 | tail -3 || true
+xcrun devicectl device process launch --activate --device "$DEV_ID" "$BUNDLE_ID" 2>&1 | tail -3 || true
 
 echo ""
 echo "✅ 完成。手机上打开「MX9 键盘」即可。"

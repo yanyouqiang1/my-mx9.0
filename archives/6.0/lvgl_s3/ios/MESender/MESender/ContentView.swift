@@ -48,26 +48,76 @@ struct ContentView: View {
                 }
             }
 
-            if !model.ble.state.isReady && !model.ble.discovered.isEmpty {
-                ForEach(model.ble.discovered) { d in
-                    Button {
-                        model.ble.connect(d)
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(d.name).foregroundStyle(.primary)
-                                Text("RSSI \(d.rssi) dBm")
+            // 错误必须显示在界面上 —— 光写日志的话，用户只会看到
+            // "点了没反应"（上一版就是这样：找不到设备只记了一行日志）。
+            if !model.ble.lastError.isEmpty {
+                Label(model.ble.lastError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+
+            if !model.ble.state.isReady {
+                if !model.ble.discovered.isEmpty {
+                    Toggle("显示全部设备", isOn: $model.showAllDevices)
+                        .font(.footnote)
+
+                    // 键盘排最前面，其余按信号强度排
+                    ForEach(sortedDevices) { d in
+                        Button {
+                            model.ble.connect(d)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    HStack(spacing: 6) {
+                                        Text(d.name).foregroundStyle(.primary)
+                                        if d.isKeyboard {
+                                            Text("键盘")
+                                                .font(.caption2)
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Color.green.opacity(0.2))
+                                                .foregroundStyle(.green)
+                                                .cornerRadius(4)
+                                        }
+                                    }
+                                    Text("RSSI \(d.rssi) dBm")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                     }
+                } else if model.ble.state == .scanning {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("正在找 \(MEProtocol.deviceName)…")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("找不到的话：确认键盘通电、离手机近一点，然后点「扫描」重来。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
+        }
+    }
+
+    /// 键盘排最前，其次按信号强度（RSSI 大 = 近）。
+    ///
+    /// 默认**只显示**像键盘的设备 —— 因为现在是全扫（广播包里没有 service
+    /// UUID，没法按 service 过滤），周围一堆手表/耳机/别的键盘会全冒出来。
+    /// 「显示全部设备」打开就能看到完整列表，排查时用。
+    private var sortedDevices: [MX9BLE.Discovered] {
+        let list = model.showAllDevices
+            ? model.ble.discovered
+            : model.ble.discovered.filter { $0.isKeyboard }
+        return list.sorted { a, b in
+            if a.isKeyboard != b.isKeyboard { return a.isKeyboard }
+            return a.rssi > b.rssi
         }
     }
 
