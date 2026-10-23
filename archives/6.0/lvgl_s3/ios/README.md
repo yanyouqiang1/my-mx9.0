@@ -32,10 +32,32 @@ App 只做 ME 这一件事（输入 → 存入 → 可选立即发送），不�
 
 ## 跑起来
 
-### 1. 生成 Xcode 工程
+### 1. 装到手机上（推荐用脚本）
 
-`MESender.xcodeproj` 是用 [XcodeGen](https://github.com/yonaskolb/XcodeGen)
-从 `project.yml` 生成的，**不要手改工程文件**（会被覆盖）。
+```bash
+cd lvgl_s3/ios
+./install.sh
+```
+
+脚本会：生成 Xcode 工程 → 编译并签名 → 装到手机 → 启动。
+
+⚠ **一次性前置条件**：Xcode → **Settings → Accounts → + → Apple Account**，
+用 **374580618@qq.com** 登录一次。
+
+没登录的话第 3 步会报：
+
+```
+error: No Accounts: Add a new account in Accounts settings.
+error: No profiles for 'com.yanyouqiang.mx9.MESender' were found.
+```
+
+这是因为**建 provisioning profile 必须有开发者门户的凭据**，本机没有 ——
+Xcode 里虽然还留着个人 Team（`RQ6477DX7S`）和签名证书，但账号列表是空的，
+没法自动为新 bundle ID 建 profile。
+
+⚠ 也可以手动指定设备：`./install.sh <UDID>`。
+
+### 2. 手动装（想在 Xcode 里点 ▶︎ 就用这个）
 
 ```bash
 cd lvgl_s3/ios/MESender
@@ -43,17 +65,22 @@ xcodegen generate
 open MESender.xcodeproj
 ```
 
-### 2. 装到手机上
-
-工程用的是**自动签名**。在 Xcode 里：
+工程用的是**自动签名**，Team 已经填成 `RQ6477DX7S`（个人 Team）。
+在 Xcode 里：
 
 1. 选中 `MESender` target → **Signing & Capabilities**
-2. 勾上 **Automatically manage signing**
-3. **Team** 选自己的 Apple ID（没有就点 Add an Account）
-4. 把 **Bundle ID** 改成别人没用过的（比如 `com.yanyouqiang.mx9.MESender`）
-5. 用数据线连 iPhone，选中它，点 ▶︎ 运行
+2. 勾上 **Automatically manage signing**，Team 选「有强 严 (Personal Team)」
+3. 把 **Bundle ID** 改成别人没用过的（默认是 `com.yanyouqiang.mx9.MESender`）
+4. 用数据线连 iPhone，选中它，点 ▶︎ 运行
 
-第一次运行会弹蓝牙权限请求 —— 同意。
+第一次运行会弹蓝牙权限请求 —— **必须允许**，否则扫不到键盘。
+
+### ⚠ 免费账号的 profile 只有 7 天
+
+个人开发者（免费账号）的 provisioning profile **7 天就过期**。过期之后
+装不上（报签名错误或 profile 失效），重跑一次 `./install.sh` 刷新就行。
+
+要长期免折腾就得用付费开发者账号（profile 有效期 1 年）。
 
 ### 3. 用
 

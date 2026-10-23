@@ -35,5 +35,8 @@ targets:
         # 系统就用这句话决定给不给。
         INFOPLIST_FILE: MESender/Info.plist
         TARGETED_DEVICE_FAMILY: "1,2"
+        # 个人开发者 Team（RQ6477DX7S / "有强 严 (Personal Team)"）。
+        # 装真机时靠它 + -allowProvisioningUpdates 让 Xcode 自动建 profile。
+        DEVELOPMENT_TEAM: RQ6477DX7S
         CODE_SIGN_STYLE: Automatic
         ENABLE_USER_SCRIPT_SANDBOXING: YES
