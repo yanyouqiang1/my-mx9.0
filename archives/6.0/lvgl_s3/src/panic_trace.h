@@ -41,6 +41,19 @@
 #ifndef PANIC_TRACE_H
 #define PANIC_TRACE_H
 
+// ⚠ 整套黑匣子只在 **debug 构建**（LOG_CDC_MIRROR=1）里生效。
+//   原因：它要接管 ROM 的 putchar（把 IDF 日志和 panic 回溯收进内存环），
+//   而产品固件 ARDUINO_USB_MODE=1 没有 CDC 节点 —— 接管了也搬不出去，
+//   反而白白占掉 8KB 内存环 + 2KB RTC 慢存，还把 UART0 的 console 顶掉
+//   （产品固件接 USB-TTL 时，panic 回溯本来就该照旧走 UART0）。
+//
+//   产品固件要抓现场的办法：接 USB-TTL，看 UART0 上的 Guru Meditation 回溯。
+#ifndef LOG_CDC_MIRROR
+#define LOG_CDC_MIRROR 0
+#endif
+
+#if LOG_CDC_MIRROR
+
 #include <Arduino.h>
 #include <esp_attr.h>
 #include <esp_debug_helpers.h>
@@ -130,5 +143,7 @@ static inline bool panicTraceHas(void)     { return s_panic.magic == PANIC_MAGIC
 static inline const char* panicTraceText(void) { return s_panic.text; }
 static inline uint32_t panicTraceLen(void) { return s_panic.len; }
 static inline void panicTraceClear(void)   { s_panic.magic = 0; }
+
+#endif  // LOG_CDC_MIRROR
 
 #endif  // PANIC_TRACE_H

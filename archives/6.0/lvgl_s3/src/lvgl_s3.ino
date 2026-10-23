@@ -10880,6 +10880,7 @@ static void handleCommand(const String& cmd) {
         btLinkSendC("LOG", "0", "CLEARED");
         LOG_PORT.println("[LOG] buffer cleared");
     }
+    #if LOG_CDC_MIRROR
     else if (cmd == "PANIC") {
         // 直接从 RTC 慢存把"上次 panic 的现场"回给主机。
         //
@@ -10895,6 +10896,7 @@ static void handleCommand(const String& cmd) {
             LOG_PORT.printf("[PANIC] 回传现场 %u 字节\n", (unsigned)panicTraceLen());
         }
     }
+    #endif
     else if (cmd == "LOG:dump") {
         // 这里**不做任何发送**，只是开一条流并记下要回拉多少字节。
         // 环形缓冲有 8KB，按 20 字节一片就是 400+ 片，一次性同步推完等于把
@@ -12814,6 +12816,7 @@ void setup() {
     //   于是"崩溃现场明明打印了却看不见"，白折腾一轮。
     //   （2026-10-23 踩过：黑匣子第一次就把这段放在缓冲分配之前，
     //     结果现场只进了 UART0 和 CDC，开机日志里一个字都没有。）
+    #if LOG_CDC_MIRROR
     if (panicTraceHas()) {
         LOG_PORT.printf("[PANIC] ===== 上次 panic 现场（%u 字节）=====\n",
                         (unsigned)panicTraceLen());
@@ -12821,6 +12824,7 @@ void setup() {
         LOG_PORT.println("[PANIC] ==========================================");
         panicTraceClear();
     }
+    #endif
 
     // 内部 DRAM 的剩余量也报一下：BLE 库每个写事件都要 new 一份 std::string，
     // 万一那里漏了，现象就是"传到第 N 片突然 panic"—— 内部堆耗尽也会这么表现。
