@@ -300,7 +300,15 @@ async def main():
     except Exception as e:
         print("✗ BLE 会话异常：%s: %s" % (type(e).__name__, e))
 
-    await asyncio.sleep(0.5)
+    # 崩溃之后固件会自动重启，开机时会把「上次 panic 现场」打进 CDC。
+    # 这里**多守一会儿**，不然 0.5 秒就关口，窗口根本来不及（2~5 秒才重启完）。
+    keep = 25
+    for a in sys.argv[1:]:
+        if a.startswith("--keep="):
+            keep = int(a.split("=", 1)[1])
+    if keep:
+        print("\n（守着 CDC 再等 %d 秒，等固件重启把 panic 现场打出来）" % keep)
+        await asyncio.sleep(keep)
     cdc.stop()
 
     print("\n=== CDC 抓到的固件日志 ===")

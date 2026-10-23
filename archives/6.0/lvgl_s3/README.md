@@ -757,6 +757,77 @@ cd lvgl_s3 && /usr/bin/python3 tools/send_wallpaper_raw.py
 抢在 START 前面到，那一片会被当成文本命令吞掉。所以发第一片之前必须轮询
 `LOGO_STATUS`，等固件回报 `RAW:0/115200`。
 
+### ⚠ 传输壁纸时，`CORE_DEBUG_LEVEL` 必须是 3（这条踩了一整天）
+
+2026-10-23 的一整轮排查都栽在这上面，单独记一节。
+
+BLE 库在 `CORE_DEBUG_LEVEL=5`（Verbose）下，**每一个 GATT 写事件**都要打十几行
+（`ESP_GATTS_WRITE_EVT` / `setValue` / FreeRTOS 锁的 take·give…）。一次壁纸传输是
+**640 个写事件** ⇒ 光这层就是 ~1MB 日志。要往 115200 波特率的 USB CDC 里灌 1MB
+需要 **87 秒**，而 USB 口只有一个 —— 于是：
+
+- 日志镜像任务被彻底堵死，**CDC 从二进制分片一开始就一个字都不吐**
+  （现场抓不到：panic 现场唯一的出口就是 CDC）
+- CPU 被日志吃掉，BLE 协议栈饿着 ⇒ **连接在第 300 片左右断开/崩溃**
+  （实测两次：54180 / 54360 字节，可复现）
+- 顺带把 `Serial.setDebugOutput(true)` 也坑了：那个函数内部是
+  `ets_install_putc2(cdc0_write_char)`，把 ROM 的 putchar 直接接到
+  **TinyUSB 的 CDC TX FIFO**，而那个 FIFO 不是线程安全的 ——
+  蓝牙协议栈的 `log_d()` 和主循环的日志镜像任务会并发写它，
+  症状是"CDC 通道整个死掉"。固件现在改成"先进自己的内存环，
+  再由日志镜像任务统一搬进 CDC"（见 `src/panic_trace.h`）。
+
+⇒ `_debug` 环境的 `CORE_DEBUG_LEVEL` 已经改成 **3**。要查 BLE 栈细节时
+临时改回 5 重新编译，**但传输壁纸时务必是 3**。
+
+### 落盘为什么分片（以及"单文件 4096 上限"这个结论是错的）
+
+SPIFFS 在 Arduino 这套配置下**单文件不能超过一个 block**（`CONFIG_SPIFFS_PAGE_SIZE=256`
++ `log_block_size=4096`），而一张 240×240 的 RGB565 是 **115200 字节**。
+所以现在**分片存**：`/logo000.bin` … `/logo056.bin`（每片 ≤ 2048 字节）
++ `/logo.ok` 标记文件（**它存在才说明整张图写完了**，写一半崩掉时
+重启不会把半截图当成有效图）。
+
+⚠ 但别把"单文件上限"当成唯一的锅：实测分区**空得不能再空**
+（`总 1438481 字节，已用 12801 字节，剩 1425680 字节`），
+115KB 分片存下去毫无压力。开机日志里的这行是判断"是不是分区满了"的唯一依据。
+
+### 崩溃现场怎么抓（黑匣子）
+
+`src/panic_trace.h` 做了三件事：
+
+1. `ets_install_putc2(romPutc)` —— 接管 ROM 的 putchar，IDF 的日志 / assert /
+   panic 回溯全进一块 8KB 内存环；再由日志镜像任务**统一**搬进 CDC 和 UART0
+2. `g_panic_abort = panicHook` —— panic 发生时把环的尾巴抄进 **RTC 慢存**
+   （跨复位不丢）
+3. 开机时把这段文字打进日志；另外有个 **`PANIC` 命令**可以直接从慢存
+   回传现场，**什么时候问都问得到**（不必赌"开机日志还没被新日志顶掉"）
+
+⚠ 打印那段现场的位置**必须在 BLE 日志环缓冲分配之后** ——
+早一步打印的话，`LOG:dump` 根本拉不到（现场只进了 UART0 和 CDC）。
+
+抓现场的工具：
+
+```bash
+# 守着 CDC 熬过"崩溃 → 自动重启 → 开机打印"这一轮
+/usr/bin/python3 tools/capture_panic.py --addr=7810793C --cdc-port=/dev/cu.usbmodemXXXX
+
+# 传输完多守一会儿 CDC，等固件重启把 panic 现场打出来
+/usr/bin/python3 tools/send_wallpaper_raw.py --no-probe --keep=25 --cdc-port=/dev/cu.usbmodemXXXX
+```
+
+⚠ `--cdc-port` 是必需的：这台机器上同时插着 A 板（native USB）和 B 板的
+CH343（USB-TTL），自动 glob 会按字典序挑中 CH343，panic 现场就抓不到了。
+
+### `--no-probe`：传输途中问固件"收到多少了"这个动作本身会出事
+
+主机每传 64 片问一次 `LOGO_STATUS`，这个**文本命令插在二进制流中间**。
+实测三次崩溃分别发生在第 121 / 621 / 121 片，而探测点在第 128 / 640 / 128 片 ——
+**每次都紧贴在下一次探测之前**。关掉探测（`--no-probe`）后 115200 字节
+一次不差全部收齐。
+
+⇒ 传输时默认加 `--no-probe`；固件回报的 `LOGO_STATUS` 只在传输前后问一次。
+
 ## 文件系统与分区（别踩）
 
 - 壁纸 `/logo.bin` 和 ME 文本 `/me_hex.txt` 存在 **SPIFFS** 上，**不是 FFat**。
