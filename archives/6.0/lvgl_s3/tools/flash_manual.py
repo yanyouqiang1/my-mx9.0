@@ -74,15 +74,12 @@ def main():
 
     port = None
     t0 = time.time()
-    tried = set()
-    while time.time() - t0 < 180:
-        now = set(usb_nodes())
-        fresh = now - before
-        # 下载模式下 S3 重新枚举，节点名和 app 模式的不同；
-        # 万一名字一样（macOS 复用同一个路径），就靠 esptool 能连上为准。
-        cands = sorted(fresh) or sorted(now - tried)
-        for c in cands:
-            tried.add(c)
+    while time.time() - t0 < 240:
+        # ⚠ 不能只看"新出现的节点"：如果你已经先按好了 BOOT，芯片在脚本
+        #   启动之前就进了下载模式，那个节点本来就在列表里。
+        #   所以每个节点都拿 esptool 试一下 —— app 模式下的节点不会应答
+        #   （USB-Serial-JTAG 外设被 TinyUSB 占了），只有 ROM 下载模式会。
+        for c in usb_nodes():
             ok, _ = esptool_ok(c)
             if ok:
                 port = c
