@@ -144,6 +144,55 @@ if mm:
           "硬件签名左端 x=%d 离圆心 %.1f > 半径 %d（不撞圆环）"
           % (sig_x - 95, dist ** 0.5, r))
 
+# ---- 8. RAW 传输协议的长度 / 字节序约定 ----
+# 这条路是"解码在电脑端做、板子只收成品像素"，所以固件和电脑端
+# 工具对"传多少字节"和"字节怎么排"必须完全一致，差一个字节就是花屏。
+RAW_TOOL = os.path.join(HERE, "tools", "send_wallpaper_raw.py")
+LV_CONF = os.path.join(HERE, "src", "lv_conf.h")
+
+m = re.search(r"#define\s+WP_W\s+(\d+)", ino)
+check(m is not None, "固件里能找到 WP_W 定义")
+wp_w = int(m.group(1)) if m else -1
+m = re.search(r"#define\s+WP_H\s+(\d+)", ino)
+check(m is not None, "固件里能找到 WP_H 定义")
+wp_h = int(m.group(1)) if m else -1
+check(wp_w == 240 and wp_h == 240,
+      "壁纸尺寸是 240x240（固件 WP_W=%d WP_H=%d）" % (wp_w, wp_h))
+
+m = re.search(r"#define\s+WP_RAW_BYTES\s+\(WP_PIXELS\s*\*\s*2\)", ino)
+check(m is not None, "固件里 WP_RAW_BYTES 是 (WP_PIXELS * 2) 形式")
+raw_bytes = wp_w * wp_h * 2
+
+check("LOGO_RAW_START:" in ino, "固件认 LOGO_RAW_START 命令")
+check('cmd == "LOGO_RAW_FLUSH"' in ino, "固件认 LOGO_RAW_FLUSH 命令")
+check("finishLogoRaw" in ino, "固件里有 RAW 收尾处理")
+
+if os.path.exists(RAW_TOOL):
+    ts = open(RAW_TOOL, encoding="utf-8").read()
+    m = re.search(r"RAW_BYTES\s*=\s*W\s*\*\s*H\s*\*\s*2", ts)
+    check(m is not None, "电脑端工具里 RAW_BYTES 是 W*H*2 形式")
+    m = re.search(r"^W\s*=\s*H\s*=\s*(\d+)", ts, re.M)
+    check(m is not None and int(m.group(1)) == 240,
+          "电脑端工具的画布是 240x240")
+else:
+    fails.append("✗ 电脑端工具不存在：%s" % RAW_TOOL)
+
+# 字节序：LV_COLOR_DEPTH=16 且**没有** LV_COLOR_16_SWAP ⇒ RGB565 是 native 小端。
+# 电脑端按小端打包，固件里 JPEGDEC 的 RGB565_LITTLE_ENDIAN 也是这个样子，
+# 两条路写进 wpPixels 的字节一致。
+if os.path.exists(LV_CONF):
+    conf = open(LV_CONF, encoding="utf-8").read()
+    m = re.search(r"#define\s+LV_COLOR_DEPTH\s+(\d+)", conf)
+    depth = int(m.group(1)) if m else -1
+    check(depth == 16, "LV_COLOR_DEPTH=16（当前 %d）" % depth)
+    swapped = re.search(r"#define\s+LV_COLOR_16_SWAP\s+1", conf)
+    check(swapped is None,
+          "没有开 LV_COLOR_16_SWAP ⇒ RGB565 是 native 小端，电脑端按小端打包")
+else:
+    fails.append("✗ lv_conf.h 不存在：%s" % LV_CONF)
+
+notes.append("   RAW 传输长度：%d 字节（240*240*2，小端 RGB565）" % raw_bytes)
+
 print("\n".join(notes))
 if fails:
     print()

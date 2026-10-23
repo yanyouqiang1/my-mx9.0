@@ -23,7 +23,13 @@ DEV_NAME = "yyq2 号"
 
 
 async def find_keyboard(timeout=10.0):
-    """用 detection_callback 扫（macOS 的 discover() 会漏设备）。"""
+    """用 detection_callback 扫（macOS 的 discover() 会漏设备）。
+
+    ⚠ 认人必须按 **GATT 里的 service UUID**，不能按名字、也不能取"第一个扫到的"。
+    这台机器上还有一台同样叫 "yyq2 号" 的 HID 设备（macOS 里配对过的另一台键盘），
+    广播顺序是随机的 —— 早先这个脚本取 cands[0] 就经常连到它身上去，
+    表现是"连上了但什么服务都没有"或者"命令发出去设备没反应"。
+    """
     found = []
 
     def cb(device, ad):
@@ -36,6 +42,15 @@ async def find_keyboard(timeout=10.0):
     await asyncio.sleep(timeout)
     await scanner.stop()
     return found
+
+
+def is_our_keyboard(c):
+    """GATT 里必须有本机的 service + 特征，才是这块板子。"""
+    uuids = [str(s.uuid) for s in c.services]
+    has_svc = any(SERVICE_UUID.lower() in u.lower() for u in uuids)
+    has_ch = any(CHAR_UUID.lower() in str(ch.uuid).lower()
+                 for s in c.services for ch in s.characteristics)
+    return has_svc and has_ch
 
 
 async def send_recv(client, text, wait=1.5):
@@ -66,7 +81,20 @@ async def main():
     for addr, name in cands:
         print("  找到 %s  %s" % (addr, name))
 
-    addr = cands[0][0]
+    addr = None
+    for cand_addr, cand_name in cands:
+        try:
+            async with BleakClient(cand_addr, timeout=8) as probe:
+                if is_our_keyboard(probe):
+                    addr = cand_addr
+                    print("  认人成功: %s  %s" % (cand_addr, cand_name))
+                    break
+        except Exception:
+            continue
+    if addr is None:
+        print("✗ 扫到的设备里没有带本机 service/特征的 —— 固件可能没在跑")
+        return 1
+
     print("\n=== 连上 %s ===" % addr)
     async with BleakClient(addr, timeout=10) as c:
         print("  --- 全部 GATT 服务/特征 ---")

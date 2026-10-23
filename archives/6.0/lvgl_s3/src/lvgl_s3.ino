@@ -1708,7 +1708,36 @@ static bool         logoRxDone  = false;
 static bool         logoRxActive = false;    // 只有这个为 true 才处于二进制接收模式
 static unsigned long logoRxLastMs = 0;
 static uint16_t*    logoOutBuf  = nullptr;  // JPEGDEC 的绘制目标（解码期间有效）
-static uint32_t     meHexBytes  = 0;         // ME_DATA 累计写进去的十六进制字符数（诊断用）
+static uint32_t     meHexBytes  = 0;         // ME_DATA 累计写进去的十六进制字符数（诊断用)
+
+// ===========================
+// RAW 传输：解码放在电脑端，板子只收 + 展示
+// ===========================
+//
+// 这条路和网页端那条（JPEG → 板子上用 JPEGDEC 解）**并列**，不是替代：
+//   · 网页端 s3-setting.html 继续走 JPEG（十几 KB，省流量）
+//   · 命令行/自动化走 RAW（电脑端解成 RGB565 直接发）
+//
+// 为什么值得多这一条：
+//   ① 板子上**彻底不需要 JPEG 解码器**了。JPEGDEC 那个对象有 12.6KB
+//      （usUnalignedPixels / usHuffAC / ucHuffDC / ucFileBuf 四张大数组），
+//      静态占着内部 DRAM；而且它的解析过程要在输入缓冲里大量跳转 ——
+//      输入缓冲一旦在 PSRAM 上（缓存行跨步 + 未对齐访问）就不稳，
+//      之前"上传壁纸必崩"就是踩在这上面。
+//   ② RAW 的长度是**固定**的 240*240*2 = 115200 字节，不存在 JPEG
+//      那种"声明多少就收多少"的可变长度，也就没有了越界那一类问题。
+//   ③ 电脑端想怎么压都行（PNG/JPEG/WebP 随便读），板子上只管显示，
+//      "发什么显示什么"这条链路更短，出问题时更好定位。
+//
+// 字节序（硬约定，两边必须一致）：
+//   LV_COLOR_DEPTH=16 且 **没有**开 LV_COLOR_16_SWAP ⇒ RGB565 就是
+//   ESP32 上的 native 小端。所以电脑端按 little-endian 打包 uint16 即可，
+//   和 JPEGDEC 的 RGB565_LITTLE_ENDIAN 落在内存里的样子完全一样。
+#define WP_RAW_BYTES  (WP_PIXELS * 2)
+
+static uint16_t*    logoRawBuf  = nullptr;  // RAW 接收目标：115200 字节，PSRAM 常驻
+static bool         logoRxRaw   = false;    // 当前是不是 RAW 模式（JPEG 模式为 false）
+
 // ME 存储改成"ME_START 开一次 fd、ME_DATA 只写、ME_END 关"（原因见 handleCommand
 // 里 ME_START 那段注释）。这三个变量配合 loop() 里的超时兜底：
 // 网页发一半跑掉时不能把 fd 一直攥着 —— SPIFFS 默认只允许 10 个同时打开的文件，
@@ -3012,6 +3041,7 @@ static uint8_t* logoRxAlloc(uint32_t need) {
 static void abortLogoUpload(const char* reason) {
     // 故意不 free(logoRxBuf)：见 logoRxAlloc() 上面的说明，释放会和 BLE 主机任务
     // 里的 handleLogoChunk() 抢同一块内存，释放出去的地址还会被 memcpy 进去。
+    logoRxRaw   = false;
     logoRxTotal = 0;
     logoRxGot   = 0;
     logoRxDone  = false;
@@ -3030,6 +3060,23 @@ static void abortLogoUpload(const char* reason) {
 // 二进制接收：这段是 JPEG 原始字节，里面必然有 0x00，
 // 只能按长度整段取，绝不能走 c_str()（会在第一个 0 处截断）。
 static void handleLogoChunk(const uint8_t* data, size_t len) {
+    if (logoRxRaw) {
+        // RAW 模式：电脑端已经解好 RGB565，这里就是往 logoRawBuf 里搬字节。
+        // 长度是**固定**的 WP_RAW_BYTES，边界只有一个，不存在 JPEG 那种
+        // "声明多少就收多少"的越界可能。
+        if (logoRawBuf == nullptr) return;
+        logoRxLastMs = millis();
+        size_t cap = (size_t)WP_RAW_BYTES;
+        if (logoRxGot >= cap) return;
+        size_t room = cap - logoRxGot;
+        if (len > room) len = room;
+        if (len == 0) return;
+        memcpy((uint8_t*)logoRawBuf + logoRxGot, data, len);
+        logoRxGot += (uint32_t)len;
+        if (logoRxGot >= cap) logoRxDone = true;
+        return;
+    }
+
     if (logoRxBuf == nullptr) return;
     logoRxLastMs = millis();
 
@@ -3060,6 +3107,95 @@ static void bindWallpaperSource(void) {
     wpImgDsc.header.cf          = LV_IMG_CF_TRUE_COLOR;
     wpImgDsc.data              = (const uint8_t*)wpPixels;
     wpReady = true;
+}
+
+// RAW 接收缓冲：固定 115200 字节（240*240*2），只分配一次，之后永不释放。
+//
+// 和 logoRxAlloc 的区别很关键：那块缓冲是按 **LOGO_RX_MAX(256KB)** 一次
+// 分配、容量与"这次声明多长"彻底解耦 —— 因为 JPEG 的长度是主机临时说的，
+// 万一先传过一张 2KB 的图就把容量钉死成 2KB，后来的大图会越界。
+// RAW 没有这个问题：长度**恒定**是 WP_RAW_BYTES，不存在"这次多长"。
+static uint16_t* logoRawAlloc(void) {
+    if (logoRawBuf != nullptr) return logoRawBuf;   // 常驻
+    logoRawBuf = (uint16_t*)heap_caps_malloc((size_t)WP_RAW_BYTES,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (logoRawBuf == nullptr) logoRawBuf = (uint16_t*)malloc((size_t)WP_RAW_BYTES);
+    if (logoRawBuf == nullptr) return nullptr;
+    LOG_PORT.printf("[WALLPAPER] raw buffer %u bytes\n", (unsigned)WP_RAW_BYTES);
+    return logoRawBuf;
+}
+
+// RAW 收齐 -> 拷进 wpPixels -> 落盘 -> 挂到 LVGL 图片源。
+//
+// 整条链路里**没有解码**：电脑端发来的就是成品像素，板子只搬字节。
+// 落盘格式和 JPEG 那条路完全一样（/logo.bin = 240*240*2 的 RGB565），
+// 所以开机读回那套逻辑（loadWallpaperFromDisk）一行都不用改。
+static void finishLogoRaw(void) {
+    ct_mark(CT_S_WP_DECODE);
+    logoRxDone   = false;
+    logoRxActive = false;
+    if (!logoRxRaw) return;
+    logoRxRaw = false;
+
+    if (logoRxGot < (uint32_t)WP_RAW_BYTES) {
+        abortLogoUpload("RAW 长度不匹配");
+        return;
+    }
+
+    // 拷进一块**新的** wpPixels。不能在传输过程中就地改 wpPixels ——
+    // 屏可能正在用它画壁纸，半张新半张旧的花屏比"没更新"更难看。
+    uint16_t* out = (uint16_t*)heap_caps_malloc((size_t)WP_RAW_BYTES,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out == nullptr) { abortLogoUpload("out of PSRAM"); return; }
+
+    // 分块拷贝 + 喂狗：115KB 一次性 memcpy 也就几毫秒，但分段更稳，
+    // 也让"崩在拷贝中间"这种现场能落在确定的阶段号上。
+    {
+        const uint8_t* p = (const uint8_t*)logoRawBuf;
+        uint8_t*       q = (uint8_t*)out;
+        size_t left = (size_t)WP_RAW_BYTES;
+        while (left) {
+            size_t n = left > 16384 ? 16384 : left;
+            memcpy(q, p, n);
+            p += n; q += n; left -= n;
+            ct_alive();
+        }
+    }
+    LOG_PORT.printf("[WALLPAPER] raw %u bytes received\n", (unsigned)logoRxGot);
+
+    // 落盘一份，重启后直接从 SPIFFS 读回（和 JPEG 路径同一个文件、同一种格式）。
+    File f = SPIFFS.open("/logo.bin", FILE_WRITE);
+    if (f) {
+        const uint8_t* p = (const uint8_t*)out;
+        size_t left = (size_t)WP_RAW_BYTES;
+        while (left) {
+            size_t n = left > 16384 ? 16384 : left;
+            f.write((uint8_t*)p, n);
+            p += n; left -= n;
+            ct_alive();
+        }
+        f.close();
+        LOG_PORT.printf("[WALLPAPER] /logo.bin written\n");
+    } else {
+        LOG_PORT.printf("[WALLPAPER] open /logo.bin FAILED\n");
+    }
+
+    logoRxTotal = 0;
+    logoRxGot   = 0;
+
+    // 顺序不能反：先接新图（wpImgDsc.data 才有合法地址），再释放旧图。
+    uint16_t* oldPixels = wpPixels;
+    wpPixels = out;
+    bindWallpaperSource();
+    if (oldPixels) heap_caps_free(oldPixels);
+
+    if (wp_img) {
+        lv_img_set_src(wp_img, &wpImgDsc);
+        lv_obj_invalidate(wp_img);
+    }
+
+    triggerHud("壁纸更新", "上传完成", lv_color_hex(CLR_GREEN));
+    btLinkReplyC("LOGOSTATUS", "OK:0/0");
 }
 
 // 解码收齐的 JPEG -> wpPixels -> 落盘。解码 + 写盘要几百毫秒，
@@ -10961,6 +11097,55 @@ static void handleCommand(const String& cmd) {
             triggerHud("壁纸传输", buf, lv_color_hex(CLR_AMBER));
         }
     }
+    // LOGO_RAW_START:<长度> - **解码在电脑端做**，板子只收成品像素。
+    //
+    // 这条路和上面的 LOGO_JPEG_START 是并列的两条，不是替代：
+    // 网页端继续走 JPEG（十几 KB，省流量）；命令行/自动化走这条
+    // （电脑端想怎么压都行，板子上没有 JPEG 解码器，也没有解码的崩溃面）。
+    //
+    // ⚠ 长度是**固定**的 240*240*2 = 115200，不是主机随口说的数 ——
+    //   所以这里只认这一个值，多一个字节少一个字节都拒。
+    //   （JPEG 那条之所以要一个 256KB 的常驻缓冲，就是因为长度可变。）
+    else if (cmd.startsWith("LOGO_RAW_START:")) {
+        uint32_t total = (uint32_t)cmd.substring(15).toInt();
+        LOG_PORT.printf("[WALLPAPER] RAW START, total=%lu\n", (unsigned long)total);
+
+        if (total != (uint32_t)WP_RAW_BYTES) {
+            char why[40];
+            snprintf(why, sizeof(why), "RAW 长度必须是 %u", (unsigned)WP_RAW_BYTES);
+            abortLogoUpload(why);
+        } else if (logoRawAlloc() == nullptr) {
+            abortLogoUpload("RAW 缓冲内存不足");
+        } else {
+            ct_mark(CT_S_WP_RX);      // 现场：正在收 RAW 像素
+            logoRxRaw   = true;
+            logoRxTotal = total;
+            logoRxGot   = 0;
+            logoRxDone  = false;
+            logoRxActive = true;
+            logoRxLastMs = millis();
+            // ⚠ 这里**故意不调 triggerHud**：HUD 是在 handleCommand 的调用栈里
+            //   建 LVGL 对象的，那条路历史上出过事（见 setScreensaverMode 附近
+            //   "cfgStoreRemap 是最后一条漏网的"那段注释）。成功之后在
+            //   finishLogoRaw() 里再提示，画面上一样能看到。
+        }
+    }
+    // LOGO_RAW_FLUSH - RAW 收尾。和 LOGO_JPEG_FLUSH 一样必须显式发：
+    // 少了它，固件会"收满就自己收尾"，而在途的字节会被当成文本命令。
+    else if (cmd == "LOGO_RAW_FLUSH") {
+        LOG_PORT.printf("[WALLPAPER] RAW FLUSH got=%lu total=%lu\n",
+                        (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+        if (!logoRxRaw) {
+            // 没在接收就当空操作
+        } else if (logoRxGot >= logoRxTotal) {
+            logoRxDone = true;          // loop() 里真正去收尾
+        } else {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "数据不全 %lu/%lu",
+                     (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+            abortLogoUpload(buf);
+        }
+    }
     // BOOTDL —— 重启进下载模式（自己给自己留一条烧录的路）。
     //
     // ⚠⚠ 为什么必须有它：
@@ -11010,25 +11195,37 @@ static void handleCommand(const String& cmd) {
     // 冲进解码，此时 logoRxActive 已经置 false，那几包在途的 JPEG 字节就会被
     // 当成文本命令灌进命令队列。显式收尾把"发完"这件事变成一个双方都确认的动作。
     else if (cmd == "LOGO_JPEG_FLUSH") {
-        LOG_PORT.printf("[WALLPAPER] FLUSH got=%lu total=%lu\n",
-                        (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
-        if (!logoRxActive) {
-            // 没在接收就当空操作，网页会接着轮 LOGO_STATUS 拿到真实状态
-        } else if (logoRxGot >= logoRxTotal) {
-            logoRxDone = true;          // loop() 里真正去解码
+        if (logoRxRaw) {
+            // 当前是 RAW 模式：JPEG 的收尾命令不认，但**也不 abort** ——
+            // 已经收到的 RAW 像素还在缓冲里，主机补发 LOGO_RAW_FLUSH 就能收尾。
+            LOG_PORT.println("[WALLPAPER] 忽略 JPEG FLUSH：当前是 RAW 模式");
         } else {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "数据不全 %lu/%lu",
-                     (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
-            abortLogoUpload(buf);
+            LOG_PORT.printf("[WALLPAPER] FLUSH got=%lu total=%lu\n",
+                            (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+            if (!logoRxActive) {
+                // 没在接收就当空操作，网页会接着轮 LOGO_STATUS 拿到真实状态
+            } else if (logoRxGot >= logoRxTotal) {
+                logoRxDone = true;          // loop() 里真正去解码
+            } else {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "数据不全 %lu/%lu",
+                         (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
+                abortLogoUpload(buf);
+            }
         }
     }
     // LOGO_STATUS - 网页轮询真实结果。
     // 网页以前是"发完字节就 alert 上传成功"，那是**假成功**：BLE 写成功只说明
     // 数据交给蓝牙了，不代表键盘解出来、落盘了。现在键盘主动回报状态。
     else if (cmd == "LOGO_STATUS") {
-        const char* state = logoRxActive ? (logoRxDone ? "READY" : "RECV")
-                                         : (wpReady ? "OK" : "IDLE");
+        // RAW 模式单独用一个前缀（"RAW:"），主机侧靠它区分"我在收哪条路的数据"。
+        // 电脑端轮询这个状态来确认固件已经进入接收模式 —— 这是跨任务的握手点：
+        // LOGO_RAW_START 是文本命令（loop 任务处理），而二进制分片走的是
+        // 蓝牙协议栈任务的 probe。第一片二进制抢在 START 前面到的话，
+        // 那时候固件还没进接收模式，这一片就会被当成文本命令吞掉。
+        const char* state;
+        if (logoRxActive) state = logoRxRaw ? "RAW" : (logoRxDone ? "READY" : "RECV");
+        else              state = wpReady ? "OK" : "IDLE";
         btLinkReplyf("LOGOSTATUS", "%s:%lu/%lu", state,
                      (unsigned long)logoRxGot, (unsigned long)logoRxTotal);
         // 同 REMAPREAD：不要把这条响应原样再灌一遍 LOG_PORT。
@@ -12890,10 +13087,16 @@ void loop() {
                (unsigned)cfgRxTotal, (unsigned)cfgRxLen);
     }
 
-    // 壁纸：收齐了就解码（几百毫秒，放主任务不占 BLE 主机任务）。
+    // 壁纸：收齐了就收尾（几百毫秒，放主任务不占 BLE 主机任务）。
     // 传一半断线（关网页、走出范围）必须超时放掉缓冲，否则后面所有文本
     // 指令都会被当成 JPEG 数据吃掉，键盘直接"失联"。
-    if (logoRxDone) finishLogoUpload();
+    //
+    // RAW 和 JPEG 两条路在这里分流：RAW 的像素在电脑端已经解好了，
+    // 板子只搬字节，不用 JPEGDEC。
+    if (logoRxDone) {
+        if (logoRxRaw) finishLogoRaw();
+        else           finishLogoUpload();
+    }
     if (logoRxActive && !logoRxDone && millis() - logoRxLastMs > LOGO_RX_TIMEOUT_MS) {
         abortLogoUpload("传输中断");
     }

@@ -719,6 +719,44 @@ python check_font.py  # 确认 MISSING 为 0
   不用 AI 底图：1024 的图缩到 240，辉光会被 JPEG q95 + RGB565 吃掉，只剩一团脏灰。
   底部 72px 刻意留空给信息条，脚本跑完会自检那块区域一个非黑像素都没有。
 
+### 壁纸上传：两条路（解码在电脑端 or 在板子上）
+
+| | 网页端 `s3-setting.html` | 命令行 `tools/send_wallpaper_raw.py` |
+|---|---|---|
+| 线上格式 | `LOGO_JPEG_START:<n>` + JPEG 字节 | `LOGO_RAW_START:115200` + RGB565 字节 |
+| 解码在哪 | **板子上**（JPEGDEC） | **电脑端**（PIL） |
+| 字节数 | 约 14 KB | 115200 字节（240×240×2） |
+| 板子要不要 JPEGDEC | 要 | **不要** |
+
+**RAW 那条路是"解码在电脑端做、板子只收 + 展示"** —— 和传 M1 宏数据是同一套路：
+这边发什么，那边就显示什么。板子上只搬字节，没有解码器，也就没有解码那一类崩溃面
+（JPEGDEC 那个对象 12.6KB 静态占着内部 DRAM，而且解析时要在输入缓冲里大量跳转，
+输入缓冲一旦在 PSRAM 上就不稳 —— 之前"上传壁纸必崩"就踩在这上面）。
+
+RAW 的长度是**固定**的 `240*240*2 = 115200`，不是主机随口说的数，所以板子上
+不存在"声明多少就收多少"的越界可能（JPEG 那条之所以需要一个 256KB 的常驻缓冲，
+就是因为长度可变）。落盘格式两者完全一样：`/logo.bin` = 240×240 的 RGB565，
+所以开机读回那套逻辑（`loadWallpaperFromDisk`）一行都不用改。
+
+**字节序是硬约定**：`LV_COLOR_DEPTH=16` 且**没有**开 `LV_COLOR_16_SWAP`
+⇒ RGB565 就是 ESP32 上的 native 小端。电脑端按小端打包，固件里 JPEGDEC 用的
+`RGB565_LITTLE_ENDIAN` 落在内存里也是这个样子，两条路写进 `wpPixels` 的字节一致。
+`check_consistency.py` 会把这条约定一起校验。
+
+```bash
+# 传新壁纸（自动完成 START → 握手 → 分片 → FLUSH → 等落盘 → 切壁纸主屏）
+cd lvgl_s3 && /usr/bin/python3 tools/send_wallpaper_raw.py
+
+# 顺便导出"解回来"的 PNG 对照，肉眼核对打包对不对
+/usr/bin/python3 tools/send_wallpaper_raw.py --verify
+```
+
+⚠ **握手不能省**：`LOGO_RAW_START` 是文本命令，在 loop 任务里处理；而二进制分片
+走的是蓝牙协议栈任务的 probe（判据是 `logoRxActive`）。BLE 的 ATT 写响应是
+协议栈**收到包就回**的，不代表 loop 任务已经处理完 —— 第一片二进制完全可能
+抢在 START 前面到，那一片会被当成文本命令吞掉。所以发第一片之前必须轮询
+`LOGO_STATUS`，等固件回报 `RAW:0/115200`。
+
 ## 文件系统与分区（别踩）
 
 - 壁纸 `/logo.bin` 和 ME 文本 `/me_hex.txt` 存在 **SPIFFS** 上，**不是 FFat**。
