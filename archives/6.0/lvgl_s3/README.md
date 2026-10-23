@@ -2,6 +2,16 @@
 
 基于 ESP32-S3-N16R8 + ST7789 240x240 + LVGL 8.4.x
 
+## ⚠ 烧给用户之前先看这一条
+
+**给用户的板子一律烧产品环境（`esp32-s3-devkitc-1`），绝不能烧 `_debug`。**
+
+`_debug` 的 USB 上多挂了一个 CDC 复合设备，经 KVM 接入时会把 KVM 内部的
+USB Hub 芯片搞挂 —— **鼠标会跟着一起不能用**，键盘自己也输入不进去
+（2026-10-23 实战复现，换产品固件后正常）。
+
+👉 完整说明、日志原文和验证清单见 **[`docs/KVM接入-USB形态与固件选择.md`](docs/KVM接入-USB形态与固件选择.md)**
+
 ## 风格：简约纯黑
 
 - 深黑背景 #000000
@@ -428,6 +438,49 @@ S3 在 3 秒那一刻才收到 `BTN:CPG_HOLD`，3 秒之前它对「键还按着
 ```bash
 pio run -t upload
 ```
+
+### USB 形态：产品固件 vs _debug 固件（KVM 兼容性的关键）
+
+> 📄 **完整说明见 [`docs/KVM接入-USB形态与固件选择.md`](docs/KVM接入-USB形态与固件选择.md)**
+> （含 macOS 系统日志原文、崩溃链逐条解读、验证清单）
+
+一句话：**给用户烧产品环境**。`_debug` 的 USB 上多挂一个 CDC 复合设备，
+经 KVM 接入时会把 KVM 内部的 VIA Labs USB Hub 芯片搞挂，
+**鼠标跟着一起不能用**，键盘也输入不进去（2026-10-23 实战复现）。
+
+| | 产品 `esp32-s3-devkitc-1` | `_debug` |
+|---|---|---|
+| `ARDUINO_USB_MODE` | 1 | 0 |
+| USB 形态 | **纯 HID** | **HID + CDC 复合设备** |
+| macOS 认成 | `Espressif ESP32-S3-DevKitC-1-N8`（HID） | `AppleUSBCDCCompositeDevice` |
+| `/dev/cu.usbmodem*` | 无 | 有（可抓日志） |
+| 键盘 HID | ✅ | ✅ |
+| **经 KVM 接入** | ✅ **正常** | ❌ **拖垮同 Hub 上的鼠标** |
+
+⚠ **HID 本身不受 `ARDUINO_USB_MODE` 影响**：`ESPUSB::begin()` 无论哪个模式都会调
+`tinyusb_init()`（`cores/esp32/USB.cpp`），HID 接口由 `USBHID.cpp:285` 单独
+`tinyusb_enable_interface()` 注册。所以产品固件照样是能用的 USB 键盘。
+
+不烧录就能查当前固件的 USB 形态：
+
+```bash
+strings .pio/build/esp32-s3-devkitc-1/firmware.bin | grep -E "TinyUSB (CDC|HID)"
+# 有 TinyUSB CDC → 是 debug 形态，经 KVM 会出事
+```
+
+⚠ **别把因果搞反**：这不是固件的 bug，是「KVM 的 Hub 芯片 + CDC 复合设备」
+这个组合的兼容性问题。本轮（`a031f4d`..HEAD`）**根本没动过 USB 配置** ——
+`platformio.ini` 唯一的改动是 `CORE_DEBUG_LEVEL 5→3`。
+
+### 烧完固件退不出 ROM 下载模式 ⇒ 必须人工拔插
+
+`esptool run` 之后芯片**仍然停在** ROM 下载模式（macOS 上还是
+`USB JTAG_serial debug unit`，BLE 不广播）。这是 native USB 口的硬限制
+（USB 会话在复位那一瞬间把 IO0 压低），不是脚本没做对。
+
+⇒ **烧完必须拔掉 USB 线等 2 秒再插回去**，芯片才会走正常上电复位进 app 模式。
+`BOOTAPP`（BLE 命令）是另一条路：它把 GPIO0 拉高再 `esp_restart()`，
+可以从下载模式拽回应用模式。
 
 ## 改完界面文案后必须重生成字体
 
