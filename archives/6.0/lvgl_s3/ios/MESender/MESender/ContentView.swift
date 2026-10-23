@@ -134,19 +134,44 @@ struct ContentView: View {
 
     private var textSection: some View {
         Section {
-            TextEditor(text: $model.text)
-                .frame(minHeight: 130)
-                .focused($editorFocused)
-                .font(.body)
-                .overlay(alignment: .topLeading) {
-                    if model.text.isEmpty {
-                        Text("要发给电脑的文字…（支持中文）")
-                            .foregroundStyle(.tertiary)
-                            .padding(.top, 8)
-                            .padding(.leading, 5)
-                            .allowsHitTesting(false)
+            // 清空按钮浮在输入框**右上角**。
+            //
+            // 为什么放这儿而不是别的地方：
+            //   · 视线落点 —— 刚写完一段话，眼睛就在这一带，不用找按钮
+            //   · 不占纵向空间（这个 Form 已经挺长了）
+            //   · 和 iOS 的通用心智一致（备忘录/微信/聊天框的"×"都在右上角）
+            //   · 只在**有内容时**才出现，空的时候不添乱
+            ZStack(alignment: .topTrailing) {
+                TextEditor(text: $model.text)
+                    .frame(minHeight: 130)
+                    .focused($editorFocused)
+                    .font(.body)
+                    .overlay(alignment: .topLeading) {
+                        if model.text.isEmpty {
+                            Text("要发给电脑的文字…（支持中文）")
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                                .allowsHitTesting(false)
+                        }
                     }
+
+                if !model.text.isEmpty {
+                    Button {
+                        model.text = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 16))
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.secondary, Color(.secondarySystemGroupedBackground))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 6)
+                    .padding(.trailing, 10)
+                    .disabled(model.isSending)
+                    .accessibilityLabel("清空文本")
                 }
+            }
         } header: {
             Text("要发送的文本")
         } footer: {
