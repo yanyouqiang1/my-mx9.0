@@ -3081,6 +3081,16 @@ static void handleLogoChunk(const uint8_t* data, size_t len) {
         if (len == 0) return;
         memcpy((uint8_t*)logoRawBuf + logoRxGot, data, len);
         logoRxGot += (uint32_t)len;
+        // 每 64 片报一次**内部堆**的剩余量。
+        // 为什么盯这个：BLE 库每收一个写事件都要 new 一份 std::string，
+        // 万一那里漏了，表现就是"传到第 N 片突然 panic"——
+        // 内部堆被吃光和栈溢出在症状上很像，但修法完全不同。
+        // 崩在第 300 片左右（2026-10-23 实测，两次都在那儿），
+        // 这个数能直接证伪/证实"堆被吃光"这条。
+        if ((logoRxGot % (64 * 180)) < len) {
+            LOG_PORT.printf("[WALLPAPER] 收到 %u 字节，内部堆剩 %u 字节\n",
+                            (unsigned)logoRxGot, (unsigned)ESP.getFreeHeap());
+        }
         if (logoRxGot >= cap) logoRxDone = true;
         return;
     }
@@ -10870,6 +10880,21 @@ static void handleCommand(const String& cmd) {
         btLinkSendC("LOG", "0", "CLEARED");
         LOG_PORT.println("[LOG] buffer cleared");
     }
+    else if (cmd == "PANIC") {
+        // 直接从 RTC 慢存把"上次 panic 的现场"回给主机。
+        //
+        // 为什么不能只靠开机日志：那段文字是开机时打进 BLE 日志环缓冲的，
+        // 环只有 8KB，跑一会儿就被新日志顶掉了 —— 到时候"现场还在芯片里，
+        // 但已经读不出来"。
+        // 这个命令直接读慢存，**什么时候问都问得到**。
+        if (!panicTraceHas()) {
+            btLinkSendC("PANIC", "0", "NONE");
+            LOG_PORT.println("[PANIC] 没有留存现场");
+        } else {
+            btLinkSendC("PANIC", "0", panicTraceText());
+            LOG_PORT.printf("[PANIC] 回传现场 %u 字节\n", (unsigned)panicTraceLen());
+        }
+    }
     else if (cmd == "LOG:dump") {
         // 这里**不做任何发送**，只是开一条流并记下要回拉多少字节。
         // 环形缓冲有 8KB，按 20 字节一片就是 400+ 片，一次性同步推完等于把
@@ -12759,16 +12784,6 @@ void setup() {
     //   并在 panic 钩子里把环的尾巴抄进 RTC 慢存 —— 下次开机直接打印。
     panicTraceInit();
     LOG_PORT.println("[LOG] ROM 输出已接管（进内存环），panic 现场会存进 RTC 慢存");
-
-    // 上次 panic 的现场：这次开机先把它打出来。
-    // ⚠ 只报一次（读完就清），免得每次开机都刷一屏。
-    if (panicTraceHas()) {
-        LOG_PORT.printf("[PANIC] ===== 上次 panic 现场（%u 字节）=====\n",
-                        (unsigned)panicTraceLen());
-        LOG_PORT.println(panicTraceText());
-        LOG_PORT.println("[PANIC] ==========================================");
-        panicTraceClear();
-    }
 #endif
 
     // 早分配 PSRAM 日志环形缓冲:越早越好,从这里开始的所有 LOG_PORT.printf
@@ -12792,6 +12807,27 @@ void setup() {
             LOG_PORT.println("[LOG] ps_malloc failed, BLE log disabled");
         }
     }
+
+    // ⚠⚠ **上次 panic 的现场必须打在这里，不能更早**：
+    //   上面那个环形缓冲是 BLE 日志（LOG:dump）唯一的存放处，
+    //   在它分配之前打的日志 LOG:dump 根本拉不到 ——
+    //   于是"崩溃现场明明打印了却看不见"，白折腾一轮。
+    //   （2026-10-23 踩过：黑匣子第一次就把这段放在缓冲分配之前，
+    //     结果现场只进了 UART0 和 CDC，开机日志里一个字都没有。）
+    if (panicTraceHas()) {
+        LOG_PORT.printf("[PANIC] ===== 上次 panic 现场（%u 字节）=====\n",
+                        (unsigned)panicTraceLen());
+        LOG_PORT.println(panicTraceText());
+        LOG_PORT.println("[PANIC] ==========================================");
+        panicTraceClear();
+    }
+
+    // 内部 DRAM 的剩余量也报一下：BLE 库每个写事件都要 new 一份 std::string，
+    // 万一那里漏了，现象就是"传到第 N 片突然 panic"—— 内部堆耗尽也会这么表现。
+    LOG_PORT.printf("[MEM] 内部堆剩 %u 字节（最小 %u），PSRAM 剩 %u 字节\n",
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMinFreeHeap(),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     setenv("TZ", "CST-8", 1);
     tzset();

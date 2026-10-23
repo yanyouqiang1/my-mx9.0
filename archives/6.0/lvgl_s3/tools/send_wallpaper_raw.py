@@ -124,14 +124,18 @@ async def main():
     chunk_size = SLOW_CHUNK if slow else CHUNK
     gap_s = SLOW_GAP_S if slow else CHUNK_GAP_S
     # --chunk=N / --gap=MS：手动指定
-    probe_every = PROBE_EVERY
-    if "--no-probe" in sys.argv:
-        probe_every = PROBE_EVERY_OFF
+    # --addr=XXXX：指定目标设备（两台板子同名时用）
+    want_addr = None
     for a in sys.argv[1:]:
         if a.startswith("--chunk="):
             chunk_size = int(a.split("=", 1)[1])
         if a.startswith("--gap="):
             gap_s = int(a.split("=", 1)[1]) / 1000.0
+        if a.startswith("--addr="):
+            want_addr = a.split("=", 1)[1].strip().upper()
+    probe_every = PROBE_EVERY
+    if "--no-probe" in sys.argv:
+        probe_every = PROBE_EVERY_OFF
     img_path = args[0] if args else DEFAULT_IMG
     if not os.path.exists(img_path):
         print("✗ 图片不存在：%s" % img_path)
@@ -152,7 +156,18 @@ async def main():
         print("    解回来的对照图：%s" % os.path.abspath(vp))
 
     cdc = CdcLog()
-    if no_cdc:
+    # --cdc-port=XXX：指定 CDC 口。这台机器上有两块板，
+    #   A 板（native USB，/dev/cu.usbmodemACA704E101E02）和
+    #   B 板的 CH343（/dev/cu.usbmodem5C4C2142561）——
+    #   自动 glob 会按字典序挑中 CH343，panic 回溯就抓不到了。
+    cdc_port = None
+    for a in sys.argv[1:]:
+        if a.startswith("--cdc-port="):
+            cdc_port = a.split("=", 1)[1]
+    if cdc_port:
+        cdc.start(port=cdc_port)
+        print("    CDC: %s (指定)" % cdc.port)
+    elif no_cdc:
         print("    CDC: 已按 --no-cdc 跳过（固件日志抓不到）")
     elif cdc.start():
         print("    CDC: %s" % cdc.port)
@@ -165,6 +180,13 @@ async def main():
         print("✗ 没扫到键盘")
         cdc.stop()
         return 1
+    if want_addr:
+        hit = [a for a in addrs if a.upper().startswith(want_addr)]
+        if not hit:
+            print("✗ 没找到地址以 %s 开头的设备（扫到：%s）" % (want_addr, addrs))
+            cdc.stop()
+            return 1
+        addrs = hit
     addr = addrs[0]
     print("  %s" % addr)
 

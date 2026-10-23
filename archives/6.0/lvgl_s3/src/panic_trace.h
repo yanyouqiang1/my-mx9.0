@@ -67,6 +67,10 @@ static void IRAM_ATTR romPutc(char c) {
 
 // 把环里的新内容搬进 USB CDC。**整个固件里只有这一处写 TinyUSB。**
 // 一次最多搬 256 字节，别把日志镜像任务堵死。
+//
+// ⚠ 同时也往 UART0 抄一份：USB-TTL（CH343）接哪块板，那块板的 UART0
+//   就实时看到 panic 的回溯 —— 不依赖 USB CDC，也就不依赖主机端有没有
+//   正确地打开 CDC 口。
 static void romRingDrain(void) {
     static uint32_t drained = 0;
     uint32_t len = s_romLen;
@@ -76,6 +80,7 @@ static void romRingDrain(void) {
         uint32_t n = len - drained;
         if (n > ROMRING_CAP - start) n = ROMRING_CAP - start;
         if (n > 256) n = 256;
+        Serial0.write((const uint8_t*)(s_romRing + start), n);
         Serial.write((const uint8_t*)(s_romRing + start), n);
         drained += n;
     }

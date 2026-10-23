@@ -61,13 +61,22 @@ class CdcLog:
         self._thread = None
         self.port = None
 
-    def start(self):
-        cands = []
-        for pat in ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*"):
-            cands += glob.glob(pat)
-        if not cands:
-            return False
-        self.port = cands[0]
+    def start(self, port=None):
+        """打开 CDC 口。
+
+        ⚠ port 可以显式指定：这台机器上同时插着 A 板（native USB）和
+        B 板的 CH343（USB-TTL），自动 glob 会按字典序挑中 CH343 ——
+        而我们要的 panic 回溯在 **A 板** 的 native USB CDC 上。
+        """
+        if port:
+            self.port = port
+        else:
+            cands = []
+            for pat in ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*"):
+                cands += glob.glob(pat)
+            if not cands:
+                return False
+            self.port = cands[0]
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
         time.sleep(0.6)   # 等端口真的打开
