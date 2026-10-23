@@ -34,7 +34,7 @@ import sys
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from blekit import CHAR_UUID, CdcLog, Link, find_keyboard, wait_state  # noqa: E402
+from blekit import CHAR_UUID, CdcLog, Link, find_keyboard, parse_status, wait_state  # noqa: E402
 
 from bleak import BleakClient  # noqa: E402
 
@@ -172,15 +172,16 @@ async def main():
                 # 每 PROBE_EVERY 片问一次固件"你收到多少了"：
                 # 丢片在这里就能看出来，而不是等最后一句"长度不匹配"才发现。
                 if (n + 1) % PROBE_EVERY == 0:
-                    st = await wait_state(link, "RAW", timeout=2.0)
+                    st = await wait_state(link, "RAW", timeout=2.0, verbose=False)
                     if st is None:
                         print("\n  ⚠ 第 %d 片之后设备没回应了" % (n + 1))
                         failed = True
                         break
-                    got = int(st.split("/")[1].split("/")[0])
-                    print("    %d/%d 字节（固件确认收到 %d）" % (sent, len(raw), got), end="\r",
-                          flush=True)
-                    if got < sent:
+                    parsed = parse_status("LOGOSTATUS:" + st)
+                    got = parsed[1] if parsed else -1
+                    print("    %d/%d 字节（固件确认收到 %d）" % (sent, len(raw), got),
+                          end="\r", flush=True)
+                    if 0 <= got < sent:
                         print("\n  ⚠ 固件只收到 %d 字节，本地发了 %d —— 丢片了" % (got, sent))
                         failed = True
                         break
@@ -214,7 +215,8 @@ async def main():
                     for nt in link.dump_notes():
                         if "LOGOSTATUS" in nt:
                             print("  ← %s" % nt)
-                            if ":OK" in nt:
+                            parsed = parse_status(nt)
+                            if parsed and parsed[0] == "OK":
                                 ok = True
                     if ok:
                         break

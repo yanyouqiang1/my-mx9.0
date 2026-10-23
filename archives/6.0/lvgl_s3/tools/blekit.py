@@ -11,6 +11,7 @@ BLE 工具的公共部分：认人、发命令、收通知、CDC 抓固件日志
 
 import asyncio
 import glob
+import re
 import threading
 import time
 
@@ -19,6 +20,26 @@ from bleak import BleakClient, BleakScanner
 SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 DEV_NAME = "yyq2 号"
+
+# 状态回包的线上格式： bt_link 的规则是 `VERB:KEY:<正文>`，
+# 所以 LOGOSTATUS 的回包长这样：
+#     LOGOSTATUS:<请求号>:RAW:0/115200
+# 请求号是 bt_link 自动加的（主机没带 #123 时退化成自增 key），
+# **每次都不一样**。所以解析不能按冒号切死位置 —— 必须用正则把
+# 状态词和后面的 "已收/总数" 抠出来。
+#
+# ⚠ 踩过的坑：按 split(":", 1) 取第二段会拿到**请求号**，
+#   于是状态永远是 "<数字>"，握手判定永远不成立 —— 表现是
+#   "固件明明回了 RAW:0/115200，脚本却说没进接收模式"。
+STATUS_RE = re.compile(r":(RAW|RECV|READY|OK|IDLE):(\d+)/(\d+)\s*$")
+
+
+def parse_status(line):
+    """把一条 LOGOSTATUS 回包解析成 (状态, 已收, 总数)。认不出来就返回 None。"""
+    m = STATUS_RE.search(line.strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
 
 
 # ---------------------------------------------------------------- CDC 抓日志
@@ -175,7 +196,7 @@ class Link:
         return list(self.notes)
 
 
-async def wait_state(link, prefix, want_total=None, timeout=10.0):
+async def wait_state(link, prefix, want_total=None, timeout=10.0, verbose=True):
     """轮询 LOGO_STATUS，等固件回报指定状态。
 
     这是**跨任务握手的唯一可靠办法**：
@@ -190,12 +211,15 @@ async def wait_state(link, prefix, want_total=None, timeout=10.0):
     while time.time() - t0 < timeout:
         notes = await link.cmd("LOGO_STATUS", wait=0.35)
         for n in notes:
-            if n.startswith("LOGOSTATUS:"):
-                body = n.split(":", 1)[1]
-                last = body
-                state = body.split(":")[0]
-                if state == prefix and (want_total is None or body.endswith("/%d" % want_total)):
-                    return body
+            parsed = parse_status(n)
+            if parsed is None:
+                continue
+            state, got, total = parsed
+            last = "%s:%d/%d" % (state, got, total)
+            if verbose:
+                print("    握手 LOGO_STATUS → %s" % last)
+            if state == prefix and (want_total is None or total == want_total):
+                return last
         if not link.alive:
             return None
     return None

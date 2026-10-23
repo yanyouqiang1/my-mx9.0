@@ -16,6 +16,7 @@
 #include <Adafruit_MCP23X17.h>
 #include <Preferences.h>
 #include <driver/timer.h>
+#include <driver/rtc_io.h>   // rtc_gpio_hold：深睡期间按住 BOOT 脚（BOOTDL 用）
 #include <esp_task_wdt.h>   // 只为了 setup() 里那三行"拆看门狗"，别处不再碰它
 #include <SPIFFS.h>
 #include <JPEGDEC.h>
@@ -3109,6 +3110,144 @@ static void bindWallpaperSource(void) {
     wpReady = true;
 }
 
+// ===========================
+// SPIFFS 上的壁纸存储：分片
+// ===========================
+//
+// ⚠⚠⚠ **为什么必须分片** ⚠⚠⚠
+//
+// SPIFFS 的硬限制是「**一个文件不能跨越一个 block**」。
+// Arduino 用的是 ESP-IDF 的 VFS SPIFFS，配置是
+//     CONFIG_SPIFFS_PAGE_SIZE = 256
+//     log_block_size = 4096（默认）
+// ⇒ **单个文件最大 4096 字节**。
+//
+// 而一张 240x240 的壁纸是 240*240*2 = **115200 字节** —— 差了 28 倍。
+// 直接往 /logo.bin 里写 115200 字节是**注定写不进去**的：
+// spiffs_write 会返回 SPIFFS_ERR_FULL，写到 4096 就卡住。
+// 这就是「壁纸重启就丢」的真正原因（跟分区表选 FFat 还是 SPIFFS 无关 ——
+// 就算 SPIFFS 挂上了，单文件也装不下）。
+//
+// 而且现象比"存不进去"更糟：写一半失败之后，**每次开机都会再写一次**
+// （elog 落盘、壁纸回写……），于是变成 boot loop —— 崩溃 → 重启 → 又崩。
+//
+// 所以改成**分片存储**：
+//   /logo000.bin, /logo001.bin, … 每片 ≤ 2048 字节（比 4096 上限还保守一半）
+//   /logo.ok 里写着片数 —— **它存在才说明整张图写完了**
+//   （写一半崩掉时没有 .ok，重启后不会把半张图当成有效的）
+//
+// 代价：开机读回要开 57 次文件（几百毫秒，换来"开机时画对图"）。
+#define LOGO_CHUNK_SIZE   2048
+#define LOGO_CHUNK_MAX    256
+#define LOGO_OK_FILE      "/logo.ok"
+
+// 写整张图。返回 false = 没写成功（调用方必须如实报错，不能假装成功）。
+static bool writeWallpaperChunked(const uint8_t* data, size_t total) {
+    size_t nChunks = (total + LOGO_CHUNK_SIZE - 1) / LOGO_CHUNK_SIZE;
+    if (nChunks == 0 || nChunks > LOGO_CHUNK_MAX) return false;
+
+    // 先把"有效"标记删掉：写一半崩了的话，重启后不会把半截图当成完整图。
+    if (SPIFFS.exists(LOGO_OK_FILE)) SPIFFS.remove(LOGO_OK_FILE);
+
+    for (size_t i = 0; i < nChunks; i++) {
+        char path[24];
+        snprintf(path, sizeof(path), "/logo%03u.bin", (unsigned)i);
+        size_t off  = i * LOGO_CHUNK_SIZE;
+        size_t want = (total - off < LOGO_CHUNK_SIZE) ? (total - off) : LOGO_CHUNK_SIZE;
+
+        File f = SPIFFS.open(path, FILE_WRITE);
+        if (!f) {
+            LOG_PORT.printf("[WALLPAPER] open %s FAILED\n", path);
+            return false;
+        }
+        size_t w = f.write(data + off, want);
+        f.close();
+        if (w != want) {
+            // ⚠ 写不进去 —— 这就是 SPIFFS 单文件上限在咬人。
+            //   如实报告实际写进去多少，别装作写成功了。
+            LOG_PORT.printf("[WALLPAPER] write %s: %u/%u 字节（写到这写不下了）\n",
+                            path, (unsigned)w, (unsigned)want);
+            SPIFFS.remove(path);
+            return false;
+        }
+        ct_alive();
+    }
+
+    // 全写完了才落"有效"标记
+    File ok = SPIFFS.open(LOGO_OK_FILE, FILE_WRITE);
+    if (!ok) { LOG_PORT.println("[WALLPAPER] open .ok FAILED"); return false; }
+    char num[16];
+    int n = snprintf(num, sizeof(num), "%u\n", (unsigned)nChunks);
+    ok.write((const uint8_t*)num, n);
+    ok.close();
+    LOG_PORT.printf("[WALLPAPER] stored: %u 片 × %u 字节\n",
+                    (unsigned)nChunks, (unsigned)LOGO_CHUNK_SIZE);
+    return true;
+}
+
+// 读回整张图。没有 .ok 标记就当没有壁纸（宁可空着，不要半张图）。
+static bool readWallpaperChunked(uint8_t* data, size_t total) {
+    if (!SPIFFS.exists(LOGO_OK_FILE)) return false;
+
+    File ok = SPIFFS.open(LOGO_OK_FILE, FILE_READ);
+    if (!ok) return false;
+    char num[16];
+    size_t n = ok.readBytesUntil('\n', num, sizeof(num) - 1);
+    ok.close();
+    if (n == 0) return false;
+    num[n] = '\0';
+    unsigned nChunks = (unsigned)atoi(num);
+    if (nChunks == 0 || nChunks > LOGO_CHUNK_MAX) return false;
+    if ((size_t)nChunks * LOGO_CHUNK_SIZE < total) return false;   // 片数不够
+
+    for (unsigned i = 0; i < nChunks; i++) {
+        char path[24];
+        snprintf(path, sizeof(path), "/logo%03u.bin", i);
+        File f = SPIFFS.open(path, FILE_READ);
+        if (!f) return false;
+        size_t off  = (size_t)i * LOGO_CHUNK_SIZE;
+        size_t want = (total - off < LOGO_CHUNK_SIZE) ? (total - off) : LOGO_CHUNK_SIZE;
+        size_t rd = f.read(data + off, want);
+        f.close();
+        if (rd != want) return false;
+        ct_alive();
+    }
+    return true;
+}
+
+// 开机自检：探一下 SPIFFS 的单文件上限到底是多少。
+//
+// 为什么要探：这个上限**不在代码里**，是 ESP-IDF 的编译期配置 +
+// 文件系统格式决定的，写代码时很容易想当然地以为"115KB 也能写"。
+// 探一次（写 8KB 读回来）就一清二楚，比猜强。
+// 代价：开机多几十毫秒 + 一次 8KB 的 flash 擦写（flash 能擦十万次，可忽略）。
+static void probeSpiffsLimit(void) {
+    // ⚠ 只写 2048 字节 —— 和壁纸分片一样大，**确定在上限之内**。
+    //   这个探测的价值是"确认 2048 字节能写进去"（分片方案的前提）。
+    //   刻意不去写更大的量：万一"写超限"本身就会触发 SPIFFS 内部 assert，
+    //   那这个探测就会把设备推进 boot loop —— 为了一个诊断把设备弄坏，
+    //   不值。真正的上限由 writeWallpaperChunked 的逐片写入量报出来。
+    static const size_t PROBE = 2048;
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(PROBE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == nullptr) buf = (uint8_t*)malloc(PROBE);
+    if (buf == nullptr) { LOG_PORT.println("[SPIFFS] probe: 内存不足"); return; }
+    memset(buf, 0xA5, PROBE);
+
+    File f = SPIFFS.open("/probe.bin", FILE_WRITE);
+    if (!f) { LOG_PORT.println("[SPIFFS] probe: open FAILED"); free(buf); return; }
+    size_t w = f.write(buf, PROBE);
+    f.close();
+
+    size_t back = 0;
+    File r = SPIFFS.open("/probe.bin", FILE_READ);
+    if (r) { back = r.read(buf, PROBE); r.close(); }
+    SPIFFS.remove("/probe.bin");
+    free(buf);
+
+    LOG_PORT.printf("[SPIFFS] 写 %u 字节 → 实际写入 %u，读回 %u\n",
+                    (unsigned)PROBE, (unsigned)w, (unsigned)back);
+}
+
 // RAW 接收缓冲：固定 115200 字节（240*240*2），只分配一次，之后永不释放。
 //
 // 和 logoRxAlloc 的区别很关键：那块缓冲是按 **LOGO_RX_MAX(256KB)** 一次
@@ -3163,27 +3302,20 @@ static void finishLogoRaw(void) {
     }
     LOG_PORT.printf("[WALLPAPER] raw %u bytes received\n", (unsigned)logoRxGot);
 
-    // 落盘一份，重启后直接从 SPIFFS 读回（和 JPEG 路径同一个文件、同一种格式）。
-    File f = SPIFFS.open("/logo.bin", FILE_WRITE);
-    if (f) {
-        const uint8_t* p = (const uint8_t*)out;
-        size_t left = (size_t)WP_RAW_BYTES;
-        while (left) {
-            size_t n = left > 16384 ? 16384 : left;
-            f.write((uint8_t*)p, n);
-            p += n; left -= n;
-            ct_alive();
-        }
-        f.close();
-        LOG_PORT.printf("[WALLPAPER] /logo.bin written\n");
-    } else {
-        LOG_PORT.printf("[WALLPAPER] open /logo.bin FAILED\n");
-    }
-
     logoRxTotal = 0;
     logoRxGot   = 0;
 
-    // 顺序不能反：先接新图（wpImgDsc.data 才有合法地址），再释放旧图。
+    // ⚠⚠⚠ 顺序：**先接图、先显示**，再落盘。
+    //
+    // 为什么反过来了：落盘要碰 SPIFFS，是整条链路上**唯一可能让固件崩掉**
+    // 的地方（历史上就是崩在这儿）。图此刻已经完整地躺在 PSRAM 里了，
+    // 先把它挂上去，用户就一定看得见 —— 哪怕下一秒因为落盘失败而重启。
+    //
+    // 反过来写的话，"落盘失败"就等于"这次上传白传了"，用户屏幕上什么都没有，
+    // 白折腾一场。**看得见**比**存得下**重要得多。
+    //
+    // 顺序上唯一的硬约束：接新图必须在释放旧图**之前**
+    // （wpImgDsc.data 才有合法地址），这个没变。
     uint16_t* oldPixels = wpPixels;
     wpPixels = out;
     bindWallpaperSource();
@@ -3192,6 +3324,21 @@ static void finishLogoRaw(void) {
     if (wp_img) {
         lv_img_set_src(wp_img, &wpImgDsc);
         lv_obj_invalidate(wp_img);
+    }
+    // 屏保那张共用同一份 wpImgDsc，但它是另一个 lv_img 对象，得单独换 src。
+    if (sv_img) {
+        lv_img_set_src(sv_img, &wpImgDsc);
+        lv_obj_invalidate(sv_img);
+    }
+
+    // 然后才落盘：**分片存**（SPIFFS 单文件上限 4096，装不下 115200）。
+    if (!writeWallpaperChunked((const uint8_t*)out, (size_t)WP_RAW_BYTES)) {
+        // 落盘失败 ≠ 图坏了。图在 RAM 里好好地显示着，只是重启后没了。
+        // 如实回报"半成功"，但**绝不**把已经显示出来的图撤掉。
+        LOG_PORT.println("[WALLPAPER] 落盘失败 —— 已显示，重启后会丢");
+        triggerHudBig("壁纸上传", "已显示·未存盘", lv_color_hex(CLR_AMBER));
+        btLinkReplyC("LOGOSTATUS", "WARN:落盘失败(已显示)");
+        return;
     }
 
     triggerHud("壁纸更新", "上传完成", lv_color_hex(CLR_GREEN));
@@ -3278,30 +3425,14 @@ static void finishLogoUpload(void) {
     ct_alive();
     LOG_PORT.printf("[WALLPAPER] decode %s\n", ok ? "ok" : "FAILED");
 
-    // 注意：写盘那 200 多毫秒里旧的 wpPixels 必须保持有效 —— 屏还在用它画壁纸，
-    // 这里提前 free 就是 use-after-free，wpImgDsc.data 还会指向已释放的地址。
-    // 所以先把旧指针扣下，等新图彻底接上再释放。
+    // ⚠ 顺序：**先接图、先显示**，再落盘（和 RAW 那条路一个道理）。
+    //   落盘是唯一可能崩的步骤；图在 RAM 里是完整的，先显示出来，
+    //   哪怕落盘失败、重启了，用户也看到过这张图。
+    //
+    //   写盘那 200 多毫秒里旧的 wpPixels 必须保持有效 —— 屏还在用它画壁纸，
+    //   这里提前 free 就是 use-after-free，wpImgDsc.data 还会指向已释放的地址。
+    //   所以先把旧指针扣下，等新图彻底接上再释放。
     uint16_t* oldPixels = wpPixels;
-
-    if (ok) {
-        // 落盘一份，重启后直接从 SPIFFS 读回。分块写 + 喂狗：115KB 一次写完
-        // 在 SPIFFS 上是毫秒级的，loop 任务挂在任务看门狗上，稳妥点分段喂。
-        File f = SPIFFS.open("/logo.bin", FILE_WRITE);
-        if (f) {
-            const uint8_t* p = (const uint8_t*)out;
-            size_t left = (size_t)WP_PIXELS * 2;
-            while (left) {
-                size_t n = left > 16384 ? 16384 : left;
-                f.write((uint8_t*)p, n);
-                p += n; left -= n;
-                ct_alive();
-            }
-            f.close();
-            LOG_PORT.printf("[WALLPAPER] /logo.bin written\n");
-        } else {
-            LOG_PORT.printf("[WALLPAPER] open /logo.bin FAILED\n");
-        }
-    }
 
     logoRxTotal = 0;
     logoRxGot   = 0;
@@ -3321,6 +3452,18 @@ static void finishLogoUpload(void) {
         lv_img_set_src(wp_img, &wpImgDsc);
         lv_obj_invalidate(wp_img);
     }
+    if (sv_img) {
+        lv_img_set_src(sv_img, &wpImgDsc);
+        lv_obj_invalidate(sv_img);
+    }
+
+    // 再落盘一份，重启后直接从 SPIFFS 读回。**分片存**（单文件上限 4096）。
+    if (!writeWallpaperChunked((const uint8_t*)out, (size_t)(WP_PIXELS * 2))) {
+        LOG_PORT.println("[WALLPAPER] 落盘失败 —— 已显示，重启后会丢");
+        triggerHudBig("壁纸上传", "已显示·未存盘", lv_color_hex(CLR_AMBER));
+        btLinkReplyC("LOGOSTATUS", "WARN:落盘失败(已显示)");
+        return;
+    }
 
     triggerHud("壁纸更新", "上传完成", lv_color_hex(CLR_GREEN));
 
@@ -3330,26 +3473,31 @@ static void finishLogoUpload(void) {
     btLinkReplyC("LOGOSTATUS", "OK:0/0");
 }
 
-// 开机：SPIFFS 里有 /logo.bin 就读回 PSRAM，重启不用重传。
+// 开机：SPIFFS 里有壁纸就读回 PSRAM，重启不用重传。
+//
+// 现在是**分片**存的（单文件上限 4096，装不下 115200），见 writeWallpaperChunked。
+// 没有 /logo.ok 标记就当没有壁纸 —— 宁可空着，也不要挂一张半张的图。
 static void loadWallpaperFromDisk(void) {
-    if (!SPIFFS.exists("/logo.bin")) return;
-    File f = SPIFFS.open("/logo.bin", FILE_READ);
-    if (!f) return;
-    size_t sz = f.size();
-    f.close();
-    if (sz != (size_t)(WP_PIXELS * 2)) return;   // 尺寸对不上就当没有，宁可空着
+    // 旧格式（单文件 /logo.bin）已经废弃：它根本写不进去，留着只会占地方。
+    // 删不掉也没关系 —— 读回路径已经不认它了。
+    if (SPIFFS.exists("/logo.bin")) SPIFFS.remove("/logo.bin");
 
-    uint16_t* buf = (uint16_t*)heap_caps_malloc(WP_PIXELS * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!SPIFFS.exists(LOGO_OK_FILE)) return;
+
+    uint16_t* buf = (uint16_t*)heap_caps_malloc((size_t)WP_PIXELS * 2,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf == nullptr) return;
-    File r = SPIFFS.open("/logo.bin", FILE_READ);
-    if (!r) { heap_caps_free(buf); return; }
-    size_t rd = r.read((uint8_t*)buf, WP_PIXELS * 2);
-    r.close();
-    if (rd != (size_t)(WP_PIXELS * 2)) { heap_caps_free(buf); return; }
+
+    if (!readWallpaperChunked((uint8_t*)buf, (size_t)(WP_PIXELS * 2))) {
+        LOG_PORT.println("[WALLPAPER] 读回失败 —— 按没有壁纸处理");
+        heap_caps_free(buf);
+        return;
+    }
 
     if (wpPixels) heap_caps_free(wpPixels);
     wpPixels = buf;
     bindWallpaperSource();
+    LOG_PORT.println("[WALLPAPER] 读回成功");
 }
 
 // ===========================
@@ -12479,11 +12627,18 @@ static void showBootDiagnostics(void) {
         pushBootHud(8000, "C3 串口", w, c3RxBytes ? CLR_GREEN : CLR_AMBER);
     }
 
-    LOG_PORT.printf("[BOOT] prev: hang=%u stage=%u(%s) key=%s uptimeMs=%u\n",
+    // ⚠ ovf 这一项**必须**打出来。阶段号只说"崩在主循环末尾"，
+    //   而 ovf 说的是"**哪个任务**把栈踩烂了、还剩多少字节" ——
+    //   这是 FreeRTOS 金丝雀亲自抓到的硬证据，比阶段号硬得多。
+    //   （以前这一项只进了开机 HUD，日志行里没有，于是每次都要人去盯屏幕。）
+    LOG_PORT.printf("[BOOT] prev: hang=%u stage=%u(%s) key=%s uptimeMs=%u ovf=%u task=%s stack=%u\n",
                   (unsigned)ct_prev.hang, (unsigned)ct_prev.stage,
                   ctStageName(ct_prev.stage),
                   (ct_prev.keyCode == 0xFFFFFFFFUL) ? "none" : getKeyName((uint16_t)ct_prev.keyCode),
-                  (unsigned)ct_prev.uptimeMs);
+                  (unsigned)ct_prev.uptimeMs,
+                  (unsigned)ct_prev.ovf,
+                  ct_prev.ovfTask[0] ? ct_prev.ovfTask : "-",
+                  (unsigned)ct_prev.ovfStack);
 }
 
 // 把"上一次是怎么结束的"补写成一条**持久**日志。
@@ -12545,6 +12700,17 @@ static void elog_notePrevRun(void) {
 // setup()
 // ===========================
 void setup() {
+    // ⚠ 解除 GPIO0(BOOT) 的 IO hold —— 必须放在**最前面**。
+    //
+    // BOOTDL 会用 gpio_hold_en() 把 IO0 按住在低电平（这是它能跨复位
+    // 保持"进下载模式"的关键）。但那个 hold **只有掉电才会消失**，
+    // 于是"进过下载模式"之后，每一次复位都会重新落回下载模式 ——
+    // 表现是"固件明明烧好了，插上还是进 ROM，app 起不来"。
+    //
+    // 所以每次开机第一件事就是把 hold 放开：让 IO0 回到正常状态，
+    // 由物理 BOOT 键 / 外部电路决定下次是进 app 还是进下载模式。
+    gpio_hold_dis(GPIO_NUM_0);
+
     // 崩溃现场记录：必须**第一时间**初始化。setup() 里后面任何一步 panic，
     // 现场也已经留在 RTC 慢存里了，下次开机能显示出来。
     ct_begin();
@@ -12568,6 +12734,18 @@ void setup() {
             LOG_PORT.println("[LOG] USB CDC 日志镜像已开");
         }
     }
+    // ⚠ 把 **IDF 自己的** panic / assert 输出也引到 USB CDC。
+    //
+    // 为什么必须开：panic 的回溯（哪个函数、哪一行）是崩溃定位的**硬证据**，
+    // 而它默认只走 UART0（CONFIG_ESP_CONSOLE_UART_DEFAULT）——
+    // 没接 USB-TTL 就一个字都看不到。setDebugOutput(true) 会把 ROM/IDF 的
+    // putchar 换到 CDC，于是 panic 回溯直接出现在 USB 串口上。
+    //
+    // ⚠ 只在 debug 构建里开（LOG_CDC_MIRROR 就是 debug 构建的标志）：
+    //   产品固件 ARDUINO_USB_MODE=1 时 Serial 是 USB-Serial-JTAG，
+    //   没有 CDC 节点，这一行等于什么也没做（而且会覆盖 UART0 的 console）。
+    Serial.setDebugOutput(true);
+    LOG_PORT.println("[LOG] panic/assert 回溯已引到 USB CDC");
 #endif
 
     // 早分配 PSRAM 日志环形缓冲:越早越好,从这里开始的所有 LOG_PORT.printf
@@ -12868,6 +13046,12 @@ void setup() {
     // ⚠ begin(true) 的 true = 挂不上就格式化重来。**整块板只能调这一次** ——
     // 再调一次会把用户配置（壁纸 /logo.bin、ME 文本）和下面的错误日志一起抹掉。
     bool fsMounted = SPIFFS.begin(true);
+
+    // 探一下 SPIFFS 的单文件上限（见 probeSpiffsLimit 的说明）。
+    // 这个上限**不在代码里**，是编译期配置 + 文件系统格式决定的，
+    // 不探一次很容易想当然地以为"115KB 也能写成一个文件"——而实际上写不进去，
+    // 每次开机重写一次还会变成 boot loop。
+    if (fsMounted) probeSpiffsLimit();
 
     // 错误日志：把上次运行留在 flash 上的日志读回 RAM，然后补一条"上次怎么结束的"。
     // 必须放在 SPIFFS.begin() 之后 —— elog 靠 SPIFFS 存取。放在这里是因为
@@ -13363,19 +13547,38 @@ if (lockStateDirty) {
     // 放在**一轮的最末尾**：前面那条回话（btLinkReplyC）是在上一轮
     // btLinkPoll() 的 pumpTx() 里发出去的，到这里它已经出去了。
     //
-    // 做法：把 BOOT 脚(GPIO0)拉低再复位。复位那一瞬间 ROM 采到 BOOT=0
-    // 就进下载模式，USB 重新枚举成 CDC —— 主机上 /dev/cu.usbmodem*
-    // 就回来了，不用再让人手动按 BOOT+EN。
+    // ⚠⚠⚠ **为什么不能用 esp_restart()**（这是 BOOTDL 一直没生效的真因）：
+    //   复位会清掉 GPIO 的输出配置 —— IO0 变回输入，由外部上拉决定电平，
+    //   于是 ROM 采样到 boot:0x1（高）→ **正常启动 app**，根本进不了下载模式。
+    //   注释里原来写"先把 GPIO0 配成输出并拉低，复位时它才是低电平"——
+    //   这个前提是错的：ESP32-S3 复位后 GPIO 的输出寄存器会被重置。
     //
-    // ⚠ 顺序不能反：必须先把 GPIO0 **配成输出并拉低**，等它稳定（100ms），
-    //   复位时它才是低电平。先复位后拉低没有意义（那时已经在跑了）。
+    // ✅ 改用 deep sleep：ESP32-S3 的 **GPIO0 属于 RTC GPIO**，
+    //   `rtc_gpio_hold()` 能在 deep sleep 期间保持输出电平。
+    //   于是唤醒（无论定时唤醒还是之后的上电）时，ROM 采到的 IO0 仍是低
+    //   → 进下载模式。
+    //
+    // ⚠ **为什么只用 rtc_gpio_hold、不用 gpio_hold_en**：
+    //   gpio_hold_en 的 hold 只有掉电才会消失 —— 一旦用了它，
+    //   "烧完固件 → esptool run → 复位"这一下又会因为 IO0 被按住在低电平
+    //   而**再次落进下载模式**，app 起不来，还得以拔插收场。
+    //   rtc_gpio_hold 的 hold 在唤醒时自己就没了：芯片醒来是干净的，
+    //   烧完固件复位一下就正常跑 app。
+    //   万一 rtc_gpio_hold 不奏效（芯片直接醒成 app），最坏结果是
+    //   "BOOTDL 白按一次"，**不会把设备锁死**。
+    //
+    // 配一个 20 秒定时唤醒当保险：万一主机没来烧，芯片自己醒过来，
+    // 但那时 IO0 仍是低的（RTC hold 还在），还是会进下载模式等主机 ——
+    // 这正是 BOOTDL 的语义（"我现在停在下载模式"），不是故障。
     if (g_bootDlPending) {
         g_bootDlPending = false;
-        LOG_PORT.println("[BOOTDL] 拉低 BOOT 脚并复位");
+        LOG_PORT.println("[BOOTDL] 拉低 BOOT 脚（RTC hold）并进入下载模式");
         pinMode(GPIO_NUM_0, OUTPUT);
         digitalWrite(GPIO_NUM_0, LOW);
-        delay(100);
-        esp_restart();
+        delay(50);
+        rtc_gpio_hold_en(GPIO_NUM_0);        // deep sleep 期间保持 IO0 为低
+        esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL);
+        esp_deep_sleep_start();
         return;      // 理论上到不了这里
     }
 
@@ -13395,6 +13598,7 @@ if (lockStateDirty) {
     if (g_bootAppPending) {
         g_bootAppPending = false;
         LOG_PORT.println("[BOOTAPP] 拉高 BOOT 脚并复位");
+        gpio_hold_dis(GPIO_NUM_0);          // 先解除可能残留的 hold
         pinMode(GPIO_NUM_0, OUTPUT);
         digitalWrite(GPIO_NUM_0, HIGH);
         delay(100);
