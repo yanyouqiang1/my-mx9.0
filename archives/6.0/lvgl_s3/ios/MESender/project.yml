@@ -35,8 +35,10 @@ targets:
         # 系统就用这句话决定给不给。
         INFOPLIST_FILE: MESender/Info.plist
         TARGETED_DEVICE_FAMILY: "1,2"
-        # 个人开发者 Team（RQ6477DX7S / "有强 严 (Personal Team)"）。
-        # 装真机时靠它 + -allowProvisioningUpdates 让 Xcode 自动建 profile。
+        # App 图标在 MESender/Assets.xcassets/AppIcon.appiconset，
+        # 由 gen_appicon.py 生成（照固件那套「简约纯黑」配色）。
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         DEVELOPMENT_TEAM: RQ6477DX7S
         CODE_SIGN_STYLE: Automatic
         ENABLE_USER_SCRIPT_SANDBOXING: YES

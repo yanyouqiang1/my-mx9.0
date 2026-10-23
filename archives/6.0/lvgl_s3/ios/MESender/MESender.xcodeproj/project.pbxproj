@@ -11,11 +11,13 @@
 		0893DD2D52F557A472C1A38C /* MESenderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16BEB071D6AE8A7FD4172190 /* MESenderApp.swift */; };
 		A82ED0297DEE59CB66E5925B /* MX9BLE in Frameworks */ = {isa = PBXBuildFile; productRef = E1AB1C781763E30DE3C9AEC9 /* MX9BLE */; };
 		B3F6DE37BCCE814145D3ED48 /* SenderModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8A53C3059BF0E16CD9C3502 /* SenderModel.swift */; };
+		FB9DF7107F0E17DD763C591B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2618FB7AE2940142B7693102 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		06402ED6664CC48854217A63 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		16BEB071D6AE8A7FD4172190 /* MESenderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MESenderApp.swift; sourceTree = "<group>"; };
+		2618FB7AE2940142B7693102 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		3C63423D7A018F545FEBD0F1 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A8A53C3059BF0E16CD9C3502 /* SenderModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SenderModel.swift; sourceTree = "<group>"; };
 		D1BDE3251609EF74256C6B4D /* MX9BLE */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MX9BLE; path = ../MX9BLE; sourceTree = SOURCE_ROOT; };
@@ -37,6 +39,7 @@
 		0821B4F4C5ECCC7D75C61466 /* MESender */ = {
 			isa = PBXGroup;
 			children = (
+				2618FB7AE2940142B7693102 /* Assets.xcassets */,
 				3C63423D7A018F545FEBD0F1 /* ContentView.swift */,
 				06402ED6664CC48854217A63 /* Info.plist */,
 				16BEB071D6AE8A7FD4172190 /* MESenderApp.swift */,
@@ -78,6 +81,7 @@
 			buildConfigurationList = 1308E004B91AFB3EC5720F87 /* Build configuration list for PBXNativeTarget "MESender" */;
 			buildPhases = (
 				A7532F270CFF100293A12CEA /* Sources */,
+				668629BBFA4BCCAAB6873847 /* Resources */,
 				FCE8374CECD9FBB0E2AC3CF2 /* Frameworks */,
 			);
 			buildRules = (
@@ -128,6 +132,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		668629BBFA4BCCAAB6873847 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FB9DF7107F0E17DD763C591B /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A7532F270CFF100293A12CEA /* Sources */ = {
@@ -270,6 +285,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = RQ6477DX7S;
@@ -290,6 +306,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = RQ6477DX7S;
