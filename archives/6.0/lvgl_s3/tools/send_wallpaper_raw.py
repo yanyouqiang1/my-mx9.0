@@ -235,7 +235,14 @@ async def main():
 
                 # 每 PROBE_EVERY 片问一次固件"你收到多少了"：
                 # 丢片在这里就能看出来，而不是等最后一句"长度不匹配"才发现。
-                if probe_every and (n + 1) % probe_every == 0:
+                #
+                # ⚠ **最后一片之后不要问**：那一刻固件已经收齐、正忙着把
+                #   115200 字节落盘（57 个 SPIFFS 文件），loop 任务正被占着，
+                #   2 秒的轮询超时必然等不到 —— 于是"其实成功了"被报成
+                #   "设备没回应了"。2026-10-23 实测踩过：传输明明 115200/115200
+                #   零丢包，工具却报失败。
+                last_chunk = (i + chunk >= len(raw))
+                if probe_every and not last_chunk and (n + 1) % probe_every == 0:
                     st = await wait_state(link, "RAW", timeout=2.0, verbose=False)
                     if st is None:
                         print("\n  ⚠ 第 %d 片之后设备没回应了" % (n + 1))
@@ -268,7 +275,9 @@ async def main():
 
                 # 5) 等固件回报真实结果（它要 memcpy + 写盘 + 挂图片源）
                 print("\n=== 等固件落盘 ===")
-                for _ in range(30):
+                # 落盘 57 个 SPIFFS 文件要好几秒（实测 5~15 秒），
+                # 这里给 90 次机会，别刚问两句就判失败。
+                for _ in range(90):
                     await asyncio.sleep(0.5)
                     try:
                         await c.write_gatt_char(CHAR_UUID,
