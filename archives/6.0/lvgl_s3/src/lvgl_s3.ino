@@ -1087,9 +1087,8 @@ static char lastKeyPressed[8] = "-";
 // ===========================
 // 原来 SLEEP_TIMEOUT_MS 到了就 destroyMainScreen() 把主屏整个拆掉，屏幕全黑。
 // 现在给三种屏保 + 一个"完全不进屏保"：
-//   SAVER_WALL 壁纸铺满，和"信息面板"每隔几秒**轮播**一张 —— 一直是图片
-//              会看不到时间，一直是面板又浪费了壁纸
-//   SAVER_INFO 只显示信息面板，不轮播
+//   SAVER_WALL 壁纸铺满 + 底部通栏信息条 —— 一直是图片，同时一直看得到时间
+//   SAVER_INFO 只显示信息面板（居中一张卡片），不铺壁纸
 //   SAVER_OFF  整个屏保功能不启用：空闲到点什么都不做，主屏原样留着
 // 三种屏保共用同一块 `sv_panel`（时间 / 日期 / 温湿度都收在这一块里，
 // 不再是四个散落在屏幕四角的 label）。
@@ -1100,13 +1099,13 @@ static char lastKeyPressed[8] = "-";
 // 如果把"关闭"插成 0，老用户开机就变成"屏保关着"，属于静默改设置。
 // 所以 SAVER_OFF=3 追加在末尾，0/1/2 三个旧值的含义一字不变。
 #define SAVER_BLACK 0   // 黑屏（拆主屏，屏幕全黑）—— 老 SAVER_OFF 的语义
-#define SAVER_WALL  1   // 壁纸轮播
+#define SAVER_WALL  1   // 壁纸 + 底部信息条
 #define SAVER_INFO  2   // 信息面板
 #define SAVER_OFF   3   // 关闭：空闲也不息屏
 // 4 曾经是 SAVER_PET（屏保里的小橘），该功能已整体移除。编号**留空不复用**：
 // 屏保档位是 NVS 持久化的，插在中间会让老用户开机就变成另一个屏保。
 #define TOTAL_SAVER_MODES 4
-static const char* saverModeNames[] = { "黑屏", "壁纸轮播", "信息面板", "关闭" };
+static const char* saverModeNames[] = { "黑屏", "壁纸", "信息面板", "关闭" };
 static uint8_t saverMode = SAVER_OFF;   // 默认不自动息屏
 static lv_obj_t* scr_saver = nullptr;
 static lv_obj_t* sv_img = nullptr;
@@ -1583,9 +1582,17 @@ static uint8_t rhythmBars[24] = {0};
 static lv_obj_t* wp_bg = nullptr;
 static lv_obj_t* wp_img = nullptr;
 static lv_obj_t* wp_lbl_time = nullptr;
-// 壁纸右下角那块 112x40 的时钟板。原来是 build_style_wallpaper 里的局部变量，
-// 探头的"底部让位"要隐藏它，提成全局才有句柄。
-static lv_obj_t* wp_plate = nullptr;
+static lv_obj_t* wp_lbl_date = nullptr;
+
+// ===========================================================
+// 底部通栏条（壁纸主屏 + 屏保共用）
+// ===========================================================
+// 高度 72 / 起点 168 是**和壁纸图一起定死**的：
+//   wallpaper/gen_wallpaper_240_v2.py 里把表盘圆心放在 (120,92)、R=76，
+//   弧线最低点正好 y=168，再往下 72px（168..240）整片留空给这条。
+// 两边任何一边改了坐标，另一边必须同步改，否则条会压到弧线或者露出空隙。
+#define BAR_H 72
+#define BAR_Y (240 - BAR_H)
 
 // 高对比度（B-1「横向战舰」纯黑 + 横向驾驶舱：LED顶栏 / 时-日卡 / 键名卡 / 数据带 / 状态行）
 static lv_obj_t* hc_bg = nullptr;
@@ -1856,7 +1863,7 @@ static void resetStylePointers(void) {
     rh_lbl_keys = nullptr; rh_lbl_profile = nullptr;
     for (int i = 0; i < 24; i++) rh_bars[i] = nullptr;
 
-    wp_img = nullptr; wp_lbl_time = nullptr; wp_plate = nullptr;
+    wp_img = nullptr; wp_lbl_time = nullptr; wp_lbl_date = nullptr;
 
     // 高对比度（B-1「横向战舰」所有指针）
     hc_lbl_time = nullptr; hc_lbl_date = nullptr;
@@ -3096,13 +3103,41 @@ static void finishLogoUpload(void) {
     // 既慢又不可靠；12.6KB 静态内存换稳定，值。
     static JPEGDEC jpeg;
     bool ok = false;
-    if (jpeg.openRAM(logoRxBuf, (int)logoRxGot, logoJpegDraw)) {
+
+    // ⚠⚠ JPEG 字节必须先拷进**内部 DRAM** 再喂给 JPEGDEC。
+    //
+    // logoRxBuf 是常驻在 PSRAM 的（logoRxAlloc 里 heap_caps_malloc(..., MALLOC_CAP_SPIRAM)），
+    // 而 jpeg.openRAM(pBuf, len) 是让 JPEGDEC **直接在 pBuf 上解析**。
+    // JPEG 是变长编码，解析过程要在缓冲区里大量跳转、逐位读哈夫曼表 ——
+    // 这些访问跨 PSRAM cache line 时不但慢，还可能踩到未对齐访问。
+    // JPEGDEC 自己就明确假设内部缓冲是 16 字节对齐的（下面 static JPEGDEC 那段
+    // 注释里的原话："JPEGDEC 内部对 usPixels / sMCUs 有 16 字节 SIMD 对齐的假设，
+    // PSRAM 上未对齐访问既慢又不可靠"）。
+    //
+    // 之前那次修复只做了一半：JPEGDEC **对象**挪进了 .bss（内部 DRAM），
+    // 但**输入数据**还在 PSRAM 上。表现就是"传输一切正常、进度条到底、
+    // 紧接着就 reason=4 异常崩溃" —— 崩在解码第一步，
+    // 而崩溃现场（[BOOT] prev: stage=0 循环末尾）完全看不出是内存问题。
+    //
+    // 一张 240x240 的 JPEG 只有十几 KB，内部 DRAM 装得下（堆还有 80MB+），
+    // 拿这点内存换解码稳定，值。
+    static uint8_t* jpegIn = nullptr;
+    size_t inLen = logoRxGot;
+    jpegIn = (uint8_t*)malloc(inLen);
+    if (jpegIn == nullptr) { abortLogoUpload("内部内存不足"); return; }
+    memcpy(jpegIn, logoRxBuf, inLen);
+
+    if (jpeg.openRAM(jpegIn, (int)inLen, logoJpegDraw)) {
         LOG_PORT.printf("[WALLPAPER] jpeg header %dx%d, decoding...\n",
                         jpeg.getWidth(), jpeg.getHeight());
         jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
         ok = (jpeg.decode(0, 0, 0) != 0);
         jpeg.close();
     }
+    // 解码完立刻还回内部 DRAM —— 这块不能像 PSRAM 常驻缓冲那样留着，
+    // 内部 DRAM 紧张，每张图都要新申请/释放。
+    free(jpegIn);
+    jpegIn = nullptr;
     logoOutBuf = nullptr;
     ct_alive();
     LOG_PORT.printf("[WALLPAPER] decode %s\n", ok ? "ok" : "FAILED");
@@ -3202,9 +3237,9 @@ static void build_style_wallpaper(void) {
         lv_img_set_src(wp_img, NULL);
     }
 
-    // 压一层半透明黑，保证上面的字在任意壁纸上都读得出来。
-    // 从 LV_OPA_50(=127) 降到 LV_OPA_20(=51)：字已经缩到右下角一小块、
-    // 而且有自己的底板了，全屏遮罩再压一半，整个画面就只剩"糊"——
+    // 压一层半透明黑，保证下面的字在任意壁纸上都读得出来。
+    // 从 LV_OPA_50(=127) 降到 LV_OPA_20(=51)：字已经收进底部通栏条、
+    // 而且条自己带了半透明黑底，全屏遮罩再压一半，整个画面就只剩"糊"——
     // 壁纸页的重点是图，不是字。
     // ⚠ LV_OPA_* 只有 0/10/20/30/40/50/60/70/80/90/100 这几档
     //   （lv_color.h，值分别是 0/25/51/76/102/127/153/178/204/229/255），
@@ -3217,22 +3252,43 @@ static void build_style_wallpaper(void) {
     lv_obj_set_style_border_width(scrim, 0, LV_PART_MAIN);
     lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 时钟挪到**右下角**一小块。
-    // 原来是 168x64 的板子杵在正中间、48px 大字 —— 图被挡掉一大块，
-    // 用户的原话是"图片都看不清了"。缩到 28px 贴右下角，只压住一个角。
-    wp_plate = lv_obj_create(wp_bg);
-    lv_obj_set_size(wp_plate, 112, 40);
-    lv_obj_align(wp_plate, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
-    mkCard(wp_plate, CLR_SURFACE_2, 10);
-    lv_obj_set_style_bg_opa(wp_plate, LV_OPA_70, LV_PART_MAIN);
+    // 时钟挪到**底部通栏**。
+    //
+    // 为什么不是右下角一块 112x40 的小卡片（原来的做法）：
+    //   那块卡片带 1px 描边 + 圆角，浮在壁纸正中间偏右的位置，
+    //   而壁纸的构图是**连续的圆弧**——112x40 的矩形正好把弧线挖断，
+    //   一眼看过去就是"有张便利贴贴在图上"，这就是"时钟很突兀"的来源。
+    //   （v1 壁纸弧线最低到 y=199，卡片在 y=190..230，直接切断。）
+    //
+    // 改成通栏之后：
+    //   · 没有描边、没有圆角 → 它是"界面结构"，不是"贴上去的控件"
+    //   · 正好落在壁纸底部预留的空场（见 wallpaper/gen_wallpaper_240_v2.py，
+    //     那边刻意把 y=168..240 清空给这块条），弧线不再被切断
+    //   · 用户上传**亮色**壁纸时也不怕：条是半透明黑底，文字照样读得出
+    //     （原来那种"纯裸字压图"的做法在亮图上完全看不清，已放弃）
+    lv_obj_t* bar = lv_obj_create(wp_bg);
+    lv_obj_set_size(bar, 240, BAR_H);
+    lv_obj_set_pos(bar, 0, BAR_Y);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    wp_lbl_time = lv_label_create(wp_plate);
+    // 时间：28px 靠左。28px 的 "22:48" 实测 75.3px 宽（lvgl_font_width.py），
+    // 左边留 14px → 占 x=14..89，不会撞到右边的日期。
+    wp_lbl_time = lv_label_create(bar);
     mkLabel(wp_lbl_time, &lv_font_montserrat_28, CLR_TEXT);
     lv_label_set_text(wp_lbl_time, "--:--");
-    lv_obj_center(wp_lbl_time);
+    lv_obj_set_pos(wp_lbl_time, 14, 8);
 
-    // 探头横条 y=168..240 会盖住这块板（它在 y=190..230），登记进让位清单。
-    // 提为全局指针就是为了这一行 —— 原来是局部变量，出函数就没句柄了。
+    // 日期：16px 中文右对齐到 226。宽 120px → 占 x=106..226。
+    // 和时间同一行，中间还有 17px 余量。
+    wp_lbl_date = lv_label_create(bar);
+    mkLabel(wp_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+    lv_label_set_text(wp_lbl_date, "1月1日 星期一");
+    lv_obj_set_pos(wp_lbl_date, 106, 12);
 }
 
 // ===========================
@@ -3828,10 +3884,16 @@ static void build_style_plankey(void) {
     // 就是按键名 label 的顶边 —— 图标和那行大字**共用一条上边线**，
     // 读起来是"图标 → 按键"的一对，而不是两个互不相干的块。
     // 图标在 61px 底卡里居中：61-52 = 9 → 上 4 下 5，所以图标顶边 86。
+    //
+    // 2026-10-22：底卡原来用**抬升面 CLR_SURFACE_2**，按键卡用 **CLR_SURFACE**，
+    // 两块一深一浅，一眼就分成了"两个东西"（用户原话："块不要区分的这么明显"）。
+    // 现在两边**同一种材质**：同样的底色、同样的 1px 描边、同样的圆角，
+    // 只靠"大小和位置"区分主次，不再靠颜色。图标那块小、按键那块大，
+    // 主次本来就看得出来，不需要额外的亮度差来强调。
     pk_iconCard = lv_obj_create(pk_bg);
     lv_obj_set_size(pk_iconCard, PK_ICON_CARD, PK_ICON_CARD);
     lv_obj_align(pk_iconCard, LV_ALIGN_TOP_LEFT, PK_LEFT_X, PK_ICON_CARD_Y);
-    mkChip(pk_iconCard, CLR_SURFACE_2, CLR_TEXT_MUTE, 12);
+    mkCard(pk_iconCard, CLR_SURFACE, 12);
 
     pk_icon = lv_img_create(pk_bg);
     lv_img_set_src(pk_icon, (currentProfile == 1) ? &style_icon_apple_desc : &style_icon_win_desc);
@@ -3849,8 +3911,23 @@ static void build_style_plankey(void) {
     // 按键名。**挂在卡里**而不是挂在 pk_bg 上：TOP_MID 是相对父对象居中的，
     // 挂 pk_bg 的话会居中到屏幕中线 x=120，而这张卡的中心在 x=152 ——
     // 差 32px，看着就是"字没居中"。挂卡里就自动跟着卡走。
+    //
+    // 颜色用**主强调青**（CLR_ACCENT），不是白 —— 2026-10-22 改。
+    //
+    // 为什么：这一页的主角就是这行按键名，但它原来是白字，而白字在这一页
+    // **一共出现四处**（标题「YYQ键盘」/ 按键名 / 温度数值 / 湿度数值）。
+    // 48px 的主角跟 14px 的小字在颜色上完全没分开，反倒是右下角那个紫色的
+    // 「1284」因为有颜色、更抢眼 —— 主角被配角压住了。
+    // 字号已经顶到 48px（能开的最大档）没法再加，**加色相**是唯一还能提
+    // 层次的手段：OLED 上高色度的颜色比纯白更"跳"。
+    //
+    // 选青而不是别的：
+    //   · 青是这套配色里的**主强调色**，语义上就是"最重要的那个"；
+    //   · 和左边的 Windows 蓝旗（#0078D4）是同类冷色、和谐不打架，
+    //     换成琥珀会跟下面的温度条同色、换成紫会跟「1284」同色；
+    //   · 对比度 9.4:1（按键卡底 #161C2B 上），48px/28px 两种字号都够。
     pk_lbl_key = lv_label_create(pk_card);
-    mkLabel(pk_lbl_key, &lv_font_montserrat_48, CLR_TEXT);
+    mkLabel(pk_lbl_key, &lv_font_montserrat_48, CLR_ACCENT);
     lv_label_set_text(pk_lbl_key, "-");
     // 字号是按实测字宽挑的，理论上一定放得下；但万一 getKeyName() 以后
     // 加了个超长键名，label 默认的长模式是 WRAP —— 会折成两行把版面顶乱。
@@ -3903,7 +3980,10 @@ static void build_style_plankey(void) {
         lv_obj_t* fill = lv_obj_create(pk_bg);
         lv_obj_set_size(fill, 0, PK_BAR_H);
         lv_obj_align(fill, LV_ALIGN_TOP_LEFT, PK_BAR_X0, barY[i]);
-        mkChip(fill, i == 0 ? CLR_AMBER : CLR_ACCENT, CLR_TEXT_MUTE, 3);
+        // 温度=琥珀、湿度=紫。湿度原来也是青（CLR_ACCENT），但青现在归
+        // 按键名**独占**了 —— 同一屏三处青（按键名 + CAPS 灯 + 湿度条），
+        // 主角的颜色就不主角了。紫色留给「1284」和湿度条当次级。
+        mkChip(fill, i == 0 ? CLR_AMBER : CLR_VIOLET, CLR_TEXT_MUTE, 3);
 
         if (i == 0) {
             pk_lbl_tCap = cap; pk_lbl_tVal = val;
@@ -3920,8 +4000,8 @@ static void build_style_plankey(void) {
 // ===========================
 // 屏保是一块独立的屏幕对象，和主屏并存：
 //   SAVER_BLACK 沿用老行为 —— 拆掉主屏，屏幕全黑
-//   SAVER_WALL 壁纸铺满，和"信息面板"每 5 秒轮播一次
-//   SAVER_INFO 只显示信息面板
+//   SAVER_WALL 壁纸铺满 + 底部通栏信息条（常驻，不再每 5 秒闪一次）
+//   SAVER_INFO 只显示信息面板（居中卡片）
 //   SAVER_OFF  根本不建屏保屏（这一档压根到不了这里，调用方会先拦掉）
 // 唤醒统一走 gotoMainScreen()：先 showScreen(主屏) 再 destroyScreensaver()，
 // 顺序反了就会删掉活动屏，LVGL 8.4 会把 disp->act_scr 置成 NULL。
@@ -3946,42 +4026,90 @@ static void destroyScreensaver(void) {
     }
 }
 
-// 屏保信息面板：时间 / 日期 / 温湿度全收在**这一块**面板里。
-// 旧版是四个 label 散在屏幕各处（时间居中偏上、日期居中、温湿度各贴一个下角），
-// 配上壁纸就是四处压图 —— 轮播模式下必须收拢成一张卡，不然图片根本没得看。
+// 屏保信息面板：时间 / 日期 / 温湿度全收在**底部通栏条**里。
+//
+// 旧版是一张 204x112 的**不透明**卡片，贴底居中：
+//   · 它把壁纸下半张整个盖住 —— "YYQ"主标和律动条全没了，
+//     屏保本来是给人看图的，图没了屏保就没意义了
+//   · 卡片带 1px 描边 + 14px 圆角，浮在图上像张便利贴
+//   · SAVER_WALL 模式下还每 5 秒"啪"地盖上又消失（见 updateScreensaver），
+//     每次切换都是一次突兀的闪
+//
+// 改成通栏条之后：图完整露出，信息贴在底部一条暗带里，
+// 描边和圆角全不要（它是界面结构，不是贴上去的控件）。
+// SAVER_INFO（纯信息屏、没有壁纸）反而需要卡片 —— 那里没图可挡，
+// 一张居中的卡片才是对的形态，所以这一档保留原样。
 static void buildSaverPanel(void) {
+    if (saverMode == SAVER_INFO) {
+        // 纯信息模式：没有壁纸，一张居中的卡片才是对的形态
+        sv_panel = lv_obj_create(scr_saver);
+        lv_obj_set_size(sv_panel, 204, 112);
+        lv_obj_align(sv_panel, LV_ALIGN_CENTER, 0, 0);
+        mkCard(sv_panel, CLR_SURFACE, 14);
+
+        sv_lbl_time = lv_label_create(sv_panel);
+        mkLabel(sv_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+        lv_label_set_text(sv_lbl_time, "--:--");
+        lv_obj_align(sv_lbl_time, LV_ALIGN_TOP_MID, 0, 6);
+
+        sv_lbl_date = lv_label_create(sv_panel);
+        mkLabel(sv_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
+        lv_label_set_text(sv_lbl_date, "1月1日 星期一");
+        lv_obj_align(sv_lbl_date, LV_ALIGN_TOP_MID, 0, 60);
+
+        // 温湿度一行，中间一根细竖线隔开（比两段文字并排更容易一眼分开）
+        iconRect(sv_panel, 1, 18, LV_ALIGN_BOTTOM_MID, 0, -8, CLR_STROKE, 0);
+
+        sv_lbl_temp = lv_label_create(sv_panel);
+        mkLabel(sv_lbl_temp, &lv_font_montserrat_16, CLR_AMBER);
+        lv_label_set_text(sv_lbl_temp, "--.-C");
+        lv_obj_align(sv_lbl_temp, LV_ALIGN_BOTTOM_MID, -52, -6);
+
+        sv_lbl_hum = lv_label_create(sv_panel);
+        mkLabel(sv_lbl_hum, &lv_font_montserrat_16, CLR_ACCENT);
+        lv_label_set_text(sv_lbl_hum, "--%");
+        lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 52, -6);
+        return;
+    }
+
+    // 壁纸模式：底部通栏条（和壁纸主屏风格 6 用的是同一套坐标，见 BAR_H/BAR_Y）
     sv_panel = lv_obj_create(scr_saver);
-    lv_obj_set_size(sv_panel, 204, 112);
-    // 壁纸轮播时贴底（让出图片的上 2/3），纯信息模式居中
-    if (saverMode == SAVER_WALL) lv_obj_align(sv_panel, LV_ALIGN_BOTTOM_MID, 0, -16);
-    else                         lv_obj_align(sv_panel, LV_ALIGN_CENTER, 0, 0);
-    mkCard(sv_panel, CLR_SURFACE, 14);
+    lv_obj_set_size(sv_panel, 240, BAR_H);
+    lv_obj_set_pos(sv_panel, 0, BAR_Y);
+    lv_obj_set_style_bg_color(sv_panel, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sv_panel, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_border_width(sv_panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(sv_panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(sv_panel, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(sv_panel, LV_OBJ_FLAG_SCROLLABLE);
 
+    // 时间 28px 靠左（"22:48" = 75.3px）→ 占 x=14..89
     sv_lbl_time = lv_label_create(sv_panel);
-    mkLabel(sv_lbl_time, &lv_font_montserrat_48, CLR_TEXT);
+    mkLabel(sv_lbl_time, &lv_font_montserrat_28, CLR_TEXT);
     lv_label_set_text(sv_lbl_time, "--:--");
-    lv_obj_align(sv_lbl_time, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_set_pos(sv_lbl_time, 14, 8);
 
+    // 日期 16px 中文，右对齐到 226（宽 120px）→ 占 x=106..226
     sv_lbl_date = lv_label_create(sv_panel);
     mkLabel(sv_lbl_date, &lv_font_simsun_16_cjk, CLR_TEXT_MUTE);
     lv_label_set_text(sv_lbl_date, "1月1日 星期一");
-    lv_obj_align(sv_lbl_date, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_pos(sv_lbl_date, 106, 12);
 
-    // 温湿度一行，中间一根细竖线隔开（比两段文字并排更容易一眼分开）
-    iconRect(sv_panel, 1, 18, LV_ALIGN_BOTTOM_MID, 0, -8, CLR_STROKE, 0);
-
+    // 温湿度：第二行右对齐。"24.3C"=44.2px + "48%"=34.5px，
+    // 加 8px 间隔共 86.7px，从 225 往左排 → 温度 x=134、湿度 x=190，
+    // 湿度右缘 190+34.5=224.5，留 15px 右边距（不贴边）。
     sv_lbl_temp = lv_label_create(sv_panel);
     mkLabel(sv_lbl_temp, &lv_font_montserrat_16, CLR_AMBER);
     lv_label_set_text(sv_lbl_temp, "--.-C");
-    lv_obj_align(sv_lbl_temp, LV_ALIGN_BOTTOM_MID, -52, -6);
+    lv_obj_set_pos(sv_lbl_temp, 134, 38);
 
     sv_lbl_hum = lv_label_create(sv_panel);
     mkLabel(sv_lbl_hum, &lv_font_montserrat_16, CLR_ACCENT);
     lv_label_set_text(sv_lbl_hum, "--%");
-    lv_obj_align(sv_lbl_hum, LV_ALIGN_BOTTOM_MID, 52, -6);
+    lv_obj_set_pos(sv_lbl_hum, 190, 38);
 }
 
-// 菜单里"屏保风格"那一项：黑屏 → 壁纸轮播 → 信息面板 → 关闭 → 黑屏
+// 菜单里"屏保风格"那一项：黑屏 → 壁纸 → 信息面板 → 关闭 → 黑屏
 // 设成指定的屏保模式（含落盘 + 正在屏保时立刻按新模式重建）。
 // 原来这段逻辑长在 cycleScreensaverMode 里，只能"转一格"。配置 JSON 要能直接
 // 设成任意一档（网页上勾哪项就是哪项），所以把主体抽出来，cycle 只负责 +1。
@@ -4044,8 +4172,9 @@ static void enterScreensaver(void) {
     }
 
     buildSaverPanel();
-    // 没上传过壁纸时没有可轮播的图，直接常显面板
-    setHidden(sv_panel, (saverMode == SAVER_WALL) && wpReady);
+    // 信息条常驻（不再按"有壁纸就藏起来"处理 —— 底部条只压住最下面一条，
+    // 藏了反而让屏幕每隔几秒抖一下，见 updateScreensaver 的说明）。
+    setHidden(sv_panel, false);
 
     updateScreensaver(true);
     showScreen(scr_saver);
@@ -4064,27 +4193,20 @@ static void updateScreensaver(bool force) {
     if (!force && nowMs - lastRunMs < 100UL) return;
     lastRunMs = nowMs;
 
-    // 壁纸轮播：每 5 秒在"纯壁纸"和"信息面板"之间翻一次。
-    // 计时器用 tick 计数而不是记时间戳 —— 这个函数既被 100ms 的节拍调，
-    // 也被 enterScreensaver() 直接调一次（force），用时间戳会被那次调用搅乱。
-    if (saverMode == SAVER_WALL && wpReady) {
-        static uint8_t tick = 0;
-        if (force) {
-            tick = 0;
-            setHidden(sv_panel, true);      // 进屏保先给图片（用户最想先看到的是图）
-        } else {
-            tick++;
-            if (tick >= 50) {               // 50 × 100ms = 5s
-                tick = 0;
-                setHidden(sv_panel, !lv_obj_has_flag(sv_panel, LV_OBJ_FLAG_HIDDEN));
-            }
-        }
-    } else {
-        setHidden(sv_panel, false);
-    }
+    // 壁纸模式：**信息条常驻，不再每 5 秒闪一次**。
+    //
+    // 原来这里有个 5 秒的轮播（tick>=50 时把面板藏起来再放出来），
+    // 起因是旧面板是 204x112 的不透明大卡片，贴着壁纸正中间，
+    // 不藏起来根本看不见图 —— 藏/放之间那道突兀的闪是这么来的。
+    //
+    // 现在面板改成了底部 72px 的通栏条（见 buildSaverPanel），
+    // 只压住图片最下面一条，主标和表盘全都露在外面，
+    // 根本不需要"让位"，也就没有理由再闪。
+    // 留着轮播只会让屏幕每隔 5 秒抖一下 —— 那是纯粹的突兀。
+    setHidden(sv_panel, false);
 
-    // 面板被藏起来（纯壁纸那一相）时不用白刷标签
-    if (sv_lbl_time == nullptr || lv_obj_has_flag(sv_panel, LV_OBJ_FLAG_HIDDEN)) return;
+    // 标签没建出来就不用刷（SAVER_BLACK 压根不会走到这）
+    if (sv_lbl_time == nullptr) return;
 
     time_t now = time(nullptr);
     struct tm* ti = localtime(&now);
@@ -4448,8 +4570,8 @@ static void build_menu(void) {
 //       240×240 上只是"那儿有东西"，余光一扫就滑过去了；反过来，一块
 //       实心色 + 黑字是这块屏上对比最强的组合，隔半米也能读出来。
 //
-//   小提示 triggerHud()      216×52   2px 描边 + 左侧语义色竖条   1.1 秒
-//       给例行确认："已保存""已开启"这类。
+//   小提示 triggerHud()      216×58   抬升面卡片 + 次级标题 / 强调数值   1.1 秒
+//       给例行确认："已保存""已开启""静音切换"这类。
 //       屏上本来就有反馈的（改了风格、拧了灯效、存了设置）**根本不该弹提示**
 //       —— 那些调用点已经删掉了。
 //
@@ -4463,10 +4585,21 @@ static void build_menu(void) {
 // ⚠ 字号的现实：中文只有 16px 一种字号（lv_conf.h 里只开了
 //   lv_font_simsun_16_cjk），再大就得重生成一份子集字库，代价和收益不匹配。
 //   所以"醒目"靠的是**色块、对比和尺寸**，不是字号。
+//
+// ⚠ 16px 中文字体的行高是 **19px**（= HINT_LINE_H，见 simsun_16_cjk 的
+//   line_height）。两行文字要塞进一张卡，行距必须按 19 算，不能按 16 算 ——
+//   按 16 算出来的排版**两行会重叠 1px**，看着就是"两行字粘在一起"。
+//   这就是原来小提示（52px 高）难看的直接原因。
 #define HUD_BIG_W     232
 #define HUD_BIG_H     112
 #define HUD_SMALL_W   216
-#define HUD_SMALL_H    52
+#define HUD_SMALL_H    58
+// 小提示卡内两行的顶边（相对卡片内容区）：
+//   标题 9 → 墨迹 12~26
+//   数值 32 → 墨迹 35~49
+//   两行墨迹之间留 9px，卡底还剩 9px，上下对称。
+#define HUD_SMALL_TITLE_Y  9
+#define HUD_SMALL_VALUE_Y 32
 #define HUD_BIG_MS    2400
 #define HUD_SMALL_MS  1100
 
@@ -4481,13 +4614,12 @@ static inline uint32_t hudRgb(lv_color_t c) {
 // HUD 的子对象指针：为了"同一条提示只改文字、不重建卡片"。
 static lv_obj_t* hudTitleLbl  = nullptr;
 static lv_obj_t* hudValueLbl  = nullptr;
-static lv_obj_t* hudAccentObj = nullptr;   // 小提示的竖条 / 大提示的实心数值块
-static lv_obj_t* hudBandObj   = nullptr;   // 大提示顶部的实心横条
+static lv_obj_t* hudAccentObj = nullptr;   // 大提示的实心数值块（小提示不再用它）
 
 static void build_hud(void) {
     if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
     hudTitleLbl = nullptr; hudValueLbl = nullptr;
-    hudAccentObj = nullptr; hudBandObj = nullptr;
+    hudAccentObj = nullptr;
 
     // ⚠⚠ 每一个 lv_obj_create / lv_label_create 都可能返回 NULL，必须逐个判。
     //
@@ -4505,43 +4637,40 @@ static void build_hud(void) {
 
     if (hud.big) {
         // ---------------- 大提示 ----------------
+        //
+        // 2026-10-22 改版：卡片底从**纯黑**改成抬升面 CLR_SURFACE_2。
+        // 纯黑（0x000000）压在页面底 CLR_BG（0x0B0F17）上，比背景还暗，
+        // 看着像"在屏幕上挖了个洞"，再套一圈 4px 彩色描边就成了一个
+        // 悬空的贴纸。抬升面比背景亮一圈，层次才对。
+        //
+        // 同时**去掉了顶部那条实心横条**：原来一个语义色在卡上出现四次
+        // （4px 描边 / 顶部横条 / 标题文字 / 数值块），红红红红一片，
+        // 反而没有重点。现在只留两处 —— 彩色描边（框）+ 实心数值块（内容），
+        // 标题改成白字：白字对深底对比最高，"键盘已锁定"这种必须一眼看清的
+        // 字就该是最白的那几个字。
         lv_obj_set_size(scr_hud, HUD_BIG_W, HUD_BIG_H);
         lv_obj_align(scr_hud, LV_ALIGN_CENTER, 0, -6);
-        mkCard(scr_hud, 0x000000, 10);
+        mkCard(scr_hud, CLR_SURFACE_2, 10);
         lv_obj_set_style_border_width(scr_hud, 4, LV_PART_MAIN);
         lv_obj_set_style_border_color(scr_hud, hud.color, LV_PART_MAIN);
         lv_obj_move_foreground(scr_hud);
 
-        // 顶部一条实心语义色横条：把"这是一条要看的提示"做成色块，
-        // 而不是靠一根细描边暗示。
-        // 宽度和下面的数值块**对齐**（都是 HUD_BIG_W - 32），整张卡的版面
-        // 才不会显得一头一尾；圆角给 3，别用直角去顶卡片外沿的圆角。
-        hudBandObj = lv_obj_create(scr_hud);
-        if (hudBandObj) {
-            lv_obj_set_size(hudBandObj, HUD_BIG_W - 32, 8);
-            lv_obj_align(hudBandObj, LV_ALIGN_TOP_MID, 0, 0);
-            lv_obj_set_style_bg_color(hudBandObj, hud.color, LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(hudBandObj, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_set_style_radius(hudBandObj, 3, LV_PART_MAIN);
-            lv_obj_set_style_border_width(hudBandObj, 0, LV_PART_MAIN);
-            lv_obj_clear_flag(hudBandObj, LV_OBJ_FLAG_SCROLLABLE);
-        }
-
-        // 标题：语义色本身。标题也是信息，不该是配角（旧版是灰的，等于藏起来）。
+        // 标题：白字。y=16 是相对卡片内容区（4px 描边之内）的顶边。
         hudTitleLbl = lv_label_create(scr_hud);
         if (hudTitleLbl) {
-            mkLabel(hudTitleLbl, &lv_font_simsun_16_cjk, hudRgb(hud.color));
+            mkLabel(hudTitleLbl, &lv_font_simsun_16_cjk, CLR_TEXT);
             lv_label_set_text(hudTitleLbl, hud.title);
             lv_obj_set_width(hudTitleLbl, HUD_BIG_W - 24);
             lv_label_set_long_mode(hudTitleLbl, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_align(hudTitleLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-            lv_obj_align(hudTitleLbl, LV_ALIGN_TOP_MID, 0, 18);
+            lv_obj_align(hudTitleLbl, LV_ALIGN_TOP_MID, 0, 16);
         }
 
         // 数值：实心语义色块 + 黑字 —— 这块屏上对比最强的组合。
+        // 块高 40（原来 34）：16px 中文字体行高 19，上下各留 10px 才不挤。
         hudAccentObj = lv_obj_create(scr_hud);
         if (hudAccentObj) {
-            lv_obj_set_size(hudAccentObj, HUD_BIG_W - 32, 34);
+            lv_obj_set_size(hudAccentObj, HUD_BIG_W - 32, 40);
             lv_obj_align(hudAccentObj, LV_ALIGN_BOTTOM_MID, 0, -16);
             lv_obj_set_style_bg_color(hudAccentObj, hud.color, LV_PART_MAIN);
             lv_obj_set_style_bg_opa(hudAccentObj, LV_OPA_COVER, LV_PART_MAIN);
@@ -4561,46 +4690,57 @@ static void build_hud(void) {
         }
     } else {
         // ---------------- 小提示 ----------------
+        //
+        // 2026-10-22 改版（用户："这个提示还是有点丑，比如静音控制这种的弹框"）。
+        // 原来那版的三个毛病：
+        //
+        //   1. 卡片是**纯黑**（0x000000）压在 CLR_BG（0x0B0F17）上 —— 比页面底
+        //      还暗，看着不像卡片，像挖了个洞；再套 2px 高饱和描边，整张卡
+        //      就成了一个悬空的**线框框**，而不是一块"浮起来的提示"。
+        //      → 改成抬升面 CLR_SURFACE_2 + 1px 中性描边（CLR_STROKE）：
+        //        卡片比页面亮一圈，一眼看出是浮起来的一块。
+        //
+        //   2. **两行文字重叠了 1px**。卡高 52，标题在 y=6、数值在 y=-5，
+        //      而 16px 中文字体行高是 19（不是 16）—— 标题占 6~25、数值占
+        //      24~43，正好压掉 1px，看着就是"两行字粘在一起"。
+        //      → 卡高改 58，两行顶边定死 9 / 32（行盒之间留 4px，
+        //        墨迹之间留 9px），卡底还剩 9px，上下对称。
+        //
+        //   3. 强调色用了三次（2px 描边 + 左侧竖条 + 标题文字），花。
+        //      而且文字是**居中**的，左边那条竖条孤零零杵在左边，离文字
+        //      十万八千里，看着像个没对齐的零件。
+        //      → 竖条整个去掉，强调色只留给**数值文字**（那才是要读的半句），
+        //        标题退成次级色 CLR_TEXT_DIM。
+        //
+        // 值和标题必须分两行：中文 16px，并一行的话"已收回屏幕，仍在计时"
+        // （实测 160px）加标题就超了 216px 的卡宽 —— 截掉的恰恰是最该看的那半句。
         lv_obj_set_size(scr_hud, HUD_SMALL_W, HUD_SMALL_H);
         lv_obj_align(scr_hud, LV_ALIGN_CENTER, 0, 40);
-        mkCard(scr_hud, 0x000000, 10);
-        lv_obj_set_style_border_width(scr_hud, 2, LV_PART_MAIN);
-        lv_obj_set_style_border_color(scr_hud, hud.color, LV_PART_MAIN);
+        mkCard(scr_hud, CLR_SURFACE_2, 12);
         lv_obj_move_foreground(scr_hud);
 
-        // 左侧语义色竖条：颜色跟着提示语义走，一眼能分辨成功/警告/错误
-        hudAccentObj = lv_obj_create(scr_hud);
-        if (hudAccentObj) {
-            lv_obj_set_size(hudAccentObj, 5, HUD_SMALL_H - 14);
-            lv_obj_align(hudAccentObj, LV_ALIGN_LEFT_MID, 5, 0);
-            lv_obj_set_style_bg_color(hudAccentObj, hud.color, LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(hudAccentObj, LV_OPA_COVER, LV_PART_MAIN);
-            lv_obj_set_style_radius(hudAccentObj, 2, LV_PART_MAIN);
-            lv_obj_set_style_border_width(hudAccentObj, 0, LV_PART_MAIN);
-            lv_obj_clear_flag(hudAccentObj, LV_OBJ_FLAG_SCROLLABLE);
-        }
-
-        // 标题（语义色）。值和标题分两行而不是并一行：中文 16px，
-        // 并一行的话"键盘扩展已重启 MCP23017 复位完成"这种根本放不下，
-        // 会被 LVGL 截成省略号 —— 截掉的恰恰是最该看到的那半句。
+        // 标题：次级色。它是"这条提示属于哪一类"（静音控制 / 灯效切换），
+        // 不是用户要读的那半句，退到次级色才不跟数值抢。
         hudTitleLbl = lv_label_create(scr_hud);
         if (hudTitleLbl) {
-            mkLabel(hudTitleLbl, &lv_font_simsun_16_cjk, hudRgb(hud.color));
+            mkLabel(hudTitleLbl, &lv_font_simsun_16_cjk, CLR_TEXT_DIM);
             lv_label_set_text(hudTitleLbl, hud.title);
             lv_obj_set_width(hudTitleLbl, HUD_SMALL_W - 28);
             lv_label_set_long_mode(hudTitleLbl, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_align(hudTitleLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-            lv_obj_align(hudTitleLbl, LV_ALIGN_TOP_MID, 0, 6);
+            lv_obj_align(hudTitleLbl, LV_ALIGN_TOP_MID, 0, HUD_SMALL_TITLE_Y);
         }
 
+        // 数值：语义色。绿=成功 / 红=出错 / 琥珀=警告，颜色跟着语义走，
+        // 而且**只有这一处**用色，所以颜色变了就是内容变了，一眼能分辨。
         hudValueLbl = lv_label_create(scr_hud);
         if (hudValueLbl) {
-            mkLabel(hudValueLbl, &lv_font_simsun_16_cjk, CLR_TEXT);
+            mkLabel(hudValueLbl, &lv_font_simsun_16_cjk, hudRgb(hud.color));
             lv_label_set_text(hudValueLbl, hud.value);
             lv_obj_set_width(hudValueLbl, HUD_SMALL_W - 28);
             lv_label_set_long_mode(hudValueLbl, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_align(hudValueLbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-            lv_obj_align(hudValueLbl, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_align(hudValueLbl, LV_ALIGN_TOP_MID, 0, HUD_SMALL_VALUE_Y);
         }
     }
 }
@@ -4610,7 +4750,7 @@ static void hudClear(void) {
     hud.active = false;
     if (scr_hud) { lv_obj_del(scr_hud); scr_hud = nullptr; }
     hudTitleLbl = nullptr; hudValueLbl = nullptr;
-    hudAccentObj = nullptr; hudBandObj = nullptr;
+    hudAccentObj = nullptr;
 }
 
 // 把新的标题/值刷到已经建好的卡片上。
@@ -4621,10 +4761,22 @@ static void hudRefreshText(void) {
     if (hudTitleLbl) lv_label_set_text(hudTitleLbl, hud.title);
     if (hudValueLbl) lv_label_set_text(hudValueLbl, hud.value);
     // 语义色也跟着换：绿色的"已保存"被红色的"保存失败"顶掉时，
-    // 边框和色块得一起变，否则颜色和内容对不上。
-    lv_obj_set_style_border_color(scr_hud, hud.color, LV_PART_MAIN);
-    if (hudAccentObj) lv_obj_set_style_bg_color(hudAccentObj, hud.color, LV_PART_MAIN);
-    if (hudBandObj)   lv_obj_set_style_bg_color(hudBandObj, hud.color, LV_PART_MAIN);
+    // 颜色得跟着变，否则颜色和内容对不上。
+    //
+    // ⚠ 两档的"颜色放在哪"不一样，**不能共用一套刷新逻辑**：
+    //   大提示：语义色在**描边**和**实心数值块**上（标题是白字）。
+    //   小提示：语义色只在**数值文字**上，卡片描边保持中性 CLR_STROKE。
+    //     小提示以前也有彩色描边，但那时候它还配着左侧竖条和彩色标题，
+    //     一次改动三处全变，看着像"闪了一下"；现在只剩文字变色，
+    //     卡片骨架是稳的，换色只影响读的那半句话。
+    if (hud.big) {
+        lv_obj_set_style_border_color(scr_hud, hud.color, LV_PART_MAIN);
+        if (hudAccentObj) lv_obj_set_style_bg_color(hudAccentObj, hud.color, LV_PART_MAIN);
+    } else {
+        if (hudValueLbl) {
+            lv_obj_set_style_text_color(hudValueLbl, lv_color_hex(hudRgb(hud.color)), LV_PART_MAIN);
+        }
+    }
 }
 
 // 语义色里，红色=出错、琥珀=警告 —— 这两类必须一眼看见；
@@ -11686,6 +11838,7 @@ static void updateDynamicElements(void) {
 
         case DISP_MODE_WALLPAPER: {
             setText(wp_lbl_time, time_buf);
+            setText(wp_lbl_date, date_buf);
             break;
         }
 
