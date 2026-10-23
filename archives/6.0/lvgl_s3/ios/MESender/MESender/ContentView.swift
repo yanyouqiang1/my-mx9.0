@@ -56,6 +56,29 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
 
+            // 同步时间放在**连接区**里，而不是"动作"区 ——
+            // 它是设备级的操作（不是 ME 文本的一部分），而且必须连上了才有意义，
+            // 挨着连接状态放最顺：知道连上了，才谈得上"把时间给它"。
+            //
+            // ⚠ 常驻显示（没连上时置灰），不藏起来 ——
+            //   藏了就没人知道有这功能了。
+            HStack {
+                Label("键盘时间", systemImage: "clock")
+                    .font(.subheadline)
+                Spacer()
+                Text(model.keyboardTimeText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Button("同步") {
+                    Task { await model.syncTime() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isSending || !model.ble.state.isReady)
+            }
+
             if !model.ble.state.isReady {
                 if !model.ble.discovered.isEmpty {
                     Toggle("显示全部设备", isOn: $model.showAllDevices)

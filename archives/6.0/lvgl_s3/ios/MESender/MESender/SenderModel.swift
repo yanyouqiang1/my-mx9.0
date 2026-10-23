@@ -111,9 +111,76 @@ final class SenderModel: ObservableObject {
         }
     }
 
-    /// 让键盘把**当前存着的**文本立刻再打一遍（不下发新文本）。
-    func resendStored() async {
+    // MARK: - 同步时间
+
+    /// 键盘最后一次确认的时间（epoch 秒）；nil = 还没同步过。
+    @Published var keyboardTime: Int?
+
+    /// 界面上显示的键盘时间。
+    var keyboardTimeText: String {
+        guard let t = keyboardTime else { return "未同步" }
+        return Self.formatTime(t)
+    }
+
+    static func formatTime(_ epoch: Int) -> String {
+        let d = Date(timeIntervalSince1970: TimeInterval(epoch))
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: d)
+    }
+
+    /// 把手机的当前时间同步给键盘。
+    ///
+    /// 走固件的 `TIME:<epoch>`：settimeofday + 存 NVS + 更新内存副本。
+    ///
+    /// ⚠ **要兼容两种固件**：
+    ///   · 新固件会回 `TIME:<key>:OK:<epoch>:<HH:MM>` —— 拿回话里的 epoch
+    ///     和发过去的对一下，对不上就说明固件那边收到的不是我们发的那个值，
+    ///     **不能当成功**（静默的错时间比不同步更难查）。
+    ///   · 老固件**一声不吭**（原来的 TIME: 分支不回话），但命令照样送达、
+    ///     照样会 settimeofday。所以超时就归到"已下发、未确认"，
+    ///     用**琥珀色**而不是绿色提示 —— 不能拿没确认的东西报成功。
+    func syncTime() async {
         guard ble.state.isReady else {
+            result = "⚠️ 还没连上键盘"
+            return
+        }
+        guard !isSending else { return }
+
+        isSending = true
+        defer { isSending = false }
+
+        let epoch = Int(Date().timeIntervalSince1970)
+        do {
+            let body = try await ble.request(MEProtocol.timeCommand(epoch: epoch),
+                                            verb: "TIME", timeout: 4)
+            print("[MX9] ← TIME \(body)")
+            guard let got = MEProtocol.parseTimeReply(body), got == epoch else {
+                result = "⚠️ 键盘回了「\(body)」，和发过去的时间对不上，没同步成功"
+                return
+            }
+            keyboardTime = got
+            result = "✅ 时间已同步：\(Self.formatTime(got))"
+            print("[MX9] ✅ 时间已同步 \(Self.formatTime(got))")
+        } catch let e as BLEError {
+            print("[MX9] ← TIME \(e.localizedDescription)")
+            if case .timeout = e {
+                // 老固件：命令送到了（BLE 的写是带响应的，收到 ACK 才算送达），
+                // 但它不回话，没法确认它认下来的值是不是我们发的那个。
+                keyboardTime = epoch
+                result = "⏳ 时间已下发：\(Self.formatTime(epoch))\n"
+                    + "键盘固件较旧，没有回话确认（刷了新固件就能看到确认）。"
+            } else {
+                result = "❌ 同步时间失败：\(e.localizedDescription)"
+            }
+        } catch {
+            result = "❌ 同步时间失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 让键盘把**当前存着的**文本立刻再打一遍（不下发新文本）。
+    func resendStored() async {        guard ble.state.isReady else {
             result = "⚠️ 还没连上键盘"
             return
         }

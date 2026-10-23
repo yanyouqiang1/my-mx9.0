@@ -10368,6 +10368,18 @@ static void handleCommand(const String& cmd) {
         settimeofday(&tv, NULL);
         preferences.putUInt("set_epoch", (uint32_t)t);
         epochCache = (uint32_t)t;   // 内存副本跟着走，否则 CFGGET 拉出来的还是旧时间
+
+        // ⚠ 以前这里**一声不吭**就结束了 —— 设没设上、设的是不是个离谱的
+        //   值，主机这边完全不知道。手机端（ios/MESender）就靠这条回话
+        //   确认"键盘真的收下了这个时间"，没有它就只能干等。
+        //   回话带上**键盘自己认下来的那个 epoch**，主机对一下就知道
+        //   固件那边是不是被截断/改写过。
+        char tbuf[24];
+        struct tm tmr;
+        localtime_r(&t, &tmr);
+        strftime(tbuf, sizeof(tbuf), "%H:%M", &tmr);
+        btLinkReplyf("TIME", "OK:%lu:%s", (unsigned long)t, tbuf);
+        triggerHud("时间已同步", tbuf, lv_color_hex(CLR_GREEN));
     }
     // ALARMSET:HH:MM | ALARMSET:OFF - Set / clear alarm
     else if (cmd.startsWith("ALARMSET:")) {

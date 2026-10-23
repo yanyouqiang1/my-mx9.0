@@ -167,4 +167,28 @@ public enum MEProtocol {
     ///
     /// 等价于用户按了一下键盘上的 ME 键 —— 走的是固件里同一个 `meOutStart()`。
     public static let sendStoredCommand = "ME_SEND"
+
+    // MARK: - 时间
+
+    /// 同步时间指令：`TIME:<epoch 秒>`。
+    ///
+    /// 固件那边（`handleCommand` 的 `TIME:` 分支）会
+    /// `settimeofday()` + 存 NVS + 更新内存副本 `epochCache`，
+    /// 并回一句 `TIME:<key>:OK:<epoch>:<HH:MM>`。
+    ///
+    /// ⚠ epoch 用的是 **UTC 绝对时间**，和时区无关 ——
+    ///   显示成什么样是固件那边的事（它自己 `setenv("TZ","CST-8",1)`）。
+    public static func timeCommand(epoch: Int) -> String {
+        return "TIME:\(epoch)"
+    }
+
+    /// 解析固件回的时间：`OK:<epoch>:<HH:MM>` → epoch。
+    ///
+    /// 返回 nil 表示回话看不懂 —— 调用方要当"没同步上"处理，
+    /// 不能拿一个猜出来的值当成功。
+    public static func parseTimeReply(_ body: String) -> Int? {
+        let parts = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 2, parts[0] == "OK" else { return nil }
+        return Int(parts[1])
+    }
 }

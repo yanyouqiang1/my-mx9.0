@@ -194,6 +194,33 @@ final class MEProtocolTests: XCTestCase {
         XCTAssertFalse(MEProtocol.looksLikeKeyboard(name: "未知设备"))
     }
 
+    // MARK: - 时间
+
+    func testTimeCommandFormat() {
+        // 固件的 TIME: 分支是 cmd.substring(5).toInt() —— 冒号后必须是纯数字
+        XCTAssertEqual(MEProtocol.timeCommand(epoch: 1791456000), "TIME:1791456000")
+        XCTAssertEqual(MEProtocol.timeCommand(epoch: 0), "TIME:0")
+    }
+
+    /// ⚠ 固件那边 Arduino 的 String::toInt() 是 long（32 位有符号），
+    ///   2038 年前都没问题，但这条要在测试里钉住 —— 哪天超过 2^31
+    ///   就会被固件截断，键盘时间直接错 68 年，而且**不报错**。
+    func testTimeEpochFitsFirmware32BitSigned() {
+        let now = Int(Date().timeIntervalSince1970)
+        XCTAssertLessThan(now, Int(Int32.max))
+        // 解析回来的必须和发出去的一模一样
+        let reply = "OK:\(now):17:30"
+        XCTAssertEqual(MEProtocol.parseTimeReply(reply), now)
+    }
+
+    func testParseTimeReplyRejectsGarbage() {
+        XCTAssertNil(MEProtocol.parseTimeReply("ERR:失败"))
+        XCTAssertNil(MEProtocol.parseTimeReply("OK"))
+        XCTAssertNil(MEProtocol.parseTimeReply("OK:"))
+        XCTAssertNil(MEProtocol.parseTimeReply("OK:abc:17:30"))
+        XCTAssertNil(MEProtocol.parseTimeReply(""))
+    }
+
     func testResetDropsPartialBuffers() {
         let a = BLEReplyAssembler()
         _ = feed(a, "LOG:9:半截\r")
